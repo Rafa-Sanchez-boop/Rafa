@@ -76,6 +76,12 @@ def db_open():
         status TEXT NOT NULL DEFAULT 'pending',
         PRIMARY KEY(ticker, horizon_minutes)
     )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS horizon_predictions (
+        ticker TEXT NOT NULL, horizon_minutes INTEGER NOT NULL,
+        direction TEXT NOT NULL, target_price REAL NOT NULL,
+        initial_price REAL NOT NULL, predicted_at REAL NOT NULL,
+        PRIMARY KEY(ticker, horizon_minutes)
+    )""")
     db.commit()
     return db
 
@@ -307,13 +313,23 @@ def selected_horizon(db):
     ).fetchall()
     eligible = [(accuracy, -minutes, minutes) for minutes, n, accuracy in rows
                 if n >= MIN_HORIZON_EVALUATIONS and accuracy is not None]
+    # Only count evaluations backed by independently calculated forecasts.
+    eligible = []
+    for minutes in MULTI_HORIZONS:
+        n, accuracy = db.execute(
+            "SELECT COUNT(*),AVG(h.direction_correct) FROM horizon_evaluations h "
+            "JOIN horizon_predictions p ON h.ticker=p.ticker AND h.horizon_minutes=p.horizon_minutes "
+            "WHERE h.status='evaluated' AND h.horizon_minutes=?", (minutes,)
+        ).fetchone()
+        if n >= MIN_HORIZON_EVALUATIONS and accuracy is not None:
+            eligible.append((accuracy, -minutes, minutes))
     return max(eligible)[2] if len(eligible) == len(MULTI_HORIZONS) else 2
 
 
 def evaluate_horizons(db, now):
     rows = db.execute(
         "SELECT h.ticker,h.horizon_minutes,h.due_at,p.initial_price,p.direction,p.target_price "
-        "FROM horizon_evaluations h JOIN opening_predictions p ON p.ticker=h.ticker "
+        "FROM horizon_evaluations h JOIN horizon_predictions p ON p.ticker=h.ticker AND p.horizon_minutes=h.horizon_minutes "
         "WHERE h.status='pending' AND h.due_at<=?", (now,)
     ).fetchall()
     if not rows:
@@ -376,7 +392,7 @@ def opening_message(market, now, close_at, horizon=2):
         f'💰 Precio al detectar señal (Kraken): ${spot:,.2f}\n'
         f'🎯 Objetivo estimado: ${target:,.2f}\n'
         f'📏 Movimiento esperado: {delta:+,.2f} USD\n'
-        '⏱️ Horizonte aproximado: 120 segundos; no se puede estimar el segundo exacto con velas de 1 minuto\n'
+        f'⏱️ Horizonte aproximado: {horizon * 60} segundos; no se puede estimar el segundo exacto con velas de 1 minuto\n'
         f'📊 Frecuencia histórica de dirección: {frequency:.1%} ({samples} muestras)\n'
         f'📝 Interpretación: posible {direction} desde ${spot:,.2f} hacia ${target:,.2f}; '
         'después el precio puede cambiar de rumbo.\n'
@@ -618,6 +634,16 @@ def scan():
                                 (ticker, now, spot, direction, target, horizon * 60, '3.11')
                             )
                             for minutes in MULTI_HORIZONS:
+                                independent = initial_move_target(bars, spot, window=minutes)
+                                if independent is None:
+                                    continue
+                                h_direction, h_target, _, _, _ = independent
+                                db.execute(
+                                    "INSERT OR IGNORE INTO horizon_predictions "
+                                    "(ticker,horizon_minutes,direction,target_price,initial_price,predicted_at) "
+                                    "VALUES (?,?,?,?,?,?)",
+                                    (ticker, minutes, h_direction, h_target, spot, now)
+                                )
                                 db.execute(
                                     "INSERT OR IGNORE INTO horizon_evaluations "
                                     "(ticker,horizon_minutes,due_at) VALUES (?,?,?)",
