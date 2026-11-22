@@ -16,7 +16,7 @@ SERIES = os.getenv('KALSHI_SERIES', 'KXBTC15M')
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 DB_PATH = os.getenv('DB_PATH', '/var/data/kalshi_bot.sqlite3')
-SCAN_SECONDS = max(60, int(os.getenv('SCAN_SECONDS', '60')))
+SCAN_SECONDS = max(15, int(os.getenv('SCAN_SECONDS', '20')))
 MAX_SPREAD = Decimal(os.getenv('MAX_SPREAD', '0.04'))
 MIN_MOVE = Decimal(os.getenv('MIN_MOVE', '0.025'))
 MIN_VOLUME_24H = Decimal(os.getenv('MIN_VOLUME_24H', '100'))
@@ -28,7 +28,7 @@ TELEGRAM_TEST_ON_START = os.getenv('TELEGRAM_TEST_ON_START', 'false').lower() in
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('kalshi-btc-monitor')
 session = requests.Session()
-session.headers.update({'User-Agent': 'KalshiBTC15MMonitor/3.3'})
+session.headers.update({'User-Agent': 'KalshiBTC15MMonitor/3.5'})
 
 
 def dec(value):
@@ -52,6 +52,7 @@ def db_open():
     db.execute('CREATE TABLE IF NOT EXISTS snapshots (ticker TEXT NOT NULL, observed_at REAL NOT NULL, midpoint TEXT NOT NULL, PRIMARY KEY(ticker, observed_at))')
     db.execute('CREATE INDEX IF NOT EXISTS idx_snapshots_ticker_time ON snapshots(ticker, observed_at)')
     db.execute('CREATE TABLE IF NOT EXISTS alerts (ticker TEXT PRIMARY KEY, sent_at REAL NOT NULL, side TEXT NOT NULL, entry_price TEXT NOT NULL, reason TEXT NOT NULL)')
+    db.execute('CREATE TABLE IF NOT EXISTS opening_alerts (ticker TEXT PRIMARY KEY, sent_at REAL NOT NULL)')
     db.commit()
     return db
 
@@ -122,6 +123,39 @@ def analyze(market, previous_mid):
             'spread': spread, 'volume': volume}, 'candidato'
 
 
+def opening_signal(market, now, close_at):
+    """Market-implied directional indication near the 15-minute window start.
+
+    Not a trained forecast and NOT a calibrated probability of success.
+    """
+    start_at = close_at - 900
+    if not (start_at <= now <= start_at + 90):
+        return None
+    bid = dec(market.get('yes_bid_dollars'))
+    ask = dec(market.get('yes_ask_dollars'))
+    if bid is None or ask is None or not (0 < bid <= ask < 1):
+        return None
+    if ask - bid > MAX_SPREAD:
+        return None
+    midpoint = (bid + ask) / 2
+    up = midpoint * 100
+    down = (Decimal(1) - midpoint) * 100
+    direction = 'UP ▲' if midpoint > Decimal('0.5') else ('DOWN ▼' if midpoint < Decimal('0.5') else 'SIN VENTAJA')
+    strike = market.get('floor_strike') or market.get('strike_price') or 'No disponible'
+    remaining = max(0, int(close_at - now))
+    return (
+        f'📊 KALSHI BTC — VENTANA 15 MIN\\n'
+        f'Señal según mercado: {direction}\\n'
+        f'UP implícito: {up:.1f}%\\n'
+        f'DOWN implícito: {down:.1f}%\\n'
+        f'Precio de referencia (si disponible): {strike}\\n'
+        f'Tiempo restante: {remaining // 60:02d}:{remaining % 60:02d}\\n'
+        f'Contrato: {market.get("ticker", "")}\\n\\n'
+        '⚠️ Porcentajes derivados de cotizaciones Kalshi, NO probabilidad '
+        'de acierto validada ni recomendación de entrada.'
+    )
+
+
 def scan():
     markets = fetch_markets()
     now = time.time()
@@ -151,6 +185,13 @@ def scan():
             if open_at and close_at - open_at > 960:
                 count('duracion_invalida')
                 continue
+            opening = opening_signal(market, now, close_at)
+            if opening and not db.execute('SELECT 1 FROM opening_alerts WHERE ticker=?', (ticker,)).fetchone():
+                if send_telegram(opening):
+                    db.execute('INSERT INTO opening_alerts VALUES (?,?)', (ticker, now))
+                    log.info('Señal de apertura enviada: %s', ticker)
+                else:
+                    count('telegram_apertura_fallo')
             bid = dec(market.get('yes_bid_dollars'))
             ask = dec(market.get('yes_ask_dollars'))
             if bid is None or ask is None or not (0 < bid <= ask < 1):
