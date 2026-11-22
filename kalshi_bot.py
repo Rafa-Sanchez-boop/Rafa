@@ -25,7 +25,7 @@ MIN_REMAINING = max(300, int(os.getenv("MIN_REMAINING_SECONDS", "300")))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-only")
 http = requests.Session()
-http.headers["User-Agent"] = "KalshiOnlyBTC15M/4.0"
+http.headers["User-Agent"] = "KalshiOnlyBTC15M/4.2"
 
 def dec(x):
     try:
@@ -110,14 +110,15 @@ def signal(db, m, now, close_at, open_at, phase):
     if volume is None or volume < MIN_VOLUME:
         return
     if phase == "OPEN":
-        # Compare current contract pricing with samples observed in its first
-        # 20-60 seconds; do not pretend this is BTC spot momentum.
-        rows = db.execute("""SELECT yes_mid FROM kalshi_only_samples
-            WHERE ticker=? AND observed_at>=? AND observed_at<=?
-            ORDER BY observed_at LIMIT 1""",
-            (ticker, open_at, open_at + 60)).fetchone()
+        # Use the first actually observed Kalshi quote as baseline. The
+        # market's open_time can predate the 15-minute trading window, and
+        # a worker restart may miss the first minute. Never fabricate a quote.
+        rows = db.execute("""SELECT yes_mid, observed_at FROM kalshi_only_samples
+            WHERE ticker=? AND observed_at<=?
+            ORDER BY observed_at ASC LIMIT 1""",
+            (ticker, now - 60)).fetchone()
         if not rows:
-            log.info("No early Kalshi sample for %s; no signal", ticker)
+            log.info("Waiting for 60s of observed Kalshi quotes for %s", ticker)
             return
         prior = dec(rows[0])
     else:
@@ -216,7 +217,7 @@ def scan():
         db.commit()
 
 def main():
-    log.info("Kalshi-only BTC15M v4.1: continuous opportunities after 120s; no late alerts; no Kraken")
+    log.info("Kalshi-only BTC15M v4.2: continuous opportunities after 120s; no late alerts; no Kraken")
     while True:
         try:
             scan()
