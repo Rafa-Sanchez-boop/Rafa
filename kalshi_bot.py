@@ -252,14 +252,17 @@ def prediction_message(market, now, close_at, phase):
             quick_side, quick_target, quick_samples, quick_frequency = quick
             delta = quick_target - spot
             quick_note = (
-                f'⚡ KALSHI BITCOIN | PRIMEROS 2 MINUTOS\n'
-                f'🚨 MOVIMIENTO INICIAL: {quick_side} {"▼" if quick_side == "DOWN" else "▲"}\n'
-                f'💰 Precio inicial aproximado: ${spot:,.2f}\n'
-                f'🎯 Precio objetivo estimado: ${quick_target:,.2f}\n'
+                '📊 BTC KALSHI — ENTRADA INICIAL\n'
+                f'{"🔻 DOWN" if quick_side == "DOWN" else "🔺 UP"}\n'
+                '━━━━━━━━━━━━━━━━━━\n'
+                f'💰 Precio inicial: ${spot:,.2f}\n'
+                f'🎯 Objetivo estimado: ${quick_target:,.2f}\n'
                 f'📏 Movimiento esperado: {delta:+,.2f} USD\n'
-                f'⏱️ Ventana estimada: 00:01 a 02:00\n'
+                '⏱️ Ventana de análisis: Primeros 2 minutos\n'
                 f'📊 Frecuencia histórica de dirección: {quick_frequency:.1%} ({quick_samples} muestras)\n'
-                '⚠️ Objetivo estadístico de velas de 1 minuto, no mínimo/máximo exacto.\n'
+                f'📝 Interpretación: posible movimiento desde ${spot:,.2f} hacia ${quick_target:,.2f}, '
+                'sin asumir que continuará en esa dirección después.\n'
+                '⚠️ Estimación experimental con velas de 1 minuto, no predicción exacta.\n'
                 '━━━━━━━━━━━━━━━━━━\n'
             )
         else:
