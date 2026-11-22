@@ -224,18 +224,16 @@ def initial_move_target(bars, spot, window=2):
     up_count = sum(x > 0 for x in returns)
     down_count = sum(x < 0 for x in returns)
     frequency = max(up_count, down_count) / len(returns)
-    if frequency < OPEN_MIN_FREQUENCY:
-        return None
+    # Always report a direction, but label weak evidence clearly.
     direction = 'UP' if up_count > down_count else 'DOWN'
     matching = sorted(abs(x) for x in returns
                       if (x > 0 if direction == 'UP' else x < 0))
-    if len(matching) < 25:
+    if not matching:
         return None
     median_move = matching[len(matching) // 2]
     target = spot * (1 + median_move if direction == 'UP' else 1 - median_move)
-    if abs(target - spot) < OPEN_MIN_MOVE_USD:
-        return None
-    return direction, target, len(returns), frequency
+    strong = frequency >= OPEN_MIN_FREQUENCY and abs(target - spot) >= OPEN_MIN_MOVE_USD and up_count != down_count
+    return direction, target, len(returns), frequency, strong
 
 
 def strike_price(market):
@@ -255,30 +253,30 @@ def opening_message(market, now, close_at):
         return None
     bars = btc_bars()
     if not bars:
-        log.info('OPEN skipped: BTC history unavailable')
-        return None
+        log.info('OPEN report: BTC history unavailable')
+        return '📊 BTC KALSHI — PRIMEROS 2 MINUTOS\n⚪ SIN PRONÓSTICO: historial BTC no disponible'
     spot = btc_spot()
     if spot is None:
-        log.info('OPEN skipped: fresh BTC spot unavailable')
-        return None
+        log.info('OPEN report: fresh BTC spot unavailable')
+        return '📊 BTC KALSHI — PRIMEROS 2 MINUTOS\n⚪ SIN PRONÓSTICO: precio BTC no disponible'
     if abs(spot / bars[-1][1] - 1) > 0.02:
-        log.warning('OPEN skipped: Kraken spot diverges from last closed candle')
-        return None
+        log.warning('OPEN report: Kraken spot diverges from last closed candle')
+        return '📊 BTC KALSHI — PRIMEROS 2 MINUTOS\n⚪ SIN PRONÓSTICO: precios inconsistentes'
     quick = initial_move_target(bars, spot)
     if quick is None:
-        log.info('OPEN skipped: insufficient historical direction evidence')
-        return None
-    side, target, samples, frequency = quick
+        log.info('OPEN report: insufficient historical direction evidence')
+        return '📊 BTC KALSHI — PRIMEROS 2 MINUTOS\n⚪ SIN PRONÓSTICO: muestras insuficientes'
+    side, target, samples, frequency, strong = quick
     delta = target - spot
     direction = 'bajada' if side == 'DOWN' else 'subida'
     return (
         '📊 BTC KALSHI — ENTRADA INICIAL\n'
-        f'{"🔻 DOWN" if side == "DOWN" else "🔺 UP"}\n'
+        f'{"🔻 DOWN" if side == "DOWN" else "🔺 UP"} | {"SEÑAL EXPERIMENTAL" if strong else "PRONÓSTICO DÉBIL — NO OPERAR"}\n'
         '━━━━━━━━━━━━━━━━━━\n'
         f'💰 Precio al detectar señal (Kraken): ${spot:,.2f}\n'
         f'🎯 Objetivo estimado: ${target:,.2f}\n'
         f'📏 Movimiento esperado: {delta:+,.2f} USD\n'
-        '⏱️ Ventana de análisis: Primeros 2 minutos\n'
+        '⏱️ Horizonte aproximado: 120 segundos; no se puede estimar el segundo exacto con velas de 1 minuto\n'
         f'📊 Frecuencia histórica de dirección: {frequency:.1%} ({samples} muestras)\n'
         f'📝 Interpretación: posible {direction} desde ${spot:,.2f} hacia ${target:,.2f}; '
         'después el precio puede cambiar de rumbo.\n'
@@ -328,7 +326,7 @@ def prediction_message(market, now, close_at, phase):
     if phase == 'OPEN':
         quick = initial_move_target(bars, spot)
         if quick:
-            quick_side, quick_target, quick_samples, quick_frequency = quick
+            quick_side, quick_target, quick_samples, quick_frequency, quick_strong = quick
             delta = quick_target - spot
             quick_note = (
                 '📊 BTC KALSHI — ENTRADA INICIAL\n'
@@ -435,7 +433,7 @@ def scan():
 
 
 def main():
-    log.info('Kalshi BTC15M v3.6 independent opening alerts; no trading')
+    log.info('Kalshi BTC15M v3.7 opening forecasts with weak-signal labels; no trading')
     if TELEGRAM_TEST_ON_START:
         if send_telegram('🧪 Prueba de conexión Kalshi Bot v3.3: Telegram funciona. No es una señal de mercado.'):
             log.info('Prueba Telegram enviada correctamente')
