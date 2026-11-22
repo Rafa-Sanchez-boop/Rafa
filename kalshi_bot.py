@@ -23,7 +23,6 @@ MIN_VOLUME_24H = int(os.getenv('MIN_VOLUME_24H', '100'))
 MIN_REMAINING_SECONDS = int(os.getenv('MIN_REMAINING_SECONDS', '90'))
 ALERT_COOLDOWN_HOURS = max(0, float(os.getenv('ALERT_COOLDOWN_HOURS', '6')))
 TOP_ALERTS = max(1, int(os.getenv('TOP_ALERTS', '15')))
-TELEGRAM_TEST_ON_START = os.getenv('TELEGRAM_TEST_ON_START', 'false').lower() in ('1', 'true', 'yes')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('kalshi-btc-monitor')
@@ -97,109 +96,80 @@ def analyze(market, previous_mid):
     bid = dec(market.get('yes_bid_dollars'))
     ask = dec(market.get('yes_ask_dollars'))
     if bid is None or ask is None or not (0 < bid <= ask < 1):
-        return None, 'cotizacion_invalida'
+        return None
     spread = ask - bid
     if spread > MAX_SPREAD:
-        return None, 'spread_alto'
+        return None
+    volume = market.get('volume_24h')
     try:
-        volume = int(market.get('volume_24h') or 0)
+        volume = int(volume or 0)
     except (ValueError, TypeError):
         volume = 0
     if volume < MIN_VOLUME_24H:
-        return None, 'volumen_bajo'
+        return None
     mid = (bid + ask) / 2
     if previous_mid is None:
-        return None, 'sin_historial_60s'
+        return {'mid': mid, 'signal': None}
     change = mid - previous_mid
     if abs(change) < MIN_MOVE:
-        return None, 'movimiento_insuficiente'
+        return {'mid': mid, 'signal': None}
+    # Movement of contract quote, not BTC spot price and not calibrated probability.
     side = 'YES' if change > 0 else 'NO'
     entry = ask if side == 'YES' else Decimal(1) - bid
-    return {'side': side, 'entry': entry, 'change': change,
-            'spread': spread, 'volume': volume}, 'candidato'
+    return {'mid': mid, 'signal': {'side': side, 'entry': entry, 'change': change, 'spread': spread, 'volume': volume}}
 
 
 def scan():
     markets = fetch_markets()
     now = time.time()
     sent = 0
-    reasons = {}
-
-    def count(reason):
-        reasons[reason] = reasons.get(reason, 0) + 1
-
     with db_open() as db:
         for market in markets:
             ticker = market.get('ticker', '')
             if not isinstance(ticker, str) or not ticker.startswith(SERIES + '-'):
-                count('serie_distinta')
                 continue
             close_at = timestamp(market.get('close_time'))
             open_at = timestamp(market.get('open_time'))
-            if close_at is None:
-                count('sin_cierre')
-                continue
-            if close_at - now < MIN_REMAINING_SECONDS:
-                count('poco_tiempo')
-                continue
-            if open_at and open_at > now:
-                count('todavia_no_abierto')
+            if close_at is None or close_at - now < MIN_REMAINING_SECONDS or (open_at and open_at > now):
                 continue
             if open_at and close_at - open_at > 960:
-                count('duracion_invalida')
                 continue
+            row = db.execute('SELECT midpoint FROM snapshots WHERE ticker=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 1', (ticker, now - 60)).fetchone()
+            prior = dec(row[0]) if row else None
             bid = dec(market.get('yes_bid_dollars'))
             ask = dec(market.get('yes_ask_dollars'))
             if bid is None or ask is None or not (0 < bid <= ask < 1):
-                count('cotizacion_invalida')
                 continue
-            row = db.execute(
-                'SELECT midpoint FROM snapshots WHERE ticker=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 1',
-                (ticker, now - 60)
-            ).fetchone()
-            prior = dec(row[0]) if row else None
             midpoint = (bid + ask) / 2
-            db.execute('INSERT OR IGNORE INTO snapshots VALUES (?,?,?)',
-                       (ticker, now, str(midpoint)))
-            signal, reason = analyze(market, prior)
-            count(reason)
-            if signal is None:
+            db.execute('INSERT OR IGNORE INTO snapshots VALUES (?,?,?)', (ticker, now, str(midpoint)))
+            result = analyze(market, prior)
+            if not result or not result['signal']:
                 continue
             if db.execute('SELECT 1 FROM alerts WHERE ticker=?', (ticker,)).fetchone():
-                count('ya_alertado')
                 continue
+            sig = result['signal']
             minutes = int((close_at - now) // 60)
             message = (f'ð KALSHI BTC 15M â MOVIMIENTO DE COTIZACIÃN\n'
-                       f'Contrato: {ticker}\nLado observado: {signal["side"]}\n'
-                       f'Precio de referencia: ${signal["entry"]:.3f}\n'
-                       f'Cambio en precio YES: {signal["change"]:+.3f}\n'
-                       f'Spread: ${signal["spread"]:.3f}\nVolumen 24h: {signal["volume"]}\n'
+                       f'Contrato: {ticker}\nLado observado: {sig["side"]}\n'
+                       f'Precio de referencia: ${sig["entry"]:.3f}\n'
+                       f'Cambio en precio YES: {sig["change"]:+.3f}\n'
+                       f'Spread: ${sig["spread"]:.3f}\nVolumen 24h: {sig["volume"]}\n'
                        f'Tiempo restante: {minutes} min\n\n'
-                       'â ï¸ Movimiento observado, no predicciÃ³n validada ni recomendaciÃ³n de compra.')
+                       'â ï¸ No es predicciÃ³n validada ni recomendaciÃ³n de compra. Verifica el contrato y el precio actual.')
             if send_telegram(message):
-                db.execute('INSERT INTO alerts VALUES (?,?,?,?,?)',
-                           (ticker, now, signal['side'], str(signal['entry']), 'contract_quote_momentum'))
+                db.execute('INSERT INTO alerts VALUES (?,?,?,?,?)', (ticker, now, sig['side'], str(sig['entry']), 'contract_quote_momentum'))
                 sent += 1
-                log.info('Alerta enviada: %s %s', ticker, signal['side'])
+                log.info('Alerta enviada: %s %s', ticker, sig['side'])
                 if sent >= TOP_ALERTS:
                     break
-            else:
-                count('telegram_fallo')
         db.execute('DELETE FROM snapshots WHERE observed_at < ?', (now - 48 * 3600,))
-        db.execute('DELETE FROM alerts WHERE sent_at < ?',
-                   (now - max(48, ALERT_COOLDOWN_HOURS) * 3600,))
+        db.execute('DELETE FROM alerts WHERE sent_at < ?', (now - max(48, ALERT_COOLDOWN_HOURS) * 3600,))
         db.commit()
-    details = ', '.join(f'{key}={value}' for key, value in sorted(reasons.items())) or 'sin_detalles'
-    log.info('Escaneo: %s mercados, %s alertas | motivos: %s', len(markets), sent, details)
+    log.info('Escaneo: %s mercados, %s alertas', len(markets), sent)
 
 
 def main():
-    log.info('Kalshi BTC15M v3.1 â diagnostico de filtros, solo alertas')
-    if TELEGRAM_TEST_ON_START:
-        if send_telegram('ð§ª Prueba de conexiÃ³n Kalshi Bot v3.1: Telegram funciona. No es una seÃ±al de mercado.'):
-            log.info('Prueba Telegram enviada correctamente')
-        else:
-            log.error('Prueba Telegram fallida')
+    log.info('Kalshi BTC15M v3 â monitor de cotizaciones, solo alertas')
     while True:
         try:
             scan()
