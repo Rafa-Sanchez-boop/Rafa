@@ -1,4 +1,5 @@
 """BTC 15-minute Kalshi contract signals with optional Kraken BTC/USD context; no trading."""
+import json
 import logging
 import os
 import sqlite3
@@ -64,6 +65,10 @@ def db_open():
     db.execute("""CREATE TABLE IF NOT EXISTS market_observations
                (ticker TEXT, observed_at REAL, yes_bid TEXT, yes_ask TEXT,
                 yes_mid TEXT, volume TEXT, PRIMARY KEY(ticker, observed_at))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS trained_models
+               (day TEXT PRIMARY KEY, trained_at REAL, samples INTEGER,
+                validation_count INTEGER, validation_brier REAL,
+                baseline_brier REAL, active INTEGER, model_json TEXT)""")
     db.commit()
     return db
 
@@ -182,6 +187,58 @@ def accuracy_report(db):
             f"🔺 UP: {up_hits}/{up_n} | 🔻 DOWN: {down_hits}/{down_n}\\n"
             "⚠️ No equivale a rentabilidad ni precisión predictiva validada.")
 
+def feature_bucket(direction, move, remaining):
+    return f"{direction}:{'large' if abs(float(move)) >= 0.10 else 'small'}:{'late' if int(remaining) < 300 else 'early'}"
+
+
+def retrain_daily(db, now):
+    """Retrain from settled alerts; activate only if temporal holdout improves Brier score."""
+    day = datetime.utcfromtimestamp(now).strftime("%Y-%m-%d")
+    if db.execute("SELECT 1 FROM trained_models WHERE day=?", (day,)).fetchone():
+        return
+    rows = db.execute("""SELECT f.direction, f.move, f.remaining_seconds, a.sent_at, r.result
+        FROM signal_features f JOIN kalshi_only_alerts a
+        ON a.ticker=f.ticker AND a.phase='OPEN'
+        JOIN kalshi_only_results r ON r.ticker=f.ticker
+        WHERE r.result IN ('yes','no') ORDER BY a.sent_at, f.ticker""").fetchall()
+    if len(rows) < 60:
+        return
+    cut = int(len(rows) * 0.8)
+    training, validation = rows[:cut], rows[cut:]
+    def outcome(row):
+        return int((row[0] == "UP" and row[4] == "yes") or
+                   (row[0] == "DOWN" and row[4] == "no"))
+    counts = {}
+    for row in training:
+        key = feature_bucket(row[0], row[1], row[2])
+        n, hits = counts.get(key, (0, 0))
+        counts[key] = (n + 1, hits + outcome(row))
+    base = (sum(outcome(x) for x in training) + 2) / (len(training) + 4)
+    def predict(row):
+        n, hits = counts.get(feature_bucket(row[0], row[1], row[2]), (0, 0))
+        return (hits + 8 * base) / (n + 8)
+    score = sum((predict(x) - outcome(x)) ** 2 for x in validation) / len(validation)
+    baseline = sum((base - outcome(x)) ** 2 for x in validation) / len(validation)
+    active = int(score + 0.002 < baseline)
+    db.execute("INSERT INTO trained_models VALUES (?,?,?,?,?,?,?,?)",
+               (day, now, len(training), len(validation), score, baseline,
+                active, json.dumps({"counts": counts, "base": base})))
+    log.info("Daily model %s: %d train %d validation, brier %.4f vs %.4f, active=%s",
+             day, len(training), len(validation), score, baseline, bool(active))
+
+
+def model_assessment(db, direction, change, remaining):
+    row = db.execute("""SELECT day, model_json FROM trained_models
+        WHERE active=1 ORDER BY day DESC LIMIT 1""").fetchone()
+    if not row:
+        return "🤖 Modelo diario: esperando al menos 60 resultados oficiales para validar."
+    model = json.loads(row[1])
+    n, hits = model["counts"].get(feature_bucket(direction, change, remaining), [0, 0])
+    estimate = (hits + 8 * model["base"]) / (n + 8)
+    return (f"🤖 Modelo {row[0]}: coincidencia histórica estimada {estimate:.1%} "
+            "para señales similares; no es garantía ni rentabilidad.")
+
+
 def daily_recalibration(db, now):
     """Daily historical checkpoint; no unvalidated live strategy changes."""
     day = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
@@ -244,6 +301,7 @@ def signal(db, m, now, close_at, open_at, phase):
     kraken_line = kraken_reference(db, now)
     learned = learning_summary(db, direction)
     historical = accuracy_report(db)
+    model_line = model_assessment(db, direction, change, remaining)
     interpretation = (
         "\n🧠 INTERPRETACIÓN — cotizaciones de Kalshi\n"
         + f"📊 Probabilidad implícita YES aproximada: {mid * 100:.1f}%\n"
@@ -266,7 +324,7 @@ def signal(db, m, now, close_at, open_at, phase):
         + f"🧾 Contrato: {ticker}\n"
         + kraken_line + "\n"
         + interpretation
-        + learned + "\n" + historical + "\n"
+        + learned + "\n" + historical + "\n" + model_line + "\n"
         +  "⚠️ Señal basada exclusivamente en cotizaciones de Kalshi. "
           "El movimiento de cotización no garantiza el resultado final. "
           "No se fija objetivo de venta; comisiones y liquidez pueden impedir beneficio. "
@@ -338,12 +396,13 @@ def scan():
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
         daily_recalibration(db, now)
+        retrain_daily(db, now)
         db.execute("DELETE FROM kalshi_only_samples WHERE observed_at < ?", (now - 48 * 3600,))
         db.execute("DELETE FROM btc_reference_samples WHERE observed_at < ?", (now - 48 * 3600,))
         db.commit()
 
 def main():
-    log.info("Kalshi BTC15M v5.2: continuous observations and daily learning snapshots")
+    log.info("Kalshi BTC15M v5.3: daily retraining with temporal holdout")
     while True:
         try:
             scan()
