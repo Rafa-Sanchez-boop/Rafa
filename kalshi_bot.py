@@ -171,6 +171,36 @@ def empirical_probability(bars, horizon, strike=None):
     return probability, len(selected), closes[-1]
 
 
+
+def initial_move_target(bars, spot, window=2):
+    """Historical 1-minute analogs for the next 2 minutes; NOT tick-level prediction."""
+    closes = [p for _, p in bars]
+    if len(closes) < 180 or min(closes) <= 0:
+        return None
+    momentum = closes[-1] / closes[-6] - 1
+    analogs = []
+    for i in range(6, len(closes) - window):
+        past = closes[i] / closes[i - 5] - 1
+        move = closes[i + window] / closes[i] - 1
+        analogs.append((abs(past - momentum), move))
+    analogs.sort(key=lambda x: x[0])
+    returns = [ret for _, ret in analogs[:80]]
+    if len(returns) < 50:
+        return None
+    up_count = sum(x > 0 for x in returns)
+    down_count = sum(x < 0 for x in returns)
+    if max(up_count, down_count) / len(returns) < 0.65:
+        return None
+    direction = 'UP' if up_count > down_count else 'DOWN'
+    matching = sorted(abs(x) for x in returns if (x > 0 if direction == 'UP' else x < 0))
+    if len(matching) < 25:
+        return None
+    # Median observed close-to-close move, not an exact intraperiod extreme.
+    median_move = matching[len(matching) // 2]
+    target = spot * (1 + median_move if direction == 'UP' else 1 - median_move)
+    return direction, target, len(returns), max(up_count, down_count) / len(returns)
+
+
 def strike_price(market):
     # Never substitute contract bid/ask for BTC settlement strike.
     for field in ('floor_strike', 'strike_price'):
@@ -215,6 +245,19 @@ def prediction_message(market, now, close_at, phase):
         log.info('%s skipped: insufficient hypothetical edge', phase)
         return None
     phase_name = 'APERTURA' if phase == 'OPEN' else 'ÚLTIMOS 3 MINUTOS'
+    quick_note = ''
+    if phase == 'OPEN':
+        quick = initial_move_target(bars, spot)
+        if quick:
+            quick_side, quick_target, quick_samples, quick_frequency = quick
+            quick_note = (
+                f'⚡ Movimiento inicial estimado (2 min): {quick_side}\\n'
+                f'🎯 Objetivo estadístico aproximado: ${quick_target:,.2f}\\n'
+                f'📊 Frecuencia histórica de dirección: {quick_frequency:.1%} ({quick_samples} muestras)\\n'
+                '⚠️ Objetivo basado en cierres de velas de 1 minuto, no en máximos/mínimos por segundo.\\n'
+            )
+        else:
+            quick_note = '⚡ Movimiento inicial (2 min): SIN SEÑAL; evidencia insuficiente.\\n'
     distance = spot - strike
     distance_label = 'por encima' if distance > 0 else ('por debajo' if distance < 0 else 'igual')
     up_price = float(ask)
@@ -261,7 +304,7 @@ def scan():
             if close_at is None:
                 count('sin_cierre')
                 continue
-            if close_at - now < MIN_REMAINING_SECONDS:
+            if close_at - now < 20:
                 count('poco_tiempo')
                 continue
             if open_at and open_at > now:
