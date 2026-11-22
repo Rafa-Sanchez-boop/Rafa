@@ -353,12 +353,15 @@ def scan():
     if payload is None:
         return
     now = time.time()
+    markets = payload.get("markets", [])
+    counters = {"listed": len(markets), "series": 0, "window": 0, "quotes": 0, "eligible": 0}
     with db_open() as db:
         # Signal generation uses Kalshi quotes only; no Kraken dependency.
         for m in payload.get("markets", []):
             ticker = m.get("ticker", "")
             if not isinstance(ticker, str) or not ticker.startswith(SERIES + "-"):
                 continue
+            counters["series"] += 1
             opened, closes = ts(m.get("open_time")), ts(m.get("close_time"))
             if opened is None or closes is None or not (opened <= now < closes):
                 continue
@@ -367,8 +370,10 @@ def scan():
             window_start = closes - 900
             if now < window_start:
                 continue
+            counters["window"] += 1
             q = quote(m)
             if q:
+                counters["quotes"] += 1
                 sample(db, ticker, now, q[2])
                 volume = m.get("volume_24h_fp") or m.get("volume_24h")
                 db.execute("INSERT OR IGNORE INTO market_observations VALUES (?,?,?,?,?,?)",
@@ -377,10 +382,14 @@ def scan():
             # Scan continuously after initial analysis, until the contract closes.
             # OPEN phase is used for one alert per contract.
             if now - window_start >= DELAY and remaining >= MIN_REMAINING:
+                counters["eligible"] += 1
                 signal(db, m, now, closes, opened, "OPEN")
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
+        if int(now // 300) != int((now - SCAN_SECONDS) // 300):
+            log.info("Scan heartbeat: listed=%d series=%d active_window=%d valid_quotes=%d eligible=%d",
+                     counters["listed"], counters["series"], counters["window"], counters["quotes"], counters["eligible"])
         daily_recalibration(db, now)
         retrain_daily(db, now)
         db.execute("DELETE FROM kalshi_only_samples WHERE observed_at < ?", (now - 48 * 3600,))
