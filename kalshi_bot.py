@@ -76,7 +76,7 @@ def fetch_markets():
                 raise
             log.warning('Consulta fallida: %s', exc)
             time.sleep(min(2 ** (attempt + 1), 30))
-    raise RuntimeError('Kalshi no respondió despuÃ©s de varios intentos')
+    raise RuntimeError('Kalshi no respondió después de varios intentos')
 
 
 def send_telegram(message):
@@ -210,6 +210,43 @@ def strike_price(market):
     return None
 
 
+
+def opening_message(market, now, close_at):
+    """Independent opening move alert; never implies Kalshi settlement or profit."""
+    remaining = int(close_at - now)
+    if not (780 <= remaining <= 900):
+        return None
+    bars = btc_bars()
+    if not bars:
+        log.info('OPEN skipped: BTC history unavailable')
+        return None
+    # Last closed candle is historical context, not a real-time opening quote.
+    spot = bars[-1][1]
+    quick = initial_move_target(bars, spot)
+    if quick is None:
+        log.info('OPEN skipped: insufficient historical direction evidence')
+        return None
+    side, target, samples, frequency = quick
+    delta = target - spot
+    direction = 'bajada' if side == 'DOWN' else 'subida'
+    return (
+        '📊 BTC KALSHI — ENTRADA INICIAL\\n'
+        f'{"🔻 DOWN" if side == "DOWN" else "🔺 UP"}\\n'
+        '━━━━━━━━━━━━━━━━━━\\n'
+        f'💰 Precio inicial de referencia (último cierre Kraken): \\u0024{spot:,.2f}\\n'
+        f'🎯 Objetivo estimado: \\u0024{target:,.2f}\\n'
+        f'📏 Movimiento esperado: {delta:+,.2f} USD\\n'
+        '⏱️ Ventana de análisis: Primeros 2 minutos\\n'
+        f'📊 Frecuencia histórica de dirección: {frequency:.1%} ({samples} muestras)\\n'
+        f'📝 Interpretación: posible {direction} desde \\u0024{spot:,.2f} hacia \\u0024{target:,.2f}; '
+        'después el precio puede cambiar de rumbo.\\n'
+        f'⏳ Tiempo restante del contrato: {remaining // 60:02d}:{remaining % 60:02d}\\n'
+        f'🧾 Contrato: {market.get("ticker", "")}\\n'
+        '⚠️ Estimación experimental con cierres de velas de 1 minuto. '
+        'No es el precio exacto de apertura, ni un máximo/mínimo garantizado. '
+        'No implica beneficio al vender en Kalshi.'
+    )
+
 def prediction_message(market, now, close_at, phase):
     remaining = int(close_at - now)
     if phase == 'OPEN' and not (810 <= remaining <= 900):
@@ -327,9 +364,11 @@ def scan():
             for phase, table in (('OPEN', 'opening_alerts'), ('FINAL', 'final_alerts')):
                 if db.execute(f'SELECT 1 FROM {table} WHERE ticker=?', (ticker,)).fetchone():
                     continue
-                message = prediction_message(market, now, close_at, phase)
+                message = (opening_message(market, now, close_at) if phase == 'OPEN'
+                           else prediction_message(market, now, close_at, phase))
                 if message and send_telegram(message):
                     db.execute(f'INSERT INTO {table} VALUES (?,?)', (ticker, now))
+                    sent += 1
                     log.info('Experimental %s signal sent: %s', phase, ticker)
             bid = dec(market.get('yes_bid_dollars'))
             ask = dec(market.get('yes_ask_dollars'))
