@@ -406,7 +406,10 @@ def scan():
             opened, closes = ts(m.get("open_time")), ts(m.get("close_time"))
             if opened is None or closes is None or not (opened <= now < closes):
                 continue
-            if closes - opened > 960:
+            # Kalshi open_time may precede the actual 15-minute BTC window.
+            # Do not discard a valid 15-minute contract based on listing age.
+            window_start = closes - 900
+            if now < window_start:
                 continue
             q = quote(m)
             if q:
@@ -417,7 +420,7 @@ def scan():
             remaining = closes - now
             # Scan continuously after initial analysis, until the contract closes.
             # OPEN phase is used for one alert per contract.
-            if now - opened >= DELAY and remaining >= MIN_REMAINING:
+            if now - window_start >= DELAY and remaining >= MIN_REMAINING:
                 signal(db, m, now, closes, opened, "OPEN")
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
