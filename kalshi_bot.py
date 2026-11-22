@@ -1,4 +1,4 @@
-"""BTC 15-minute Kalshi contract signals with optional Kraken BTC/USD context; no trading."""
+"""BTC 15-minute Kalshi-only contract signals; no trading."""
 import json
 import logging
 import os
@@ -48,8 +48,6 @@ def db_open():
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_only_alerts
                (ticker TEXT, phase TEXT, sent_at REAL, direction TEXT,
                 PRIMARY KEY(ticker,phase))""")
-    db.execute("""CREATE TABLE IF NOT EXISTS btc_reference_samples
-               (observed_at REAL PRIMARY KEY, price TEXT)""")
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_only_results
                (ticker TEXT PRIMARY KEY, result TEXT, observed_at REAL)""")
     db.execute("""CREATE TABLE IF NOT EXISTS signal_features
@@ -105,35 +103,6 @@ def notify(msg):
     except (requests.RequestException, ValueError):
         log.exception("Telegram send failed")
         return False
-
-def kraken_reference(db, now):
-    """Optional BTC/USD spot context, never used to determine Kalshi settlement."""
-    try:
-        r = http.get("https://api.kraken.com/0/public/Ticker",
-                     params={"pair": "XBTUSD"}, timeout=8)
-        r.raise_for_status()
-        payload = r.json()
-        if payload.get("error"):
-            return "📍 BTC/USD Kraken: no disponible (API)."
-        ticker = next(iter(payload["result"].values()))
-        price = dec(ticker["c"][0])
-        if price is None or price <= 0:
-            return "📍 BTC/USD Kraken: dato no válido."
-        old = db.execute("""SELECT price FROM btc_reference_samples
-            WHERE observed_at <= ? ORDER BY observed_at DESC LIMIT 1""",
-                         (now - 60,)).fetchone()
-        previous = dec(old[0]) if old else None
-        db.execute("INSERT OR REPLACE INTO btc_reference_samples VALUES (?,?)",
-                   (now, str(price)))
-        if previous is None:
-            return f"📍 BTC/USD Kraken: ${price:,.2f}; sin referencia previa suficiente."
-        delta = price - previous
-        trend = "subió" if delta > 0 else "bajó" if delta < 0 else "sin cambio"
-        return (f"📍 BTC/USD Kraken: ${price:,.2f}; "
-                f"{trend} ${abs(delta):,.2f} frente a muestra previa (≥60 s).")
-    except (requests.RequestException, ValueError, KeyError, TypeError, StopIteration):
-        log.warning("Kraken reference unavailable", exc_info=True)
-        return "📍 BTC/USD Kraken: no disponible; señal de Kalshi sin confirmar."
 
 def quote(m):
     bid, ask = dec(m.get("yes_bid_dollars")), dec(m.get("yes_ask_dollars"))
@@ -298,7 +267,6 @@ def signal(db, m, now, close_at, open_at, phase):
     direction = "UP" if up else "DOWN"
     entry = ask if up else Decimal(1) - bid
     remaining = max(0, int(close_at - now))
-    kraken_line = kraken_reference(db, now)
     learned = learning_summary(db, direction)
     historical = accuracy_report(db)
     model_line = model_assessment(db, direction, change, remaining)
@@ -322,13 +290,11 @@ def signal(db, m, now, close_at, open_at, phase):
         + f"🎟️ Entrada indicativa {direction}: ${entry:.2f}\n"
         + f"⏳ Tiempo restante: {remaining//60:02d}:{remaining%60:02d}\n"
         + f"🧾 Contrato: {ticker}\n"
-        + kraken_line + "\n"
         + interpretation
         + learned + "\n" + historical + "\n" + model_line + "\n"
         +  "⚠️ Señal basada exclusivamente en cotizaciones de Kalshi. "
           "El movimiento de cotización no garantiza el resultado final. "
           "No se fija objetivo de venta; comisiones y liquidez pueden impedir beneficio. "
-          "Referencia BTC/USD de Kraken solo informativa. "
           "Alerta informativa, no operación automática."
     )
     if notify(message):
@@ -340,7 +306,7 @@ def signal(db, m, now, close_at, open_at, phase):
         log.info("Kalshi-only %s alert: %s %s", phase, ticker, direction)
 
 def check_results(db, now):
-    # Use Kalshi's official result field, never Kraken, for completed markets.
+    # Use Kalshi official settlement results for completed markets.
     rows = db.execute("""SELECT DISTINCT ticker FROM kalshi_only_alerts
         WHERE ticker NOT IN (SELECT ticker FROM kalshi_only_results)""").fetchall()
     for (ticker,) in rows[-30:]:
@@ -398,7 +364,6 @@ def scan():
         daily_recalibration(db, now)
         retrain_daily(db, now)
         db.execute("DELETE FROM kalshi_only_samples WHERE observed_at < ?", (now - 48 * 3600,))
-        db.execute("DELETE FROM btc_reference_samples WHERE observed_at < ?", (now - 48 * 3600,))
         db.commit()
 
 def main():
