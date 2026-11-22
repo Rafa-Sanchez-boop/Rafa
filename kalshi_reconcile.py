@@ -51,7 +51,10 @@ class ReadOnlyKalshi:
             response.raise_for_status()
             payload = response.json()
         except (requests.RequestException, ValueError) as exc:
-            raise ReconciliationError(f"Portfolio read failed at {path.rsplit('/', 1)[-1]} (HTTP {getattr(getattr(exc, 'response', None), 'status_code', 'unknown')})") from exc
+            status = getattr(getattr(exc, "response", None), "status_code", "unknown")
+            if status == 429:
+                LOG.warning("Kalshi rate limit on %s; reconciliation deferred, trading disabled", path.rsplit("/", 1)[-1])
+            raise ReconciliationError(f"Portfolio read failed at {path.rsplit('/', 1)[-1]} (HTTP {status})") from exc
         if not isinstance(payload, dict):
             raise ReconciliationError("Unexpected portfolio response")
         return payload
