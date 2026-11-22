@@ -490,6 +490,27 @@ def evaluate_opening_predictions(db, now):
         log.info('OPEN evaluated ticker=%s correct=%s initial=%.2f observed=%.2f '
                  'target=%.2f endpoint_error=%.2f observation_delay=%.1fs',
                  ticker, correct, initial, spot, target, error, delay)
+        outcome = '✅ ACERTÓ DIRECCIÓN' if correct else '❌ FALLÓ DIRECCIÓN'
+        move = spot - initial
+        target_status = 'Sí (en muestras)' if touched else 'No observado en muestras'
+        message = (
+            f'📊 BTC KALSHI — RESULTADO A LOS 2 MINUTOS\\n'
+            f'{outcome}\\n'
+            f'🧾 Contrato: {ticker}\\n'
+            f'🔮 Pronóstico: {direction}\\n'
+            f'💰 Precio inicial: ${initial:,.2f}\\n'
+            f'🎯 Objetivo estimado: ${target:,.2f}\\n'
+            f'📍 Precio observado: ${spot:,.2f}\\n'
+            f'📏 Movimiento real: {move:+,.2f} USD\\n'
+            f'📐 Error frente al objetivo: ${error:,.2f}\\n'
+            f'📉 Mínimo muestreado: ${low:,.2f}\\n'
+            f'📈 Máximo muestreado: ${high:,.2f}\\n'
+            f'🎯 Objetivo alcanzado: {target_status}\\n'
+            f'⏱️ Evaluación realizada {delay:.0f} s después del horizonte.\\n'
+            f'⚠️ Evaluación aproximada con Kraken; no representa el resultado oficial de Kalshi.'
+        )
+        if not send_telegram(message):
+            log.error('OPEN result notification failed ticker=%s', ticker)
     count, hits, avg_error = db.execute(
         "SELECT COUNT(*),COALESCE(SUM(direction_correct),0),AVG(target_error_usd) "
         "FROM opening_predictions WHERE status='evaluated'"
