@@ -136,22 +136,22 @@ def signal(db, m, now, close_at, open_at, phase):
     direction = "UP" if up else "DOWN"
     entry = ask if up else Decimal(1) - bid
     target = entry + TICK * TARGET_TICKS
-    if target > Decimal("0.99"):
-        log.info("Target outside allowed price range: %s", ticker)
-        return
+    target_valid = target <= Decimal("0.99")
+    if not target_valid:
+        log.info("35-tick target infeasible for %s; sending directional observation without target", ticker)
     remaining = max(0, int(close_at - now))
     phase_name = "DESPUÉS DE 2 MINUTOS" if phase == "OPEN" else "ÚLTIMOS 3 MINUTOS"
     message = (
-        "📊 BTC KALSHI — " + phase_name + "\\n"
-        + ("🔺 UP" if up else "🔻 DOWN") + " | SEÑAL EXPERIMENTAL\\n"
-        + "━━━━━━━━━━━━━━━━━━\\n"
-        + f"📈 Precio YES anterior (Kalshi): ${prior:.3f}\\n"
-        + f"📈 Precio YES actual (Kalshi): ${mid:.3f}\\n"
-        + f"📏 Cambio en cotización YES: {change:+.3f}\\n"
-        + f"🎟️ Entrada indicativa {direction}: ${entry:.2f}\\n"
-        + f"🎯 Objetivo de venta: ${target:.2f} (+{TARGET_TICKS} ticks brutos)\\n"
-        + f"⏳ Tiempo restante: {remaining//60:02d}:{remaining%60:02d}\\n"
-        + f"🧾 Contrato: {ticker}\\n"
+        "📊 BTC KALSHI — " + phase_name + "\n"
+        + ("🔺 UP" if up else "🔻 DOWN") + " | SEÑAL EXPERIMENTAL\n"
+        + "━━━━━━━━━━━━━━━━━━\n"
+        + f"📈 Precio YES anterior (Kalshi): ${prior:.3f}\n"
+        + f"📈 Precio YES actual (Kalshi): ${mid:.3f}\n"
+        + f"📏 Cambio en cotización YES: {change:+.3f}\n"
+        + f"🎟️ Entrada indicativa {direction}: ${entry:.2f}\n"
+        + (f"🎯 Objetivo de venta: ${target:.2f} (+{TARGET_TICKS} ticks brutos)\n" if target_valid else "🎯 Objetivo de 35 ticks no viable a este precio; sin objetivo de venta.\n")
+        + f"⏳ Tiempo restante: {remaining//60:02d}:{remaining%60:02d}\n"
+        + f"🧾 Contrato: {ticker}\n"
         + "⚠️ Solo datos de Kalshi. El cambio de cotización no predice "
           "necesariamente el precio BTC ni el resultado final. "
           "Objetivo no garantizado; comisiones y liquidez pueden impedir beneficio. "
@@ -179,10 +179,10 @@ def check_results(db, now):
         if predicted:
             correct = (predicted[0] == "UP" and result == "yes") or (
                 predicted[0] == "DOWN" and result == "no")
-            notify(f"📊 KALSHI — RESULTADO OFICIAL\\n🧾 {ticker}\\n"
-                   f"🔮 Pronóstico: {predicted[0]}\\n"
-                   f"🏁 Resultado Kalshi: {result.upper()}\\n"
-                   f"{'✅ ACERTÓ' if correct else '❌ FALLÓ'}\\n"
+            notify(f"📊 KALSHI — RESULTADO OFICIAL\n🧾 {ticker}\n"
+                   f"🔮 Pronóstico: {predicted[0]}\n"
+                   f"🏁 Resultado Kalshi: {result.upper()}\n"
+                   f"{'✅ ACERTÓ' if correct else '❌ FALLÓ'}\n"
                    "⚠️ Acertar dirección no confirma que se vendiera al objetivo de 35 ticks.")
 
 def scan():
