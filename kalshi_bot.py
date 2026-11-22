@@ -214,20 +214,30 @@ def prediction_message(market, now, close_at, phase):
     if float(entry) + 0.08 >= confidence:
         log.info('%s skipped: insufficient hypothetical edge', phase)
         return None
+    phase_name = 'APERTURA' if phase == 'OPEN' else 'ÚLTIMOS 3 MINUTOS'
+    distance = spot - strike
+    distance_label = 'por encima' if distance > 0 else ('por debajo' if distance < 0 else 'igual')
+    up_price = float(ask)
+    down_price = float(Decimal(1) - bid)
     return (
-        f'📊 BTC 15M — {phase}\n'
-        f'Señal experimental: {side}\\n'
-        f'UP histórico comparable: {probability:.1%}\\n'
-        f'DOWN histórico comparable: {1 - probability:.1%}\\n'
-        f'Muestras: {count}\\n'
-        f'BTC Kraken: ${spot:,.2f}\\n'
-        f'Referencia contrato: {strike if strike else "pendiente"}\\n'
-        f'Precio contrato estimado: ${entry:.3f}\\n'
-        f'Restante: {remaining // 60:02d}:{remaining % 60:02d}\\n'
-        f'Contrato: {market.get("ticker", "")}\\n'
-        '⚠️ Frecuencias históricas NO calibradas; no son probabilidades '
-        'fiables de acierto. Kraken puede diferir del índice de liquidación '
-        'Kalshi. Sin garantía ni recomendación de apuesta.'
+        f'🔔 SEÑALES BTC 15M | {phase_name}\n'
+        f'━━━━━━━━━━━━━━━━━━\n'
+        f'🚨 ALERTA: {side}\n'
+        f'📊 UP histórico comparable: {probability:.1%}\n'
+        f'📉 DOWN histórico comparable: {1 - probability:.1%}\n'
+        f'🔎 Muestras comparables: {count}\n'
+        f'💰 Precio BTC (Kraken): ${spot:,.2f}\n'
+        f'🎯 Referencia del contrato: ${strike:,.2f}\n'
+        f'📏 Distancia: ${abs(distance):,.2f} {distance_label}\n'
+        f'🟢 Precio UP estimado: ${up_price:.3f}\n'
+        f'🔴 Precio DOWN estimado: ${down_price:.3f}\n'
+        f'⏳ Tiempo restante: {remaining // 60:02d}:{remaining % 60:02d}\n'
+        f'🧾 Contrato: {market.get("ticker", "")}\n'
+        f'━━━━━━━━━━━━━━━━━━\n'
+        '⚠️ Señal experimental: frecuencias históricas no calibradas, '
+        'NO probabilidades fiables. Cotizaciones indicativas, no garantizadas. '
+        'Kraken puede diferir del índice de liquidación de Kalshi. '
+        'No es una recomendación de apuesta.'
     )
 
 
