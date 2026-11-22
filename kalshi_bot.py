@@ -265,7 +265,8 @@ def prediction_message(market, now, close_at, phase):
     return (
         f'🔔 SEÑALES BTC 15M | {phase_name}\n'
         f'━━━━━━━━━━━━━━━━━━\n'
-        f'🚨 ALERTA: {side}\n'
+        f'🚨 ALERTA DE CIERRE: {side}\n'
+        f'{quick_note}'
         f'📊 UP histórico comparable: {probability:.1%}\n'
         f'📉 DOWN histórico comparable: {1 - probability:.1%}\n'
         f'🔎 Muestras comparables: {count}\n'
