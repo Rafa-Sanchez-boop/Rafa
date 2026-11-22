@@ -179,6 +179,38 @@ def btc_spot():
         return None
 
 
+_trade_cache = {'at': 0, 'result': None}
+
+
+def recent_trade_pressure():
+    """Recent aggressive buy/sell volume from Kraken public trade prints."""
+    now = time.time()
+    if now - _trade_cache['at'] < 20:
+        return _trade_cache['result']
+    _trade_cache.update(at=now, result=None)
+    try:
+        response = session.get('https://api.kraken.com/0/public/Trades',
+                               params={'pair': 'XBTUSD', 'count': 1000}, timeout=8)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get('error'):
+            raise ValueError(str(payload['error']))
+        key = next(k for k in payload['result'] if k != 'last')
+        trades = payload['result'][key]
+        recent = [t for t in trades if len(t) >= 4 and now - 90 <= float(t[2]) <= now + 5]
+        buy = sum(float(t[1]) for t in recent if t[3] == 'b')
+        sell = sum(float(t[1]) for t in recent if t[3] == 's')
+        if len(recent) < 20 or buy + sell <= 0:
+            return None
+        pressure = (buy - sell) / (buy + sell)
+        result = (pressure, len(recent))
+        _trade_cache['result'] = result
+        return result
+    except (requests.RequestException, ValueError, KeyError, TypeError, StopIteration) as exc:
+        log.warning('Kraken recent trade pressure unavailable: %s', exc)
+        return None
+
+
 def empirical_probability(bars, horizon, strike=None):
     """Experimental analog estimator. Not calibrated or validated for Kalshi."""
     closes = [price for _, price in bars]
@@ -267,6 +299,17 @@ def opening_message(market, now, close_at):
         log.info('OPEN report: insufficient historical direction evidence')
         return '📊 BTC KALSHI — PRIMEROS 2 MINUTOS\n⚪ SIN PRONÓSTICO: muestras insuficientes'
     side, target, samples, frequency, strong = quick
+    pressure = recent_trade_pressure()
+    pressure_text = '⚖️ Flujo de operaciones: no disponible\\n'
+    if pressure is not None:
+        imbalance, trade_count = pressure
+        agrees = (imbalance > 0 and side == 'UP') or (imbalance < 0 and side == 'DOWN')
+        pressure_text = (f'⚖️ Presión compradora-vendedora (90 s): {imbalance:+.1%} '
+                         f'({trade_count} operaciones); '
+                         f'{"confirma dirección" if agrees else "no confirma dirección"}\\n')
+        strong = strong and agrees
+    else:
+        strong = False
     delta = target - spot
     direction = 'bajada' if side == 'DOWN' else 'subida'
     return (
@@ -433,7 +476,7 @@ def scan():
 
 
 def main():
-    log.info('Kalshi BTC15M v3.7 opening forecasts with weak-signal labels; no trading')
+    log.info('Kalshi BTC15M v3.8 opening forecasts with trade-flow confirmation; no trading')
     if TELEGRAM_TEST_ON_START:
         if send_telegram('🧪 Prueba de conexión Kalshi Bot v3.3: Telegram funciona. No es una señal de mercado.'):
             log.info('Prueba Telegram enviada correctamente')
