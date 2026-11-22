@@ -21,7 +21,7 @@ MIN_REMAINING = 0  # Allow alerts until contract closes, including final 2-3 min
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-only")
 http = requests.Session()
-http.headers["User-Agent"] = "KalshiBTC15M/5.0"
+http.headers["User-Agent"] = "KalshiBTC15M/5.1"
 # Extra in-process protection against opposite alerts during a worker lifetime.
 alerted_tickers = set()
 
@@ -51,6 +51,11 @@ def db_open():
                (observed_at REAL PRIMARY KEY, price TEXT)""")
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_only_results
                (ticker TEXT PRIMARY KEY, result TEXT, observed_at REAL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS signal_features
+               (ticker TEXT PRIMARY KEY, direction TEXT, move REAL,
+                remaining_seconds INTEGER, recorded_at REAL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS learning_audit
+               (ticker TEXT PRIMARY KEY, correct INTEGER, assessed_at REAL)""")
     db.commit()
     return db
 
@@ -129,6 +134,46 @@ def sample(db, ticker, now, mid):
     db.execute("INSERT OR IGNORE INTO kalshi_only_samples VALUES (?,?,?)",
                (ticker, now, str(mid)))
 
+def performance(db, direction=None):
+    """Evaluate only settled, previously emitted alerts; no look-ahead."""
+    where = "AND a.direction=?" if direction else ""
+    params = (direction,) if direction else ()
+    rows = db.execute("""SELECT a.direction, r.result
+        FROM kalshi_only_alerts a JOIN kalshi_only_results r ON r.ticker=a.ticker
+        WHERE a.phase='OPEN' AND r.result IN ('yes','no') """ + where, params).fetchall()
+    n = len(rows)
+    hits = sum((d == "UP" and result == "yes") or
+               (d == "DOWN" and result == "no") for d, result in rows)
+    return n, hits
+
+
+def learning_summary(db, direction):
+    """Conservative empirical reliability with a 10-signal minimum."""
+    n, hits = performance(db, direction)
+    if n < 10:
+        return f"🧠 Aprendizaje {direction}: {n}/10 resultados mínimos; sin ajuste aún."
+    rate = hits / n
+    # A smoothed historical agreement rate is NOT a validated probability.
+    smoothed = (hits + 2) / (n + 4)
+    note = ("historial favorable" if smoothed >= 0.60 else
+            "historial débil; revisar señales" if smoothed < 0.45 else
+            "historial sin ventaja clara")
+    return (f"🧠 Aprendizaje {direction}: {hits}/{n} coincidencias "
+            f"({rate:.1%}); evaluación suavizada {smoothed:.1%}, {note}. "
+            "No es probabilidad de ganar.")
+
+
+def accuracy_report(db):
+    n, hits = performance(db)
+    up_n, up_hits = performance(db, "UP")
+    down_n, down_hits = performance(db, "DOWN")
+    if not n:
+        return "📚 Precisión histórica: sin contratos alertados y liquidados todavía."
+    return (f"📚 Precisión histórica (coincidencia con liquidación): "
+            f"{hits}/{n} = {hits/n:.1%}\\n"
+            f"🔺 UP: {up_hits}/{up_n} | 🔻 DOWN: {down_hits}/{down_n}\\n"
+            "⚠️ No equivale a rentabilidad ni precisión predictiva validada.")
+
 def signal(db, m, now, close_at, open_at, phase):
     ticker = m["ticker"]
     if ticker in alerted_tickers:
@@ -175,6 +220,8 @@ def signal(db, m, now, close_at, open_at, phase):
     entry = ask if up else Decimal(1) - bid
     remaining = max(0, int(close_at - now))
     kraken_line = kraken_reference(db, now)
+    learned = learning_summary(db, direction)
+    historical = accuracy_report(db)
     interpretation = (
         "\n🧠 INTERPRETACIÓN — cotizaciones de Kalshi\n"
         + f"📊 Probabilidad implícita YES aproximada: {mid * 100:.1f}%\n"
@@ -195,7 +242,9 @@ def signal(db, m, now, close_at, open_at, phase):
         + f"🎟️ Entrada indicativa {direction}: ${entry:.2f}\n"
         + f"⏳ Tiempo restante: {remaining//60:02d}:{remaining%60:02d}\n"
         + f"🧾 Contrato: {ticker}\n"
+        + kraken_line + "\n"
         + interpretation
+        + learned + "\n" + historical + "\n"
         +  "⚠️ Señal basada exclusivamente en cotizaciones de Kalshi. "
           "El movimiento de cotización no garantiza el resultado final. "
           "No se fija objetivo de venta; comisiones y liquidez pueden impedir beneficio. "
@@ -204,6 +253,8 @@ def signal(db, m, now, close_at, open_at, phase):
     )
     if notify(message):
         alerted_tickers.add(ticker)
+        db.execute("INSERT OR IGNORE INTO signal_features VALUES (?,?,?,?,?)",
+                   (ticker, direction, float(change), remaining, now))
         db.execute("INSERT OR IGNORE INTO kalshi_only_alerts VALUES (?,?,?,?)",
                    (ticker, phase, now, direction))
         log.info("Kalshi-only %s alert: %s %s", phase, ticker, direction)
@@ -225,12 +276,15 @@ def check_results(db, now):
         if predicted:
             correct = (predicted[0] == "UP" and result == "yes") or (
                 predicted[0] == "DOWN" and result == "no")
+            db.execute("INSERT OR IGNORE INTO learning_audit VALUES (?,?,?)",
+                       (ticker, int(correct), now))
             notify(f"📊 KALSHI — RESULTADO OFICIAL\n🧾 {ticker}\n"
                    f"📈 Dirección de momentum observada: {predicted[0]}\n"
                    f"🏁 Resultado final Kalshi: {result.upper()}\n"
                    f"{'Coincidió' if correct else 'No coincidió'} con el resultado final.\n"
                    "⚠️ La señal mide momentum de cotización, no predice "
-                   "el resultado final ni confirma beneficio de compraventa.")
+                   "el resultado final ni confirma beneficio de compraventa.\n"
+                   + accuracy_report(db))
 
 def scan():
     payload = get_json("/markets", {"series_ticker": SERIES, "status": "open", "limit": 100})
@@ -263,7 +317,7 @@ def scan():
         db.commit()
 
 def main():
-    log.info("Kalshi BTC15M v5.0: original format, Kraken context and interpretations")
+    log.info("Kalshi BTC15M v5.1: Kraken, interpretation and historical learning")
     while True:
         try:
             scan()
