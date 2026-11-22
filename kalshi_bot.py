@@ -23,7 +23,7 @@ MIN_REMAINING = max(300, int(os.getenv("MIN_REMAINING_SECONDS", "300")))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-only")
 http = requests.Session()
-http.headers["User-Agent"] = "KalshiOnlyBTC15M/4.4"
+http.headers["User-Agent"] = "KalshiOnlyBTC15M/4.5"
 # Extra in-process protection against opposite alerts during a worker lifetime.
 alerted_tickers = set()
 
@@ -141,6 +141,14 @@ def signal(db, m, now, close_at, open_at, phase):
     entry = ask if up else Decimal(1) - bid
     remaining = max(0, int(close_at - now))
     phase_name = "OPORTUNIDAD A TIEMPO"
+    # Projection is for the Kalshi YES contract quote, NOT BTC/USD.
+    # A one-minute momentum extrapolation is illustrative, not a target order.
+    projected = min(Decimal("0.99"), max(Decimal("0.01"), mid + change))
+    interpretation = (f"📉 Interpretación: posible bajada de la cotización YES de Kalshi "
+                      f"desde ${mid:.3f} hacia ${projected:.3f}; después el precio puede cambiar de rumbo."
+                      if not up else
+                      f"📈 Interpretación: posible subida de la cotización YES de Kalshi "
+                      f"desde ${mid:.3f} hacia ${projected:.3f}; después el precio puede cambiar de rumbo.")
     message = (
         "📊 BTC KALSHI — " + phase_name + "\n"
         + ("🔺 UP" if up else "🔻 DOWN") + " | SEÑAL EXPERIMENTAL\n"
@@ -151,6 +159,8 @@ def signal(db, m, now, close_at, open_at, phase):
         + f"🎟️ Entrada indicativa {direction}: ${entry:.2f}\n"
         + f"⏳ Tiempo restante: {remaining//60:02d}:{remaining%60:02d}\n"
         + f"🧾 Contrato: {ticker}\n"
+        + interpretation + "\n"
+        + "🎯 Proyección ilustrativa de cotización YES, no precio BTC/USD ni objetivo de compra/venta.\n"
         + "⚠️ Solo datos de Kalshi. El cambio de cotización no predice "
           "necesariamente el precio BTC ni el resultado final. "
           "No se fija objetivo de venta; comisiones y liquidez pueden impedir beneficio. "
@@ -216,7 +226,7 @@ def scan():
         db.commit()
 
 def main():
-    log.info("Kalshi-only BTC15M v4.4: continuous opportunities after 120s; no late alerts; no Kraken")
+    log.info("Kalshi-only BTC15M v4.5: continuous opportunities after 120s; no late alerts; no Kraken")
     while True:
         try:
             scan()
