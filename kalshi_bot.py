@@ -190,17 +190,18 @@ def prediction_message(market, now, close_at, phase):
     if not bars:
         return None
     strike = strike_price(market)
-    if phase == 'FINAL' and strike is None:
-        log.info('FINAL skipped: no verified BTC strike for %s', market.get('ticker'))
+    if strike is None:
+        log.info('%s skipped: no verified BTC strike for %s', phase, market.get('ticker'))
         return None
-    horizon = 15 if phase == 'OPEN' else max(1, round(remaining / 60))
-    estimate = empirical_probability(bars, horizon, strike if phase == 'FINAL' else None)
+    horizon = max(1, min(15, round(remaining / 60)))
+    estimate = empirical_probability(bars, horizon, strike)
     if estimate is None:
         return None
     probability, count, spot = estimate
     side = 'UP ▲' if probability > 0.5 else 'DOWN ▼'
     confidence = max(probability, 1 - probability)
     if confidence < 0.65:
+        log.info('%s skipped: low historical confidence %.3f', phase, confidence)
         return None
     bid = dec(market.get('yes_bid_dollars'))
     ask = dec(market.get('yes_ask_dollars'))
@@ -211,9 +212,10 @@ def prediction_message(market, now, close_at, phase):
     entry = ask if probability > 0.5 else 1 - bid
     # Only flag positive theoretical edge versus contract ask.
     if float(entry) + 0.08 >= confidence:
+        log.info('%s skipped: insufficient hypothetical edge', phase)
         return None
     return (
-        f'📊 BTC 15M — {phase}\\n'
+        f'📊 BTC 15M — {phase}\n'
         f'Señal experimental: {side}\\n'
         f'UP histórico comparable: {probability:.1%}\\n'
         f'DOWN histórico comparable: {1 - probability:.1%}\\n'
