@@ -26,6 +26,8 @@ MIN_MOVE = Decimal(os.getenv('MIN_MOVE', '0.025'))
 MIN_VOLUME_24H = Decimal(os.getenv('MIN_VOLUME_24H', '100'))
 MIN_REMAINING_SECONDS = max(121, int(os.getenv('MIN_REMAINING_SECONDS', '121')))
 OPEN_SIGNAL_DELAY_SECONDS = 20
+PROFIT_TARGET_TICKS = 1
+KALSHI_TICK = Decimal('0.01')  # Standard cent-priced contracts; verify market tick size before execution.
 ALERT_COOLDOWN_HOURS = max(0, float(os.getenv('ALERT_COOLDOWN_HOURS', '6')))
 TOP_ALERTS = max(1, int(os.getenv('TOP_ALERTS', '15')))
 TELEGRAM_TEST_ON_START = os.getenv('TELEGRAM_TEST_ON_START', 'false').lower() in ('1', 'true', 'yes')
@@ -368,6 +370,15 @@ def opening_message(market, now, close_at, horizon=2):
         strong = strong and agrees
     else:
         strong = False
+    # Indicative one-tick gross profit target for the Kalshi contract, not BTC/USD.
+    bid = dec(market.get('yes_bid_dollars'))
+    ask = dec(market.get('yes_ask_dollars'))
+    if bid is None or ask is None or not (0 < bid <= ask < 1) or ask - bid > MAX_SPREAD:
+        return None
+    entry = ask if side == 'UP' else Decimal(1) - bid
+    exit_target = entry + KALSHI_TICK * PROFIT_TARGET_TICKS
+    if exit_target > Decimal('0.99'):
+        return None
     delta = target - spot
     direction = 'bajada' if side == 'DOWN' else 'subida'
     return (
@@ -377,6 +388,7 @@ def opening_message(market, now, close_at, horizon=2):
         f'💰 Precio al detectar señal (Kraken): ${spot:,.2f}\n'
         f'🎯 Objetivo estimado: ${target:,.2f}\n'
         f'📏 Movimiento esperado: {delta:+,.2f} USD\n'
+        f'🎟️ Entrada indicativa Kalshi: ${entry:.2f} | Objetivo de venta: ${exit_target:.2f} (+1 tick bruto)\n'
         '⏱️ Horizonte aproximado: 120 segundos; no se puede estimar el segundo exacto con velas de 1 minuto\n'
         f'📊 Frecuencia histórica de dirección: {frequency:.1%} ({samples} muestras)\n'
         f'📝 Interpretación: posible {direction} desde ${spot:,.2f} hacia ${target:,.2f}; '
@@ -418,6 +430,9 @@ def prediction_message(market, now, close_at, phase):
     if ask - bid > MAX_SPREAD:
         return None
     entry = ask if probability > 0.5 else 1 - bid
+    exit_target = Decimal(str(entry)) + KALSHI_TICK * PROFIT_TARGET_TICKS
+    if exit_target > Decimal('0.99'):
+        return None
     # Only flag positive theoretical edge versus contract ask.
     if float(entry) + 0.08 >= confidence:
         log.info('%s skipped: insufficient hypothetical edge', phase)
@@ -461,6 +476,7 @@ def prediction_message(market, now, close_at, phase):
         f'💰 Precio BTC (Kraken): ${spot:,.2f}\n'
         f'🎯 Referencia del contrato: ${strike:,.2f}\n'
         f'📏 Distancia: ${abs(distance):,.2f} {distance_label}\n'
+        f'🎟️ Entrada indicativa: ${float(entry):.2f} | Objetivo de venta: ${exit_target:.2f} (+1 tick bruto)\n'
         f'🟢 Precio UP estimado: ${up_price:.3f}\n'
         f'🔴 Precio DOWN estimado: ${down_price:.3f}\n'
         f'⏳ Tiempo restante: {remaining // 60:02d}:{remaining % 60:02d}\n'
