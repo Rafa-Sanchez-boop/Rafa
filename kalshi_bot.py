@@ -249,6 +249,25 @@ def daily_recalibration(db, now):
              day, n, hits, up_hits, up_n, down_hits, down_n)
 
 
+def market_pattern(db, ticker, now):
+    """Recent quote highs/lows, repeat touches, and consecutive directional steps."""
+    rows = db.execute("""SELECT yes_mid FROM kalshi_only_samples
+        WHERE ticker=? AND observed_at>=? ORDER BY observed_at DESC LIMIT 18""",
+        (ticker, now - 180)).fetchall()
+    values = [dec(r[0]) for r in reversed(rows)]
+    values = [v for v in values if v is not None]
+    if len(values) < 4:
+        return None
+    high, low = max(values), min(values)
+    tolerance = Decimal("0.015")
+    high_touches = sum(abs(v - high) <= tolerance for v in values)
+    low_touches = sum(abs(v - low) <= tolerance for v in values)
+    steps = [values[i] - values[i-1] for i in range(1, len(values))]
+    rising = sum(v > 0 for v in steps[-3:])
+    falling = sum(v < 0 for v in steps[-3:])
+    return high, low, high_touches, low_touches, rising, falling
+
+
 def signal(db, m, now, close_at, open_at, phase):
     ticker = m["ticker"]
     if ticker in alerted_tickers:
@@ -291,6 +310,17 @@ def signal(db, m, now, close_at, open_at, phase):
         # No strong Kalshi direction; retry on subsequent scans.
         return
     up = change > 0
+    pattern = market_pattern(db, ticker, now)
+    if pattern is None:
+        return
+    high, low, high_touches, low_touches, rising, falling = pattern
+    # Require repeat observations and short-term confirmation, not a lone quote spike.
+    if (up and rising < 2) or (not up and falling < 2):
+        return
+    if high_touches < 2 and low_touches < 2:
+        return
+    log.info("Pattern %s: high=%s touches=%d low=%s touches=%d rise=%d fall=%d",
+             ticker, high, high_touches, low, low_touches, rising, falling)
     direction = "UP" if up else "DOWN"
     entry = ask if up else Decimal(1) - bid
     remaining = max(0, int(close_at - now))
@@ -303,6 +333,8 @@ def signal(db, m, now, close_at, open_at, phase):
         price_line = "📍 BTC/USD: referencia no disponible."
     elif btc_target is None:
         price_line = f"📍 BTC/USD: ${btc_now:,.2f} (calculando proyección)."
+    elif (up and btc_target <= btc_now) or (not up and btc_target >= btc_now):
+        price_line = f"📍 BTC/USD: ${btc_now:,.2f} (sin objetivo confirmado)."
     else:
         price_line = (f"📈 Posible {'subida' if up else 'bajada'} desde "
                       f"${btc_now:,.2f} hacia ${btc_target:,.2f}.")
