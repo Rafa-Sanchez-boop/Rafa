@@ -250,14 +250,21 @@ def prediction_message(market, now, close_at, phase):
         quick = initial_move_target(bars, spot)
         if quick:
             quick_side, quick_target, quick_samples, quick_frequency = quick
+            delta = quick_target - spot
             quick_note = (
-                f'⚡ Movimiento inicial estimado (2 min): {quick_side}\\n'
-                f'🎯 Objetivo estadístico aproximado: ${quick_target:,.2f}\\n'
-                f'📊 Frecuencia histórica de dirección: {quick_frequency:.1%} ({quick_samples} muestras)\\n'
-                '⚠️ Objetivo basado en cierres de velas de 1 minuto, no en máximos/mínimos por segundo.\\n'
+                f'⚡ KALSHI BITCOIN | PRIMEROS 2 MINUTOS\n'
+                f'🚨 MOVIMIENTO INICIAL: {quick_side} {"▼" if quick_side == "DOWN" else "▲"}\n'
+                f'💰 Precio inicial aproximado: ${spot:,.2f}\n'
+                f'🎯 Precio objetivo estimado: ${quick_target:,.2f}\n'
+                f'📏 Movimiento esperado: {delta:+,.2f} USD\n'
+                f'⏱️ Ventana estimada: 00:01 a 02:00\n'
+                f'📊 Frecuencia histórica de dirección: {quick_frequency:.1%} ({quick_samples} muestras)\n'
+                '⚠️ Objetivo estadístico de velas de 1 minuto, no mínimo/máximo exacto.\n'
+                '━━━━━━━━━━━━━━━━━━\n'
             )
         else:
-            quick_note = '⚡ Movimiento inicial (2 min): SIN SEÑAL; evidencia insuficiente.\\n'
+            quick_note = '⚡ KALSHI BITCOIN | PRIMEROS 2 MINUTOS: SIN SEÑAL\n━━━━━━━━━━━━━━━━━━\n'
+
     distance = spot - strike
     distance_label = 'por encima' if distance > 0 else ('por debajo' if distance < 0 else 'igual')
     up_price = float(ask)
