@@ -25,6 +25,7 @@ MAX_SPREAD = Decimal(os.getenv('MAX_SPREAD', '0.04'))
 MIN_MOVE = Decimal(os.getenv('MIN_MOVE', '0.025'))
 MIN_VOLUME_24H = Decimal(os.getenv('MIN_VOLUME_24H', '100'))
 MIN_REMAINING_SECONDS = max(121, int(os.getenv('MIN_REMAINING_SECONDS', '121')))
+OPEN_SIGNAL_DELAY_SECONDS = 20
 ALERT_COOLDOWN_HOURS = max(0, float(os.getenv('ALERT_COOLDOWN_HOURS', '6')))
 TOP_ALERTS = max(1, int(os.getenv('TOP_ALERTS', '15')))
 TELEGRAM_TEST_ON_START = os.getenv('TELEGRAM_TEST_ON_START', 'false').lower() in ('1', 'true', 'yes')
@@ -338,7 +339,7 @@ def evaluate_horizons(db, now):
 def opening_message(market, now, close_at, horizon=2):
     """Independent opening move alert; never implies Kalshi settlement or profit."""
     remaining = int(close_at - now)
-    if not (780 <= remaining <= 900):
+    if not (780 <= remaining <= 900 - OPEN_SIGNAL_DELAY_SECONDS):
         return None
     bars = btc_bars()
     if not bars:
@@ -389,7 +390,7 @@ def opening_message(market, now, close_at, horizon=2):
 
 def prediction_message(market, now, close_at, phase):
     remaining = int(close_at - now)
-    if phase == 'OPEN' and not (810 <= remaining <= 900):
+    if phase == 'OPEN' and not (810 <= remaining <= 900 - OPEN_SIGNAL_DELAY_SECONDS):
         return None
     if phase == 'FINAL' and not (MIN_REMAINING_SECONDS <= remaining <= 180):
         return None
@@ -595,10 +596,14 @@ def scan():
             if open_at and open_at > now:
                 count('todavia_no_abierto')
                 continue
+            # Observe the market immediately, but never send opening alerts before 20s.
+            opening_ready = open_at is not None and now - open_at >= OPEN_SIGNAL_DELAY_SECONDS
             if open_at and close_at - open_at > 960:
                 count('duracion_invalida')
                 continue
             for phase, table in (('OPEN', 'opening_alerts'), ('FINAL', 'final_alerts')):
+                if phase == 'OPEN' and not opening_ready:
+                    continue
                 if db.execute(f'SELECT 1 FROM {table} WHERE ticker=?', (ticker,)).fetchone():
                     continue
                 message = (opening_message(market, now, close_at, selected_horizon(db)) if phase == 'OPEN'
