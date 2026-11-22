@@ -74,7 +74,7 @@ def fetch_markets():
                 raise
             log.warning('Consulta fallida: %s', exc)
             time.sleep(min(2 ** (attempt + 1), 30))
-    raise RuntimeError('Kalshi no respondiÃ³ despuÃ©s de varios intentos')
+    raise RuntimeError('Kalshi no respondió despuÃ©s de varios intentos')
 
 
 def send_telegram(message):
@@ -86,7 +86,7 @@ def send_telegram(message):
         response.raise_for_status()
         data = response.json()
         if not data.get('ok'):
-            log.error('Telegram rechazÃ³ el mensaje: %s', data.get('description', 'sin detalle'))
+            log.error('Telegram rechazó el mensaje: %s', data.get('description', 'sin detalle'))
         return bool(data.get('ok'))
     except (requests.RequestException, ValueError):
         log.exception('No se pudo enviar alerta Telegram')
@@ -165,7 +165,7 @@ def scan():
             db.execute('INSERT OR IGNORE INTO snapshots VALUES (?,?,?)',
                        (ticker, now, str(midpoint)))
             signal, reason = analyze(market, prior)
-            # DiagnÃ³stico: registrar campos originales y valores calculados.
+            # Diagnóstico: registrar campos originales y valores calculados.
             # No contiene tokens, chat IDs ni otras credenciales.
             raw_v24 = market.get('volume_24h')
             raw_volume = market.get('volume')
@@ -187,7 +187,7 @@ def scan():
                 count('ya_alertado')
                 continue
             minutes = int((close_at - now) // 60)
-            message = (f'ð KALSHI BTC 15M â MOVIMIENTO DE COTIZACIÃN\n'
+            message = (f'📊 KALSHI BTC 15M — MOVIMIENTO DE COTIZACIÓN\n'
                        f'Contrato: {ticker}\nLado observado: {signal["side"]}\n'
                        f'Precio de referencia: ${signal["entry"]:.3f}\n'
                        f'Cambio en precio YES: {signal["change"]:+.3f}\n'
@@ -212,9 +212,9 @@ def scan():
 
 
 def main():
-    log.info('Kalshi BTC15M v3.3 â volumen fp y diagnostico, solo alertas')
+    log.info('Kalshi BTC15M v3.4 — volumen fp y diagnostico, solo alertas')
     if TELEGRAM_TEST_ON_START:
-        if send_telegram('ð§ª Prueba de conexiÃ³n Kalshi Bot v3.3: Telegram funciona. No es una seÃ±al de mercado.'):
+        if send_telegram('🧪 Prueba de conexión Kalshi Bot v3.3: Telegram funciona. No es una señal de mercado.'):
             log.info('Prueba Telegram enviada correctamente')
         else:
             log.error('Prueba Telegram fallida')
