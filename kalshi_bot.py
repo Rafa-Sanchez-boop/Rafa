@@ -17,6 +17,8 @@ TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 DB_PATH = os.getenv('DB_PATH', '/var/data/kalshi_bot.sqlite3')
 SCAN_SECONDS = max(15, int(os.getenv('SCAN_SECONDS', '20')))
+OPEN_MIN_FREQUENCY = min(0.95, max(0.50, float(os.getenv('OPEN_MIN_FREQUENCY', '0.65'))))
+OPEN_MIN_MOVE_USD = max(0.0, float(os.getenv('OPEN_MIN_MOVE_USD', '5')))
 MAX_SPREAD = Decimal(os.getenv('MAX_SPREAD', '0.04'))
 MIN_MOVE = Decimal(os.getenv('MIN_MOVE', '0.025'))
 MIN_VOLUME_24H = Decimal(os.getenv('MIN_VOLUME_24H', '100'))
@@ -28,7 +30,7 @@ TELEGRAM_TEST_ON_START = os.getenv('TELEGRAM_TEST_ON_START', 'false').lower() in
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('kalshi-btc-monitor')
 session = requests.Session()
-session.headers.update({'User-Agent': 'KalshiBTC15MMonitor/3.5'})
+session.headers.update({'User-Agent': 'KalshiBTC15MMonitor/3.6'})
 
 
 def dec(value):
@@ -151,6 +153,32 @@ def btc_bars():
         return _btc_cache['bars'] if _btc_cache['bars'] and now - _btc_cache['bars'][-1][0] < 180 else []
 
 
+_spot_cache = {'at': 0, 'price': None}
+
+
+def btc_spot():
+    """Recent Kraken BTC last trade; not the Kalshi settlement index."""
+    now = time.time()
+    if now - _spot_cache['at'] < 12:
+        return _spot_cache['price']
+    try:
+        response = session.get('https://api.kraken.com/0/public/Ticker',
+                               params={'pair': 'XBTUSD'}, timeout=8)
+        response.raise_for_status()
+        data = response.json()
+        if data.get('error'):
+            raise ValueError(str(data['error']))
+        key = next(iter(data['result']))
+        price = float(data['result'][key]['c'][0])
+        if not (1000 < price < 10000000):
+            raise ValueError('Invalid BTC spot')
+        _spot_cache.update(at=now, price=price)
+        return price
+    except (requests.RequestException, ValueError, KeyError, TypeError, StopIteration) as exc:
+        log.warning('BTC spot unavailable: %s', exc)
+        return None
+
+
 def empirical_probability(bars, horizon, strike=None):
     """Experimental analog estimator. Not calibrated or validated for Kalshi."""
     closes = [price for _, price in bars]
@@ -173,32 +201,41 @@ def empirical_probability(bars, horizon, strike=None):
 
 
 def initial_move_target(bars, spot, window=2):
-    """Historical 1-minute analogs for the next 2 minutes; NOT tick-level prediction."""
+    """Two-minute historical close-to-close analogs, not exact intraminute extremes."""
     closes = [p for _, p in bars]
-    if len(closes) < 180 or min(closes) <= 0:
+    if len(closes) < 180 or min(closes) <= 0 or spot <= 0:
         return None
     momentum = closes[-1] / closes[-6] - 1
     analogs = []
     for i in range(6, len(closes) - window):
         past = closes[i] / closes[i - 5] - 1
         move = closes[i + window] / closes[i] - 1
-        analogs.append((abs(past - momentum), move))
+        analogs.append((abs(past - momentum), i, move))
     analogs.sort(key=lambda x: x[0])
-    returns = [ret for _, ret in analogs[:80]]
+    chosen = []
+    for _, index, ret in analogs:
+        if all(abs(index - previous) > window for previous, _ in chosen):
+            chosen.append((index, ret))
+        if len(chosen) == 80:
+            break
+    returns = [ret for _, ret in chosen]
     if len(returns) < 50:
         return None
     up_count = sum(x > 0 for x in returns)
     down_count = sum(x < 0 for x in returns)
-    if max(up_count, down_count) / len(returns) < 0.65:
+    frequency = max(up_count, down_count) / len(returns)
+    if frequency < OPEN_MIN_FREQUENCY:
         return None
     direction = 'UP' if up_count > down_count else 'DOWN'
-    matching = sorted(abs(x) for x in returns if (x > 0 if direction == 'UP' else x < 0))
+    matching = sorted(abs(x) for x in returns
+                      if (x > 0 if direction == 'UP' else x < 0))
     if len(matching) < 25:
         return None
-    # Median observed close-to-close move, not an exact intraperiod extreme.
     median_move = matching[len(matching) // 2]
     target = spot * (1 + median_move if direction == 'UP' else 1 - median_move)
-    return direction, target, len(returns), max(up_count, down_count) / len(returns)
+    if abs(target - spot) < OPEN_MIN_MOVE_USD:
+        return None
+    return direction, target, len(returns), frequency
 
 
 def strike_price(market):
@@ -220,8 +257,13 @@ def opening_message(market, now, close_at):
     if not bars:
         log.info('OPEN skipped: BTC history unavailable')
         return None
-    # Last closed candle is historical context, not a real-time opening quote.
-    spot = bars[-1][1]
+    spot = btc_spot()
+    if spot is None:
+        log.info('OPEN skipped: fresh BTC spot unavailable')
+        return None
+    if abs(spot / bars[-1][1] - 1) > 0.02:
+        log.warning('OPEN skipped: Kraken spot diverges from last closed candle')
+        return None
     quick = initial_move_target(bars, spot)
     if quick is None:
         log.info('OPEN skipped: insufficient historical direction evidence')
@@ -233,7 +275,7 @@ def opening_message(market, now, close_at):
         '📊 BTC KALSHI — ENTRADA INICIAL\n'
         f'{"🔻 DOWN" if side == "DOWN" else "🔺 UP"}\n'
         '━━━━━━━━━━━━━━━━━━\n'
-        f'💰 Precio inicial de referencia (último cierre Kraken): ${spot:,.2f}\n'
+        f'💰 Precio al detectar señal (Kraken): ${spot:,.2f}\n'
         f'🎯 Objetivo estimado: ${target:,.2f}\n'
         f'📏 Movimiento esperado: {delta:+,.2f} USD\n'
         '⏱️ Ventana de análisis: Primeros 2 minutos\n'
@@ -243,7 +285,7 @@ def opening_message(market, now, close_at):
         f'⏳ Tiempo restante del contrato: {remaining // 60:02d}:{remaining % 60:02d}\n'
         f'🧾 Contrato: {market.get("ticker", "")}\n'
         '⚠️ Estimación experimental con cierres de velas de 1 minuto. '
-        'No es el precio exacto de apertura, ni un máximo/mínimo garantizado. '
+        'No es la apertura oficial de Kalshi ni un máximo/mínimo garantizado. '
         'No implica beneficio al vender en Kalshi.'
     )
 
@@ -393,7 +435,7 @@ def scan():
 
 
 def main():
-    log.info('Kalshi BTC15M experimental historical analog signals; no trading')
+    log.info('Kalshi BTC15M v3.6 independent opening alerts; no trading')
     if TELEGRAM_TEST_ON_START:
         if send_telegram('🧪 Prueba de conexión Kalshi Bot v3.3: Telegram funciona. No es una señal de mercado.'):
             log.info('Prueba Telegram enviada correctamente')
