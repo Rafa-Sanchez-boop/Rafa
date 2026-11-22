@@ -23,7 +23,9 @@ MIN_REMAINING = max(300, int(os.getenv("MIN_REMAINING_SECONDS", "300")))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-only")
 http = requests.Session()
-http.headers["User-Agent"] = "KalshiOnlyBTC15M/4.3"
+http.headers["User-Agent"] = "KalshiOnlyBTC15M/4.4"
+# Extra in-process protection against opposite alerts during a worker lifetime.
+alerted_tickers = set()
 
 def dec(x):
     try:
@@ -95,8 +97,11 @@ def sample(db, ticker, now, mid):
 
 def signal(db, m, now, close_at, open_at, phase):
     ticker = m["ticker"]
-    if db.execute("SELECT 1 FROM kalshi_only_alerts WHERE ticker=? AND phase=?",
-                  (ticker, phase)).fetchone():
+    if ticker in alerted_tickers:
+        return
+    if db.execute("SELECT 1 FROM kalshi_only_alerts WHERE ticker=?",
+                  (ticker,)).fetchone():
+        alerted_tickers.add(ticker)
         return
     q = quote(m)
     if q is None:
@@ -152,7 +157,8 @@ def signal(db, m, now, close_at, open_at, phase):
           "Alerta informativa, no operación automática."
     )
     if notify(message):
-        db.execute("INSERT INTO kalshi_only_alerts VALUES (?,?,?,?)",
+        alerted_tickers.add(ticker)
+        db.execute("INSERT OR IGNORE INTO kalshi_only_alerts VALUES (?,?,?,?)",
                    (ticker, phase, now, direction))
         log.info("Kalshi-only %s alert: %s %s", phase, ticker, direction)
 
@@ -210,7 +216,7 @@ def scan():
         db.commit()
 
 def main():
-    log.info("Kalshi-only BTC15M v4.3: continuous opportunities after 120s; no late alerts; no Kraken")
+    log.info("Kalshi-only BTC15M v4.4: continuous opportunities after 120s; no late alerts; no Kraken")
     while True:
         try:
             scan()
