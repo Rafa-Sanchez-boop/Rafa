@@ -17,6 +17,8 @@ TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 DB_PATH = os.getenv('DB_PATH', '/var/data/kalshi_bot.sqlite3')
 SCAN_SECONDS = max(15, int(os.getenv('SCAN_SECONDS', '20')))
+MULTI_HORIZONS = (2, 3, 5, 10)
+MIN_HORIZON_EVALUATIONS = 50
 OPEN_MIN_FREQUENCY = min(0.95, max(0.50, float(os.getenv('OPEN_MIN_FREQUENCY', '0.65'))))
 OPEN_MIN_MOVE_USD = max(0.0, float(os.getenv('OPEN_MIN_MOVE_USD', '5')))
 MAX_SPREAD = Decimal(os.getenv('MAX_SPREAD', '0.04'))
@@ -67,6 +69,13 @@ def db_open():
         PRIMARY KEY(ticker, observed_at)
     )""")
     db.execute('CREATE INDEX IF NOT EXISTS idx_open_samples ON opening_price_samples(ticker, observed_at)')
+    db.execute("""CREATE TABLE IF NOT EXISTS horizon_evaluations (
+        ticker TEXT NOT NULL, horizon_minutes INTEGER NOT NULL,
+        due_at REAL NOT NULL, evaluated_at REAL, observed_price REAL,
+        direction_correct INTEGER, target_error_usd REAL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        PRIMARY KEY(ticker, horizon_minutes)
+    )""")
     db.commit()
     return db
 
@@ -289,7 +298,44 @@ def strike_price(market):
 
 
 
-def opening_message(market, now, close_at):
+def selected_horizon(db):
+    """Use a proven horizon; until enough evidence, retain the 2-minute baseline."""
+    rows = db.execute(
+        "SELECT horizon_minutes,COUNT(*),AVG(direction_correct) "
+        "FROM horizon_evaluations WHERE status='evaluated' "
+        "GROUP BY horizon_minutes"
+    ).fetchall()
+    eligible = [(accuracy, -minutes, minutes) for minutes, n, accuracy in rows
+                if n >= MIN_HORIZON_EVALUATIONS and accuracy is not None]
+    return max(eligible)[2] if len(eligible) == len(MULTI_HORIZONS) else 2
+
+
+def evaluate_horizons(db, now):
+    rows = db.execute(
+        "SELECT h.ticker,h.horizon_minutes,h.due_at,p.initial_price,p.direction,p.target_price "
+        "FROM horizon_evaluations h JOIN opening_predictions p ON p.ticker=h.ticker "
+        "WHERE h.status='pending' AND h.due_at<=?", (now,)
+    ).fetchall()
+    if not rows:
+        return
+    price = btc_spot()
+    for ticker, minutes, due, initial, direction, target in rows:
+        if now - due > max(45, SCAN_SECONDS * 2):
+            db.execute("UPDATE horizon_evaluations SET status='missing_observation' "
+                       "WHERE ticker=? AND horizon_minutes=?", (ticker, minutes))
+            continue
+        if price is None:
+            continue
+        correct = int(price > initial if direction == 'UP' else price < initial)
+        db.execute("UPDATE horizon_evaluations SET status='evaluated',evaluated_at=?,"
+                   "observed_price=?,direction_correct=?,target_error_usd=? "
+                   "WHERE ticker=? AND horizon_minutes=?",
+                   (now, price, correct, abs(price-target), ticker, minutes))
+        log.info('HORIZON evaluated ticker=%s minutes=%d correct=%d price=%.2f',
+                 ticker, minutes, correct, price)
+
+
+def opening_message(market, now, close_at, horizon=2):
     """Independent opening move alert; never implies Kalshi settlement or profit."""
     remaining = int(close_at - now)
     if not (780 <= remaining <= 900):
@@ -305,7 +351,7 @@ def opening_message(market, now, close_at):
     if abs(spot / bars[-1][1] - 1) > 0.02:
         log.warning('OPEN report: Kraken spot diverges from last closed candle')
         return '📊 BTC KALSHI — PRIMEROS 2 MINUTOS\n⚪ SIN PRONÓSTICO: precios inconsistentes'
-    quick = initial_move_target(bars, spot)
+    quick = initial_move_target(bars, spot, window=horizon)
     if quick is None:
         log.info('OPEN report: insufficient historical direction evidence')
         return '📊 BTC KALSHI — PRIMEROS 2 MINUTOS\n⚪ SIN PRONÓSTICO: muestras insuficientes'
@@ -532,6 +578,7 @@ def scan():
     with db_open() as db:
         record_opening_prices(db, now)
         evaluate_opening_predictions(db, now)
+        evaluate_horizons(db, now)
         for market in markets:
             ticker = market.get('ticker', '')
             if not isinstance(ticker, str) or not ticker.startswith(SERIES + '-'):
@@ -554,21 +601,28 @@ def scan():
             for phase, table in (('OPEN', 'opening_alerts'), ('FINAL', 'final_alerts')):
                 if db.execute(f'SELECT 1 FROM {table} WHERE ticker=?', (ticker,)).fetchone():
                     continue
-                message = (opening_message(market, now, close_at) if phase == 'OPEN'
+                message = (opening_message(market, now, close_at, selected_horizon(db)) if phase == 'OPEN'
                            else prediction_message(market, now, close_at, phase))
                 if message and send_telegram(message):
                     if phase == 'OPEN' and '🎯 Objetivo estimado:' in message:
                         bars = btc_bars()
                         spot = btc_spot()
-                        quick = initial_move_target(bars, spot) if bars and spot else None
+                        horizon = selected_horizon(db)
+                        quick = initial_move_target(bars, spot, window=horizon) if bars and spot else None
                         if quick:
                             direction, target, _, _, _ = quick
                             db.execute(
                                 "INSERT OR IGNORE INTO opening_predictions "
                                 "(ticker,predicted_at,initial_price,direction,target_price,"
                                 "horizon_seconds,model_version) VALUES (?,?,?,?,?,?,?)",
-                                (ticker, now, spot, direction, target, 120, '3.9')
+                                (ticker, now, spot, direction, target, horizon * 60, '3.11')
                             )
+                            for minutes in MULTI_HORIZONS:
+                                db.execute(
+                                    "INSERT OR IGNORE INTO horizon_evaluations "
+                                    "(ticker,horizon_minutes,due_at) VALUES (?,?,?)",
+                                    (ticker, minutes, now + minutes * 60)
+                                )
                     db.execute(f'INSERT INTO {table} VALUES (?,?)', (ticker, now))
                     sent += 1
                     log.info('Experimental %s signal sent: %s', phase, ticker)
@@ -596,7 +650,7 @@ def scan():
 
 
 def main():
-    log.info('Kalshi BTC15M v3.10 opening sampled price paths; no trading')
+    log.info('Kalshi BTC15M v3.11 multi-horizon evaluation; no trading')
     if TELEGRAM_TEST_ON_START:
         if send_telegram('🧪 Prueba de conexión Kalshi Bot v3.3: Telegram funciona. No es una señal de mercado.'):
             log.info('Prueba Telegram enviada correctamente')
