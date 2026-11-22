@@ -63,10 +63,30 @@ class ReadOnlyKalshi:
         orders = self._collect("/trade-api/v2/portfolio/orders", "orders")
         positions = self._collect("/trade-api/v2/portfolio/positions", "market_positions")
         # Block any future automated entry when there is unrecognized exposure.
-        active_orders = [o for o in orders if o.get("status") in ("resting", "pending")]
-        active_positions = [p for p in positions if (
-            float(p.get("position_fp") or p.get("position") or 0) != 0
-        )]
+        # Fail closed on unknown statuses or missing position quantities.
+        closed_statuses = {"canceled", "cancelled", "executed"}
+        active_orders = []
+        for order in orders:
+            if not isinstance(order, dict) or not isinstance(order.get("status"), str):
+                raise ReconciliationError("Unrecognized order record")
+            if order["status"].lower() not in closed_statuses:
+                active_orders.append(order)
+        from decimal import Decimal, InvalidOperation
+        active_positions = []
+        for position in positions:
+            if not isinstance(position, dict):
+                raise ReconciliationError("Unrecognized position record")
+            value = position.get("position_fp", position.get("position"))
+            if value is None:
+                raise ReconciliationError("Position quantity missing")
+            try:
+                quantity = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise ReconciliationError("Invalid position quantity") from exc
+            if not quantity.is_finite():
+                raise ReconciliationError("Nonfinite position quantity")
+            if quantity != 0:
+                active_positions.append(position)
         return {"balance_cents": balance["balance"],
                 "orders_total": len(orders),
                 "active_orders": len(active_orders),
