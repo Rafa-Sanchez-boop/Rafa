@@ -267,35 +267,22 @@ def signal(db, m, now, close_at, open_at, phase):
     direction = "UP" if up else "DOWN"
     entry = ask if up else Decimal(1) - bid
     remaining = max(0, int(close_at - now))
-    learned = learning_summary(db, direction)
-    historical = accuracy_report(db)
-    model_line = model_assessment(db, direction, change, remaining)
-    interpretation = (
-        "\n🧠 INTERPRETACIÓN — cotizaciones de Kalshi\n"
-        + f"📊 Probabilidad implícita YES aproximada: {mid * 100:.1f}%\n"
-        + f"📈 Posible subida: YES podría superar ${mid:.3f} si continúa la presión compradora; sin objetivo cuantificado.\n"
-        + f"📉 Posible bajada: YES podría caer por debajo de ${mid:.3f} si domina la presión vendedora; sin objetivo cuantificado.\n"
-        + f"🔄 Referencia de cambio de rumbo: YES ${prior:.3f} (cotización observada hace al menos 60 segundos).\n"
-        + f"🔎 Interpretación: YES {'subió' if up else 'bajó'} {abs(change) * 100:.1f} centavos respecto a esa referencia.\n"
-        + "⚠️ Estas cifras son del contrato, NO del precio BTC/USD. No hay base para calcular objetivos BTC en dólares ni una confianza estadística validada.\n"
-    )
-    phase_name = "OPORTUNIDAD A TIEMPO"
+    # Keep learning, accuracy, and model assessment in SQLite/logs, not Telegram.
+    log.info("Internal learning %s: %s | %s | %s",
+             ticker, learning_summary(db, direction),
+             accuracy_report(db), model_assessment(db, direction, change, remaining))
     message = (
-        "📊 BTC KALSHI — " + phase_name + "\n"
+        "📊 BTC KALSHI — OPORTUNIDAD A TIEMPO\n"
         + ("🔺 UP" if up else "🔻 DOWN") + " | SEÑAL EXPERIMENTAL\n"
         + "━━━━━━━━━━━━━━━━━━\n"
-        + f"📈 Precio YES anterior (Kalshi): ${prior:.3f}\n"
-        + f"📈 Precio YES actual (Kalshi): ${mid:.3f}\n"
-        + f"📏 Cambio en cotización YES: {change:+.3f}\n"
+        + f"📈 YES anterior: ${prior:.3f}\n"
+        + f"📈 YES actual: ${mid:.3f}\n"
+        + f"📏 Cambio YES: {change:+.3f}\n"
         + f"🎟️ Entrada indicativa {direction}: ${entry:.2f}\n"
         + f"⏳ Tiempo restante: {remaining//60:02d}:{remaining%60:02d}\n"
         + f"🧾 Contrato: {ticker}\n"
-        + interpretation
-        + learned + "\n" + historical + "\n" + model_line + "\n"
-        +  "⚠️ Señal basada exclusivamente en cotizaciones de Kalshi. "
-          "El movimiento de cotización no garantiza el resultado final. "
-          "No se fija objetivo de venta; comisiones y liquidez pueden impedir beneficio. "
-          "Alerta informativa, no operación automática."
+        + f"🔎 Tendencia YES: {'subiendo' if up else 'bajando'}; puede revertirse.\n"
+        + "⚠️ Señal informativa, no garantiza el resultado."
     )
     if notify(message):
         alerted_tickers.add(ticker)
