@@ -5,5 +5,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY kalshi_bot.py .
 COPY kalshi_auth.py .
 COPY kalshi_paper.py .
+COPY kalshi_reconcile.py .
 ENV PYTHONUNBUFFERED=1
 CMD ["python", "-u", "kalshi_bot.py"]
