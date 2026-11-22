@@ -47,7 +47,9 @@ def db_open():
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_only_alerts
                (ticker TEXT, phase TEXT, sent_at REAL, direction TEXT,
                 PRIMARY KEY(ticker,phase))""")
-    db.execute("""CREATE TABLE IF NOT EXISTS btc_reference_samples\n               (observed_at REAL PRIMARY KEY, price TEXT)""")\n    db.execute("""CREATE TABLE IF NOT EXISTS kalshi_only_results
+    db.execute("""CREATE TABLE IF NOT EXISTS btc_reference_samples
+               (observed_at REAL PRIMARY KEY, price TEXT)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS kalshi_only_results
                (ticker TEXT PRIMARY KEY, result TEXT, observed_at REAL)""")
     db.commit()
     return db
@@ -172,7 +174,8 @@ def signal(db, m, now, close_at, open_at, phase):
     direction = "UP" if up else "DOWN"
     entry = ask if up else Decimal(1) - bid
     remaining = max(0, int(close_at - now))
-    kraken_line = kraken_reference(db, now)\n    interpretation = (
+    kraken_line = kraken_reference(db, now)
+    interpretation = (
         "\n🧠 INTERPRETACIÓN — cotizaciones de Kalshi\n"
         + f"📊 Probabilidad implícita YES aproximada: {mid * 100:.1f}%\n"
         + f"📈 Posible subida: YES podría superar ${mid:.3f} si continúa la presión compradora; sin objetivo cuantificado.\n"
@@ -196,7 +199,8 @@ def signal(db, m, now, close_at, open_at, phase):
         +  "⚠️ Señal basada exclusivamente en cotizaciones de Kalshi. "
           "El movimiento de cotización no garantiza el resultado final. "
           "No se fija objetivo de venta; comisiones y liquidez pueden impedir beneficio. "
-          "Referencia BTC/USD de Kraken solo informativa. "\n          "Alerta informativa, no operación automática."
+          "Referencia BTC/USD de Kraken solo informativa. "
+          "Alerta informativa, no operación automática."
     )
     if notify(message):
         alerted_tickers.add(ticker)
@@ -254,7 +258,8 @@ def scan():
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
-        db.execute("DELETE FROM kalshi_only_samples WHERE observed_at < ?", (now - 48 * 3600,))\n        db.execute("DELETE FROM btc_reference_samples WHERE observed_at < ?", (now - 48 * 3600,))
+        db.execute("DELETE FROM kalshi_only_samples WHERE observed_at < ?", (now - 48 * 3600,))
+        db.execute("DELETE FROM btc_reference_samples WHERE observed_at < ?", (now - 48 * 3600,))
         db.commit()
 
 def main():
