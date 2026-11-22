@@ -21,7 +21,7 @@ TICK = Decimal("0.01")
 MAX_SPREAD = Decimal(os.getenv("MAX_SPREAD", "0.04"))
 MIN_MOVE = Decimal(os.getenv("MIN_MOVE", "0.025"))
 MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
-MIN_REMAINING = max(121, int(os.getenv("MIN_REMAINING_SECONDS", "121")))
+MIN_REMAINING = max(300, int(os.getenv("MIN_REMAINING_SECONDS", "300")))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-only")
 http = requests.Session()
@@ -140,7 +140,7 @@ def signal(db, m, now, close_at, open_at, phase):
     if not target_valid:
         log.info("35-tick target infeasible for %s; sending directional observation without target", ticker)
     remaining = max(0, int(close_at - now))
-    phase_name = "DESPUÉS DE 2 MINUTOS" if phase == "OPEN" else "ÚLTIMOS 3 MINUTOS"
+    phase_name = "OPORTUNIDAD A TIEMPO"
     message = (
         "📊 BTC KALSHI — " + phase_name + "\n"
         + ("🔺 UP" if up else "🔻 DOWN") + " | SEÑAL EXPERIMENTAL\n"
@@ -204,11 +204,10 @@ def scan():
             if q:
                 sample(db, ticker, now, q[2])
             remaining = closes - now
+            # Scan continuously after initial analysis, until five minutes remain.
+            # OPEN phase is used for one alert per contract.
             if now - opened >= DELAY and remaining >= MIN_REMAINING:
-                if 720 <= remaining <= 780:
-                    signal(db, m, now, closes, opened, "OPEN")
-                if MIN_REMAINING <= remaining <= 180:
-                    signal(db, m, now, closes, opened, "FINAL")
+                signal(db, m, now, closes, opened, "OPEN")
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
@@ -216,7 +215,7 @@ def scan():
         db.commit()
 
 def main():
-    log.info("Kalshi-only BTC15M v4.0: observe first 120s; alerts only; no Kraken")
+    log.info("Kalshi-only BTC15M v4.1: continuous opportunities after 120s; no late alerts; no Kraken")
     while True:
         try:
             scan()
