@@ -56,6 +56,14 @@ def db_open():
                 remaining_seconds INTEGER, recorded_at REAL)""")
     db.execute("""CREATE TABLE IF NOT EXISTS learning_audit
                (ticker TEXT PRIMARY KEY, correct INTEGER, assessed_at REAL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS daily_learning
+               (day TEXT PRIMARY KEY, total INTEGER, correct INTEGER,
+                up_total INTEGER, up_correct INTEGER,
+                down_total INTEGER, down_correct INTEGER,
+                generated_at REAL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS market_observations
+               (ticker TEXT, observed_at REAL, yes_bid TEXT, yes_ask TEXT,
+                yes_mid TEXT, volume TEXT, PRIMARY KEY(ticker, observed_at))""")
     db.commit()
     return db
 
@@ -173,6 +181,20 @@ def accuracy_report(db):
             f"{hits}/{n} = {hits/n:.1%}\\n"
             f"🔺 UP: {up_hits}/{up_n} | 🔻 DOWN: {down_hits}/{down_n}\\n"
             "⚠️ No equivale a rentabilidad ni precisión predictiva validada.")
+
+def daily_recalibration(db, now):
+    """Daily historical checkpoint; no unvalidated live strategy changes."""
+    day = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+    if db.execute("SELECT 1 FROM daily_learning WHERE day=?", (day,)).fetchone():
+        return
+    n, hits = performance(db)
+    up_n, up_hits = performance(db, "UP")
+    down_n, down_hits = performance(db, "DOWN")
+    db.execute("INSERT OR IGNORE INTO daily_learning VALUES (?,?,?,?,?,?,?,?)",
+               (day, n, hits, up_n, up_hits, down_n, down_hits, now))
+    log.info("Daily learning checkpoint %s: total=%d correct=%d UP=%d/%d DOWN=%d/%d",
+             day, n, hits, up_hits, up_n, down_hits, down_n)
+
 
 def signal(db, m, now, close_at, open_at, phase):
     ticker = m["ticker"]
@@ -304,6 +326,9 @@ def scan():
             q = quote(m)
             if q:
                 sample(db, ticker, now, q[2])
+                volume = m.get("volume_24h_fp") or m.get("volume_24h")
+                db.execute("INSERT OR IGNORE INTO market_observations VALUES (?,?,?,?,?,?)",
+                           (ticker, now, str(q[0]), str(q[1]), str(q[2]), str(volume)))
             remaining = closes - now
             # Scan continuously after initial analysis, until the contract closes.
             # OPEN phase is used for one alert per contract.
@@ -312,12 +337,13 @@ def scan():
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
+        daily_recalibration(db, now)
         db.execute("DELETE FROM kalshi_only_samples WHERE observed_at < ?", (now - 48 * 3600,))
         db.execute("DELETE FROM btc_reference_samples WHERE observed_at < ?", (now - 48 * 3600,))
         db.commit()
 
 def main():
-    log.info("Kalshi BTC15M v5.1: Kraken, interpretation and historical learning")
+    log.info("Kalshi BTC15M v5.2: continuous observations and daily learning snapshots")
     while True:
         try:
             scan()
