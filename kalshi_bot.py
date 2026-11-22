@@ -16,10 +16,10 @@ SERIES = os.getenv('KALSHI_SERIES', 'KXBTC15M')
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 DB_PATH = os.getenv('DB_PATH', '/var/data/kalshi_bot.sqlite3')
-SCAN_SECONDS = max(20, int(os.getenv('SCAN_SECONDS', '30')))
+SCAN_SECONDS = max(60, int(os.getenv('SCAN_SECONDS', '60')))
 MAX_SPREAD = Decimal(os.getenv('MAX_SPREAD', '0.04'))
 MIN_MOVE = Decimal(os.getenv('MIN_MOVE', '0.025'))
-MIN_VOLUME_24H = int(os.getenv('MIN_VOLUME_24H', '100'))
+MIN_VOLUME_24H = Decimal(os.getenv('MIN_VOLUME_24H', '100'))
 MIN_REMAINING_SECONDS = int(os.getenv('MIN_REMAINING_SECONDS', '90'))
 ALERT_COOLDOWN_HOURS = max(0, float(os.getenv('ALERT_COOLDOWN_HOURS', '6')))
 TOP_ALERTS = max(1, int(os.getenv('TOP_ALERTS', '15')))
@@ -28,7 +28,7 @@ TELEGRAM_TEST_ON_START = os.getenv('TELEGRAM_TEST_ON_START', 'false').lower() in
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('kalshi-btc-monitor')
 session = requests.Session()
-session.headers.update({'User-Agent': 'KalshiBTC15MMonitor/3.2'})
+session.headers.update({'User-Agent': 'KalshiBTC15MMonitor/3.3'})
 
 
 def dec(value):
@@ -101,10 +101,13 @@ def analyze(market, previous_mid):
     spread = ask - bid
     if spread > MAX_SPREAD:
         return None, 'spread_alto'
-    try:
-        volume = int(market.get('volume_24h') or 0)
-    except (ValueError, TypeError):
-        volume = 0
+    # Prefer the fixed-point volume field; older API responses may provide volume_24h.
+    # Missing volume is unknown, not zero. Never silently bypass the filter.
+    volume = dec(market.get('volume_24h_fp'))
+    if volume is None:
+        volume = dec(market.get('volume_24h'))
+    if volume is None:
+        return None, 'volumen_no_disponible'
     if volume < MIN_VOLUME_24H:
         return None, 'volumen_bajo'
     mid = (bid + ask) / 2
@@ -201,17 +204,17 @@ def scan():
             else:
                 count('telegram_fallo')
         db.execute('DELETE FROM snapshots WHERE observed_at < ?', (now - 48 * 3600,))
-        db.execute('DELETE FROM alerts WHERE sent_at < ?',
-                   (now - max(48, ALERT_COOLDOWN_HOURS) * 3600,))
+        # BTC 15m tickers are unique. Keep alert history so a restart never
+        # re-sends an old contract; only snapshot history is pruned.
         db.commit()
     details = ', '.join(f'{key}={value}' for key, value in sorted(reasons.items())) or 'sin_detalles'
     log.info('Escaneo: %s mercados, %s alertas | motivos: %s', len(markets), sent, details)
 
 
 def main():
-    log.info('Kalshi BTC15M v3.2 â metricas de mercado, solo alertas')
+    log.info('Kalshi BTC15M v3.3 â volumen fp y diagnostico, solo alertas')
     if TELEGRAM_TEST_ON_START:
-        if send_telegram('ð§ª Prueba de conexiÃ³n Kalshi Bot v3.2: Telegram funciona. No es una seÃ±al de mercado.'):
+        if send_telegram('ð§ª Prueba de conexiÃ³n Kalshi Bot v3.3: Telegram funciona. No es una seÃ±al de mercado.'):
             log.info('Prueba Telegram enviada correctamente')
         else:
             log.error('Prueba Telegram fallida')
