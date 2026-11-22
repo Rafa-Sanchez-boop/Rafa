@@ -180,10 +180,11 @@ def check_results(db, now):
             correct = (predicted[0] == "UP" and result == "yes") or (
                 predicted[0] == "DOWN" and result == "no")
             notify(f"📊 KALSHI — RESULTADO OFICIAL\n🧾 {ticker}\n"
-                   f"🔮 Pronóstico: {predicted[0]}\n"
-                   f"🏁 Resultado Kalshi: {result.upper()}\n"
-                   f"{'✅ ACERTÓ' if correct else '❌ FALLÓ'}\n"
-                   "⚠️ Acertar dirección no confirma que se vendiera al objetivo de 35 ticks.")
+                   f"📈 Dirección de momentum observada: {predicted[0]}\n"
+                   f"🏁 Resultado final Kalshi: {result.upper()}\n"
+                   f"{'Coincidió' if correct else 'No coincidió'} con el resultado final.\n"
+                   "⚠️ La señal mide momentum de cotización, no predice "
+                   "el resultado final ni confirma venta al objetivo.")
 
 def scan():
     payload = get_json("/markets", {"series_ticker": SERIES, "status": "open", "limit": 100})
