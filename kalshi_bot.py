@@ -24,7 +24,7 @@ OPEN_MIN_MOVE_USD = max(0.0, float(os.getenv('OPEN_MIN_MOVE_USD', '5')))
 MAX_SPREAD = Decimal(os.getenv('MAX_SPREAD', '0.04'))
 MIN_MOVE = Decimal(os.getenv('MIN_MOVE', '0.025'))
 MIN_VOLUME_24H = Decimal(os.getenv('MIN_VOLUME_24H', '100'))
-MIN_REMAINING_SECONDS = int(os.getenv('MIN_REMAINING_SECONDS', '90'))
+MIN_REMAINING_SECONDS = max(121, int(os.getenv('MIN_REMAINING_SECONDS', '121')))
 ALERT_COOLDOWN_HOURS = max(0, float(os.getenv('ALERT_COOLDOWN_HOURS', '6')))
 TOP_ALERTS = max(1, int(os.getenv('TOP_ALERTS', '15')))
 TELEGRAM_TEST_ON_START = os.getenv('TELEGRAM_TEST_ON_START', 'false').lower() in ('1', 'true', 'yes')
@@ -391,7 +391,7 @@ def prediction_message(market, now, close_at, phase):
     remaining = int(close_at - now)
     if phase == 'OPEN' and not (810 <= remaining <= 900):
         return None
-    if phase == 'FINAL' and not (20 <= remaining <= 180):
+    if phase == 'FINAL' and not (MIN_REMAINING_SECONDS <= remaining <= 180):
         return None
     bars = btc_bars()
     if not bars:
@@ -589,7 +589,7 @@ def scan():
             if close_at is None:
                 count('sin_cierre')
                 continue
-            if close_at - now < 20:
+            if close_at - now < MIN_REMAINING_SECONDS:
                 count('poco_tiempo')
                 continue
             if open_at and open_at > now:
