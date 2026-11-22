@@ -304,9 +304,9 @@ def signal(db, m, now, close_at, open_at, phase):
         # market's open_time can predate the 15-minute trading window, and
         # a worker restart may miss the first minute. Never fabricate a quote.
         rows = db.execute("""SELECT yes_mid, observed_at FROM kalshi_only_samples
-            WHERE ticker=? AND observed_at<=?
+            WHERE ticker=? AND observed_at BETWEEN ? AND ?
             ORDER BY observed_at ASC LIMIT 1""",
-            (ticker, now - 30)).fetchone()
+            (ticker, now - 90, now - 30)).fetchone()
         if not rows:
             log.info("Waiting for 30s of observed Kalshi quotes for %s", ticker)
             return
@@ -435,7 +435,7 @@ def main():
     if check_private_api():
         from kalshi_reconcile import startup_reconciliation
         startup_reconciliation()  # Read-only; fail closed, no orders.
-    log.info("Kalshi BTC15M v5.3: daily retraining with temporal holdout")
+    log.info("Kalshi BTC15M v5.5: rolling 30-90s signal baseline; no live trading")
     while True:
         try:
             scan()
