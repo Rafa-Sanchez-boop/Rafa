@@ -67,7 +67,6 @@ def db_open():
                (day TEXT PRIMARY KEY, trained_at REAL, samples INTEGER,
                 validation_count INTEGER, validation_brier REAL,
                 baseline_brier REAL, active INTEGER, model_json TEXT)""")
-    db.execute("""CREATE TABLE IF NOT EXISTS btc_reference_samples (observed_at REAL PRIMARY KEY, price REAL)""")
     db.commit()
     return db
 
@@ -104,32 +103,6 @@ def notify(msg):
     except (requests.RequestException, ValueError):
         log.exception("Telegram send failed")
         return False
-
-def kraken_reference(db, now):
-    """BTC/USD illustrative one-step extrapolation from observed Kraken prices."""
-    try:
-        r = http.get("https://api.kraken.com/0/public/Ticker",
-                     params={"pair": "XBTUSD"}, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("error"):
-            raise ValueError(str(data["error"]))
-        item = next(iter(data["result"].values()))
-        current = float(item["c"][0])
-        if not (1000 < current < 10000000):
-            raise ValueError("Invalid BTC quote")
-        old = db.execute("""SELECT price FROM btc_reference_samples
-            WHERE observed_at <= ? ORDER BY observed_at DESC LIMIT 1""",
-                         (now - 60,)).fetchone()
-        db.execute("INSERT OR IGNORE INTO btc_reference_samples VALUES (?,?)", (now, current))
-        db.execute("DELETE FROM btc_reference_samples WHERE observed_at < ?", (now - 86400,))
-        if old is None:
-            return current, None
-        return current, current + (current - old[0])
-    except (requests.RequestException, ValueError, KeyError, StopIteration, TypeError) as exc:
-        log.warning("Kraken reference unavailable: %s", exc)
-        return None, None
-
 
 def quote(m):
     bid, ask = dec(m.get("yes_bid_dollars")), dec(m.get("yes_ask_dollars"))
@@ -328,20 +301,11 @@ def signal(db, m, now, close_at, open_at, phase):
     log.info("Internal learning %s: %s | %s | %s",
              ticker, learning_summary(db, direction),
              accuracy_report(db), model_assessment(db, direction, change, remaining))
-    btc_now, btc_target = kraken_reference(db, now)
-    if btc_now is None:
-        price_line = "📍 BTC/USD: referencia no disponible."
-    elif btc_target is None:
-        price_line = f"📍 BTC/USD: ${btc_now:,.2f} (calculando proyección)."
-    elif (up and btc_target <= btc_now) or (not up and btc_target >= btc_now):
-        price_line = f"📍 BTC/USD: ${btc_now:,.2f} (sin objetivo confirmado)."
-    else:
-        price_line = (f"📈 Posible {'subida' if up else 'bajada'} desde "
-                      f"${btc_now:,.2f} hacia ${btc_target:,.2f}.")
+    # Only observed Kalshi YES quotes; never extrapolate BTC/USD spot prices.
     message = (
         ("🔺 UP" if up else "🔻 DOWN") + "\n"
-        + price_line + "\n"
-        + "🔄 Después el precio puede cambiar de rumbo."
+        + f"📈 Kalshi YES: movimiento observado desde ${prior:.3f} hacia ${mid:.3f}.\n"
+        + "🔄 Después la cotización puede cambiar de rumbo."
     )
     if notify(message):
         alerted_tickers.add(ticker)
