@@ -22,7 +22,8 @@ MIN_REMAINING = 0  # Allow alerts until contract closes, including final 2-3 min
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-only")
 http = requests.Session()
-http.headers["User-Agent"] = "KalshiBTC15M/5.1"
+http.headers["User-Agent"] = "KalshiBTC15M/5.4"
+KRAKEN_TICKER = "https://api.kraken.com/0/public/Ticker"
 # Extra in-process protection against opposite alerts during a worker lifetime.
 alerted_tickers = set()
 
@@ -63,6 +64,8 @@ def db_open():
     db.execute("""CREATE TABLE IF NOT EXISTS market_observations
                (ticker TEXT, observed_at REAL, yes_bid TEXT, yes_ask TEXT,
                 yes_mid TEXT, volume TEXT, PRIMARY KEY(ticker, observed_at))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS btc_spot_samples
+               (observed_at REAL PRIMARY KEY, price TEXT NOT NULL)""")
     db.execute("""CREATE TABLE IF NOT EXISTS trained_models
                (day TEXT PRIMARY KEY, trained_at REAL, samples INTEGER,
                 validation_count INTEGER, validation_brier REAL,
@@ -85,6 +88,43 @@ def get_json(path, params=None):
                 return None
             time.sleep(2 ** attempt)
     return None
+
+def btc_projection(db, now):
+    """Extrapolate a short BTC/USD move using real Kraken spot observations."""
+    try:
+        response = http.get(KRAKEN_TICKER, params={"pair": "XBTUSD"}, timeout=8)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("error"):
+            raise ValueError(str(data["error"]))
+        entries = data.get("result", {})
+        if not entries:
+            raise ValueError("empty Kraken ticker")
+        price = dec(next(iter(entries.values()))["c"][0])
+        if price is None or price <= 0:
+            raise ValueError("invalid Kraken price")
+        db.execute("INSERT OR REPLACE INTO btc_spot_samples VALUES (?,?)",
+                   (now, str(price)))
+        db.execute("DELETE FROM btc_spot_samples WHERE observed_at < ?",
+                   (now - 3600,))
+        rows = db.execute("""SELECT observed_at, price FROM btc_spot_samples
+            WHERE observed_at >= ? ORDER BY observed_at DESC LIMIT 12""",
+            (now - 180,)).fetchall()
+        rows.reverse()
+        if len(rows) < 4 or rows[-1][0] - rows[0][0] < 30:
+            log.info("BTC/USD projection waiting for Kraken spot history")
+            return None
+        elapsed = rows[-1][0] - rows[0][0]
+        drift = (price - dec(rows[0][1])) / Decimal(str(elapsed))
+        move = drift * Decimal("30")
+        cap = price * Decimal("0.002")
+        move = max(-cap, min(cap, move))
+        if abs(move) < Decimal("0.01"):
+            return None
+        return price, price + move
+    except (requests.RequestException, ValueError, KeyError, TypeError, IndexError) as exc:
+        log.warning("Kraken unavailable; skipping incomplete alert: %s", exc)
+        return None
 
 def notify(msg):
     if not TOKEN or not CHAT_ID:
@@ -301,11 +341,19 @@ def signal(db, m, now, close_at, open_at, phase):
     log.info("Internal learning %s: %s | %s | %s",
              ticker, learning_summary(db, direction),
              accuracy_report(db), model_assessment(db, direction, change, remaining))
-    # Only observed Kalshi YES quotes; never extrapolate BTC/USD spot prices.
+    projection = btc_projection(db, now)
+    if projection is None:
+        return
+    spot, target = projection
+    if (up and target <= spot) or (not up and target >= spot):
+        log.info("Kalshi %s disagrees with BTC/USD projection; skipping %s",
+                 direction, ticker)
+        return
+    movement = "subida" if up else "bajada"
     message = (
         ("🔺 UP" if up else "🔻 DOWN") + "\n"
-        + f"📈 Kalshi YES: movimiento observado desde ${prior:.3f} hacia ${mid:.3f}.\n"
-        + "🔄 Después la cotización puede cambiar de rumbo."
+        + f"📈 Posible {movement} desde ${spot:,.2f} hacia ${target:,.2f}.\n"
+        + "🔄 Después el precio puede cambiar de rumbo."
     )
     if notify(message):
         alerted_tickers.add(ticker)
