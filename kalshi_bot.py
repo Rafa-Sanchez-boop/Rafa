@@ -19,7 +19,7 @@ DELAY = 120
 MAX_SPREAD = Decimal(os.getenv("MAX_SPREAD", "0.04"))
 MIN_MOVE = Decimal(os.getenv("MIN_MOVE", "0.025"))
 MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
-MIN_REMAINING = max(300, int(os.getenv("MIN_REMAINING_SECONDS", "300")))
+MIN_REMAINING = 0  # Allow alerts until contract closes, including final 2-3 minutes.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-only")
 http = requests.Session()
@@ -215,7 +215,7 @@ def scan():
             if q:
                 sample(db, ticker, now, q[2])
             remaining = closes - now
-            # Scan continuously after initial analysis, until five minutes remain.
+            # Scan continuously after initial analysis, until the contract closes.
             # OPEN phase is used for one alert per contract.
             if now - opened >= DELAY and remaining >= MIN_REMAINING:
                 signal(db, m, now, closes, opened, "OPEN")
@@ -226,7 +226,7 @@ def scan():
         db.commit()
 
 def main():
-    log.info("Kalshi-only BTC15M v4.5: continuous opportunities after 120s; no late alerts; no Kraken")
+    log.info("Kalshi-only BTC15M v4.6: continuous opportunities after 120s, including final minutes; no Kraken")
     while True:
         try:
             scan()
