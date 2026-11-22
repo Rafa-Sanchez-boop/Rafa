@@ -1,185 +1,212 @@
-"""
-KALSHI AI BOT v2 — Cloud alerts-only scanner
-- Public Kalshi market data only; no trading endpoints or API keys.
-- Stores snapshots and sent-alert deduplication in SQLite.
-- Optional Telegram notifications.
-- Rule-based market-momentum monitor, NOT a calibrated event-outcome predictor.
-"""
-import os, time, sqlite3, logging, math
+
+import os
+import time
+import logging
+import sqlite3
 from datetime import datetime, timezone
-from typing import Any
+
 import requests
 
 BASE = "https://external-api.kalshi.com/trade-api/v2"
-DB_PATH = os.getenv("DB_PATH", "/var/data/kalshi_bot.sqlite3")
-SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "300"))
-MIN_VOLUME = float(os.getenv("MIN_VOLUME_24H", "100"))
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.04"))
-MIN_MOVE = float(os.getenv("MIN_MOVE", "0.025"))
-ALERT_COOLDOWN_HOURS = float(os.getenv("ALERT_COOLDOWN_HOURS", "6"))
-MAX_PAGES = int(os.getenv("MAX_PAGES", "5"))
-TOP_ALERTS = int(os.getenv("TOP_ALERTS", "15"))
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+SERIES = "KXBTC15M"
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
-                    format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("kalshi-ai")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+DB_PATH = os.getenv("DB_PATH", "/tmp/btc_alerts.sqlite3")
 
-http = requests.Session()
-http.headers.update({"User-Agent": "KalshiAIAlerts/0.2"})
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+log = logging.getLogger("BTC15M")
+
+session = requests.Session()
+session.headers.update({"User-Agent": "BTC15MAlerts/1.0"})
 
 
-def db():
+def database():
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("""CREATE TABLE IF NOT EXISTS snapshots (
-        ticker TEXT NOT NULL, seen_at REAL NOT NULL, midpoint REAL NOT NULL,
-        PRIMARY KEY(ticker, seen_at))""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS alerts (
-        ticker TEXT NOT NULL, side TEXT NOT NULL, sent_at REAL NOT NULL,
-        PRIMARY KEY(ticker, side))""")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sent (
+            ticker TEXT PRIMARY KEY,
+            sent_at REAL NOT NULL
+        )
+    """)
     conn.commit()
     return conn
 
 
-def fnum(v: Any):
+def request_markets():
+    url = f"{BASE}/markets"
+    params = {
+        "series_ticker": SERIES,
+        "status": "open",
+        "limit": 10
+    }
+
+    for attempt in range(5):
+        response = session.get(
+            url, params=params, timeout=20
+        )
+
+        if response.status_code == 429:
+            delay = min(
+                int(response.headers.get("Retry-After", "0") or 0)
+                or 5 * (2 ** attempt),
+                120
+            )
+            log.warning("Rate limit. Esperando %s s", delay)
+            time.sleep(delay)
+            continue
+
+        response.raise_for_status()
+        return response.json().get("markets", [])
+
+    raise RuntimeError("Kalshi sigue limitando solicitudes")
+
+
+def number(value):
     try:
-        return float(v) if v not in (None, "") else None
-    except (ValueError, TypeError):
+        return float(value)
+    except (TypeError, ValueError):
         return None
 
 
-def get_markets():
-    all_markets, cursor, seen = [], None, set()
-    for _ in range(MAX_PAGES):
-        params = {"status": "open", "limit": 1000}
-        if cursor:
-            params["cursor"] = cursor
-        r = http.get(f"{BASE}/markets", params=params, timeout=30)
-        r.raise_for_status()
-        payload = r.json()
-        for m in payload.get("markets", []):
-            ticker = m.get("ticker")
-            if ticker and ticker not in seen:
-                all_markets.append(m)
-                seen.add(ticker)
-        cursor = payload.get("cursor")
-        if not cursor:
-            break
-    return all_markets
-
-
-def telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+def parse_time(value):
+    if not value:
+        return None
     try:
-        r = http.post(url, json={"chat_id": TELEGRAM_CHAT,
-                                 "text": message, "disable_web_page_preview": True},
-                      timeout=20)
-        r.raise_for_status()
-    except requests.RequestException:
-        log.exception("Telegram notification failed")
+        return datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        ).timestamp()
+    except ValueError:
+        return None
 
 
-def previous_midpoint(conn, ticker):
-    row = conn.execute(
-        "SELECT midpoint FROM snapshots WHERE ticker=? ORDER BY seen_at DESC LIMIT 1",
-        (ticker,)).fetchone()
-    return row[0] if row else None
+def send_telegram(message):
+    if not TOKEN or not CHAT_ID:
+        log.error("Falta configurar Telegram")
+        return False
 
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
-def was_alerted_recently(conn, ticker, side, now):
-    row = conn.execute("SELECT sent_at FROM alerts WHERE ticker=? AND side=?",
-                       (ticker, side)).fetchone()
-    return bool(row and now - row[0] < ALERT_COOLDOWN_HOURS * 3600)
-
-
-def scan_once():
-    now = time.time()
-    markets = get_markets()
-    conn = db()
-    candidates = []
-
-    for m in markets:
-        ticker = m.get("ticker", "")
-        bid = fnum(m.get("yes_bid_dollars"))
-        ask = fnum(m.get("yes_ask_dollars"))
-        vol = fnum(m.get("volume_24h_fp")) or 0.0
-
-        if not ticker or bid is None or ask is None:
-            continue
-        if not (0 < bid <= ask < 1):
-            continue
-        spread = ask - bid
-        if vol < MIN_VOLUME or spread > MAX_SPREAD:
-            continue
-
-        mid = (bid + ask) / 2
-        old_mid = previous_midpoint(conn, ticker)
-        # Save every valid observation; a new deployment starts its own baseline.
-        conn.execute("INSERT OR REPLACE INTO snapshots VALUES (?, ?, ?)",
-                     (ticker, now, mid))
-
-        if old_mid is None:
-            continue
-        move = mid - old_mid
-        if abs(move) < MIN_MOVE:
-            continue
-
-        side = "YES" if move > 0 else "NO"
-        if was_alerted_recently(conn, ticker, side, now):
-            continue
-
-        # Executable-side reference prices. These are approximate; inspect the book
-        # and current quotes before acting.
-        entry = ask if side == "YES" else (1 - bid)
-        # Momentum score is deliberately NOT represented as a probability.
-        score = min(100, abs(move) / max(MIN_MOVE, 0.001) * 50)
-        title = m.get("title") or m.get("subtitle") or ticker
-        candidates.append({
-            "ticker": ticker, "title": title, "side": side, "entry": entry,
-            "mid": mid, "move": move, "spread": spread, "volume": vol,
-            "score": score, "close": m.get("close_time", ""),
-            "category": m.get("category", "Unspecified")
-        })
-
-    conn.commit()
-    candidates.sort(key=lambda x: (x["score"], x["volume"]), reverse=True)
-    candidates = candidates[:TOP_ALERTS]
-
-    for c in candidates:
-        msg = (
-            f"🔎 KALSHI AI — WATCH {c['side']}\n"
-            f"{c['title']}\n"
-            f"Ticker: {c['ticker']}\n"
-            f"Precio de referencia de entrada: ${c['entry']:.2f}\n"
-            f"Movimiento desde escaneo anterior: {c['move']:+.1%}\n"
-            f"Spread YES: {c['spread']:.1%} | Volumen 24h: {c['volume']:.0f}\n"
-            f"Cierre: {c['close'] or 'No indicado'}\n"
-            "No es una probabilidad predictiva ni una orden. Verifica reglas, noticias, "
-            "liquidez, comisiones y precio actual antes de decidir."
+    try:
+        response = session.post(
+            url,
+            json={
+                "chat_id": CHAT_ID,
+                "text": message
+            },
+            timeout=20
         )
-        log.info("%s | %s | move=%+.3f | spread=%.3f | vol=%.0f",
-                 c["ticker"], c["side"], c["move"], c["spread"], c["volume"])
-        telegram(msg)
-        conn.execute("INSERT OR REPLACE INTO alerts VALUES (?, ?, ?)",
-                     (c["ticker"], c["side"], now))
+        response.raise_for_status()
+        return response.json().get("ok", False)
+    except requests.RequestException:
+        log.exception("Error enviando Telegram")
+        return False
 
-    conn.commit()
-    conn.close()
-    log.info("Escaneados %d mercados; alertas nuevas: %d", len(markets), len(candidates))
+
+def analyze(market):
+    yes_bid = number(market.get("yes_bid_dollars"))
+    yes_ask = number(market.get("yes_ask_dollars"))
+
+    if yes_bid is None or yes_ask is None:
+        return "SIN ENTRADA", None, "Sin cotizaciones"
+
+    if not (0 < yes_bid <= yes_ask < 1):
+        return "SIN ENTRADA", None, "Cotizaciones inválidas"
+
+    midpoint = (yes_bid + yes_ask) / 2
+    spread = yes_ask - yes_bid
+
+    if spread > 0.08:
+        return "SIN ENTRADA", None, "Spread elevado"
+
+    # Señal simple basada en precios del mercado.
+    # NO es una predicción validada de Bitcoin.
+    if midpoint >= 0.60:
+        return "SUBE - YES", yes_ask, "Mercado favorece YES"
+
+    if midpoint <= 0.40:
+        return "BAJA - NO", 1 - yes_bid, "Mercado favorece NO"
+
+    return "SIN ENTRADA", None, "Mercado sin dirección clara"
+
+
+def scan():
+    markets = request_markets()
+    now = time.time()
+    conn = database()
+
+    try:
+        for market in markets:
+            ticker = market.get("ticker", "")
+
+            if not ticker.startswith(SERIES + "-"):
+                continue
+
+            close_ts = parse_time(market.get("close_time"))
+            open_ts = parse_time(market.get("open_time"))
+
+            if not close_ts or close_ts <= now:
+                continue
+
+            if open_ts and open_ts > now:
+                continue
+
+            if open_ts and close_ts - open_ts > 960:
+                continue
+
+            existing = conn.execute(
+                "SELECT 1 FROM sent WHERE ticker=?",
+                (ticker,)
+            ).fetchone()
+
+            if existing:
+                continue
+
+            direction, entry, reason = analyze(market)
+            remaining = max(0, int((close_ts - now) / 60))
+
+            price_text = (
+                f"${entry:.2f}"
+                if entry is not None
+                else "No disponible"
+            )
+
+            message = (
+                "🚨 KALSHI BTC 15 MIN 🚨\n\n"
+                f"📊 SEÑAL: {direction}\n"
+                f"💰 Entrada referencia: {price_text}\n"
+                f"⏱ Tiempo restante: {remaining} min\n"
+                f"📈 Análisis: {reason}\n"
+                f"🎯 Contrato: {ticker}\n\n"
+                "Señal orientativa, no predicción "
+                "garantizada. Revisa el precio actual."
+            )
+
+            if send_telegram(message):
+                conn.execute(
+                    "INSERT INTO sent VALUES (?, ?)",
+                    (ticker, now)
+                )
+                conn.commit()
+                log.info("Alerta enviada: %s", ticker)
+    finally:
+        conn.close()
 
 
 def main():
-    log.info("KALSHI AI BOT v2 iniciado. Solo alertas; sin trading.")
+    log.info("BTC 15M iniciado. Solo alertas.")
+
     while True:
         try:
-            scan_once()
+            scan()
         except Exception:
-            log.exception("Falló el escaneo; se reintentará en el próximo ciclo.")
-        time.sleep(max(60, SCAN_SECONDS))
+            log.exception("Error en escaneo")
+
+        time.sleep(20)
 
 
 if __name__ == "__main__":
