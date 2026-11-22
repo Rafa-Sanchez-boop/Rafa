@@ -62,6 +62,11 @@ def db_open():
         model_version TEXT NOT NULL, evaluated_at REAL, observed_price REAL,
         direction_correct INTEGER, target_error_usd REAL, status TEXT NOT NULL DEFAULT 'pending'
     )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS opening_price_samples (
+        ticker TEXT NOT NULL, observed_at REAL NOT NULL, price REAL NOT NULL,
+        PRIMARY KEY(ticker, observed_at)
+    )""")
+    db.execute('CREATE INDEX IF NOT EXISTS idx_open_samples ON opening_price_samples(ticker, observed_at)')
     db.commit()
     return db
 
@@ -421,6 +426,28 @@ def prediction_message(market, now, close_at, phase):
     )
 
 
+def record_opening_prices(db, now):
+    """Sample every active two-minute prediction on each scan; not tick-by-tick data."""
+    active = db.execute(
+        "SELECT ticker,predicted_at,horizon_seconds FROM opening_predictions "
+        "WHERE status='pending' AND predicted_at<=? AND predicted_at+horizon_seconds>=?",
+        (now, now)
+    ).fetchall()
+    if not active:
+        return
+    price = btc_spot()
+    if price is None:
+        log.warning('OPEN price sample unavailable for %d pending predictions', len(active))
+        return
+    for ticker, started, horizon in active:
+        db.execute(
+            'INSERT OR IGNORE INTO opening_price_samples VALUES (?,?,?)',
+            (ticker, now, price)
+        )
+        log.info('OPEN sample ticker=%s elapsed=%.1fs spot=%.2f',
+                 ticker, now-started, price)
+
+
 def evaluate_opening_predictions(db, now):
     """Evaluate observed endpoint only, not intrawindow target touches."""
     rows = db.execute(
@@ -446,6 +473,20 @@ def evaluate_opening_predictions(db, now):
             "direction_correct=?,target_error_usd=?,status='evaluated' WHERE ticker=?",
             (now, spot, correct, error, ticker)
         )
+        samples = db.execute(
+            'SELECT observed_at,price FROM opening_price_samples '
+            'WHERE ticker=? AND observed_at>=? AND observed_at<=? ORDER BY observed_at',
+            (ticker, at, at+horizon)
+        ).fetchall()
+        values = [initial] + [p for _, p in samples] + [spot]
+        low, high = min(values), max(values)
+        touched = (low <= target if direction == 'DOWN' else high >= target)
+        rises = sum(b > a for a,b in zip(values,values[1:]))
+        falls = sum(b < a for a,b in zip(values,values[1:]))
+        log.info('OPEN path ticker=%s sampled_points=%d low=%.2f high=%.2f '
+                 'target_touched_in_samples=%s rises=%d falls=%d '
+                 'sampling_interval_approx=%ds (not tick data)',
+                 ticker, len(samples), low, high, int(touched), rises, falls, SCAN_SECONDS)
         log.info('OPEN evaluated ticker=%s correct=%s initial=%.2f observed=%.2f '
                  'target=%.2f endpoint_error=%.2f observation_delay=%.1fs',
                  ticker, correct, initial, spot, target, error, delay)
@@ -468,6 +509,7 @@ def scan():
         reasons[reason] = reasons.get(reason, 0) + 1
 
     with db_open() as db:
+        record_opening_prices(db, now)
         evaluate_opening_predictions(db, now)
         for market in markets:
             ticker = market.get('ticker', '')
@@ -524,6 +566,7 @@ def scan():
                        (ticker, now, str(midpoint)))
             count('historial_actualizado')
         db.execute('DELETE FROM snapshots WHERE observed_at < ?', (now - 48 * 3600,))
+        db.execute('DELETE FROM opening_price_samples WHERE observed_at < ?', (now - 30 * 86400,))
         # BTC 15m tickers are unique. Keep alert history so a restart never
         # re-sends an old contract; only snapshot history is pruned.
         db.commit()
@@ -532,7 +575,7 @@ def scan():
 
 
 def main():
-    log.info('Kalshi BTC15M v3.9 opening prediction evaluation; no trading')
+    log.info('Kalshi BTC15M v3.10 opening sampled price paths; no trading')
     if TELEGRAM_TEST_ON_START:
         if send_telegram('🧪 Prueba de conexión Kalshi Bot v3.3: Telegram funciona. No es una señal de mercado.'):
             log.info('Prueba Telegram enviada correctamente')
