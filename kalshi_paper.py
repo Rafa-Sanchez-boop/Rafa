@@ -51,14 +51,16 @@ def plan_paper_trade(db, ticker, direction, yes_bid, yes_ask, close_at, now=None
     if len(open_trades) >= MAX_OPEN_TRADES:
         return None
     committed = sum((Decimal(row[0]) for row in open_trades), Decimal(0))
-    budget = min(MAX_ENTRY, MAX_CAPITAL - committed)
+    # Lifetime paper budget: do not recycle capital after settlement.
+    spent = sum((Decimal(row[0]) for row in db.execute("SELECT reserved FROM paper_trades")), Decimal(0))
+    budget = min(MAX_ENTRY, MAX_CAPITAL - spent)
     if budget <= 0:
         return None
     contracts = int((budget / price).to_integral_value(rounding=ROUND_DOWN))
     if contracts < 1:
         return None
     reserved = price * contracts
-    if reserved > MAX_ENTRY or committed + reserved > MAX_CAPITAL:
+    if reserved > MAX_ENTRY or spent + reserved > MAX_CAPITAL:
         return None
     db.execute("""INSERT INTO paper_trades
         (ticker,direction,price,contracts,reserved,created_at,close_at,status)
