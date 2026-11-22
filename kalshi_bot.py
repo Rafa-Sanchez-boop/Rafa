@@ -148,7 +148,7 @@ def btc_bars():
     except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
         log.warning('BTC candles unavailable: %s', exc)
         _btc_cache['at'] = now
-        return _btc_cache['bars'] if _btc_cache['bars'] and now - _btc_cache['bars'][-1][0][0] < 180 else []
+        return _btc_cache['bars'] if _btc_cache['bars'] and now - _btc_cache['bars'][-1][0] < 180 else []
 
 
 def empirical_probability(bars, horizon, strike=None):
