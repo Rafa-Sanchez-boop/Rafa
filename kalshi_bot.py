@@ -354,7 +354,8 @@ def scan():
         return
     now = time.time()
     with db_open() as db:
-        # Signal generation uses Kalshi quotes only; no Kraken dependency.\n        for m in payload.get("markets", []):
+        # Signal generation uses Kalshi quotes only; no Kraken dependency.
+        for m in payload.get("markets", []):
             ticker = m.get("ticker", "")
             if not isinstance(ticker, str) or not ticker.startswith(SERIES + "-"):
                 continue
