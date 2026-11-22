@@ -56,6 +56,12 @@ def db_open():
     db.execute('CREATE TABLE IF NOT EXISTS alerts (ticker TEXT PRIMARY KEY, sent_at REAL NOT NULL, side TEXT NOT NULL, entry_price TEXT NOT NULL, reason TEXT NOT NULL)')
     db.execute('CREATE TABLE IF NOT EXISTS opening_alerts (ticker TEXT PRIMARY KEY, sent_at REAL NOT NULL)')
     db.execute('CREATE TABLE IF NOT EXISTS final_alerts (ticker TEXT PRIMARY KEY, sent_at REAL NOT NULL)')
+    db.execute("""CREATE TABLE IF NOT EXISTS opening_predictions (
+        ticker TEXT PRIMARY KEY, predicted_at REAL NOT NULL, initial_price REAL NOT NULL,
+        direction TEXT NOT NULL, target_price REAL NOT NULL, horizon_seconds INTEGER NOT NULL,
+        model_version TEXT NOT NULL, evaluated_at REAL, observed_price REAL,
+        direction_correct INTEGER, target_error_usd REAL, status TEXT NOT NULL DEFAULT 'pending'
+    )""")
     db.commit()
     return db
 
@@ -415,6 +421,43 @@ def prediction_message(market, now, close_at, phase):
     )
 
 
+def evaluate_opening_predictions(db, now):
+    """Evaluate observed endpoint only, not intrawindow target touches."""
+    rows = db.execute(
+        "SELECT ticker,predicted_at,initial_price,direction,target_price,horizon_seconds "
+        "FROM opening_predictions WHERE status='pending' AND predicted_at+horizon_seconds<=?",
+        (now,)
+    ).fetchall()
+    if not rows:
+        return
+    spot = btc_spot()
+    for ticker, at, initial, direction, target, horizon in rows:
+        delay = now - (at + horizon)
+        if delay > max(45, SCAN_SECONDS * 2):
+            db.execute("UPDATE opening_predictions SET status='missing_observation' WHERE ticker=?", (ticker,))
+            log.warning('OPEN evaluation missed timely observation: %s', ticker)
+            continue
+        if spot is None:
+            continue
+        correct = int((spot > initial) if direction == 'UP' else (spot < initial))
+        error = abs(spot - target)
+        db.execute(
+            "UPDATE opening_predictions SET evaluated_at=?,observed_price=?,"
+            "direction_correct=?,target_error_usd=?,status='evaluated' WHERE ticker=?",
+            (now, spot, correct, error, ticker)
+        )
+        log.info('OPEN evaluated ticker=%s correct=%s initial=%.2f observed=%.2f '
+                 'target=%.2f endpoint_error=%.2f observation_delay=%.1fs',
+                 ticker, correct, initial, spot, target, error, delay)
+    count, hits, avg_error = db.execute(
+        "SELECT COUNT(*),COALESCE(SUM(direction_correct),0),AVG(target_error_usd) "
+        "FROM opening_predictions WHERE status='evaluated'"
+    ).fetchone()
+    if count:
+        log.info('OPEN metrics evaluated=%d directional_accuracy=%.1f%% mean_endpoint_error=%.2f USD',
+                 count, hits * 100 / count, avg_error)
+
+
 def scan():
     markets = fetch_markets()
     now = time.time()
@@ -425,6 +468,7 @@ def scan():
         reasons[reason] = reasons.get(reason, 0) + 1
 
     with db_open() as db:
+        evaluate_opening_predictions(db, now)
         for market in markets:
             ticker = market.get('ticker', '')
             if not isinstance(ticker, str) or not ticker.startswith(SERIES + '-'):
@@ -450,6 +494,18 @@ def scan():
                 message = (opening_message(market, now, close_at) if phase == 'OPEN'
                            else prediction_message(market, now, close_at, phase))
                 if message and send_telegram(message):
+                    if phase == 'OPEN' and '🎯 Objetivo estimado:' in message:
+                        bars = btc_bars()
+                        spot = btc_spot()
+                        quick = initial_move_target(bars, spot) if bars and spot else None
+                        if quick:
+                            direction, target, _, _, _ = quick
+                            db.execute(
+                                "INSERT OR IGNORE INTO opening_predictions "
+                                "(ticker,predicted_at,initial_price,direction,target_price,"
+                                "horizon_seconds,model_version) VALUES (?,?,?,?,?,?,?)",
+                                (ticker, now, spot, direction, target, 120, '3.9')
+                            )
                     db.execute(f'INSERT INTO {table} VALUES (?,?)', (ticker, now))
                     sent += 1
                     log.info('Experimental %s signal sent: %s', phase, ticker)
@@ -476,7 +532,7 @@ def scan():
 
 
 def main():
-    log.info('Kalshi BTC15M v3.8 opening forecasts with trade-flow confirmation; no trading')
+    log.info('Kalshi BTC15M v3.9 opening prediction evaluation; no trading')
     if TELEGRAM_TEST_ON_START:
         if send_telegram('🧪 Prueba de conexión Kalshi Bot v3.3: Telegram funciona. No es una señal de mercado.'):
             log.info('Prueba Telegram enviada correctamente')
