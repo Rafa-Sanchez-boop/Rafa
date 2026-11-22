@@ -15,7 +15,7 @@ services:
       - key: KALSHI_SERIES
         value: KXBTC15M
       - key: SCAN_SECONDS
-        value: '60'
+        value: '20'
       - key: MIN_VOLUME_24H
         value: '100'
       - key: MAX_SPREAD
