@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import requests
+from kalshi_paper import plan_paper_trade, settle_paper
 
 BASE = "https://external-api.kalshi.com/trade-api/v2"
 SERIES = os.getenv("KALSHI_SERIES", "KXBTC15M")
@@ -361,6 +362,7 @@ def signal(db, m, now, close_at, open_at, phase):
                    (ticker, direction, float(change), remaining, now))
         db.execute("INSERT OR IGNORE INTO kalshi_only_alerts VALUES (?,?,?,?)",
                    (ticker, phase, now, direction))
+        plan_paper_trade(db, ticker, direction, bid, ask, close_at, now)
         log.info("Kalshi-only %s alert: %s %s", phase, ticker, direction)
 
 def check_results(db, now):
@@ -375,6 +377,7 @@ def check_results(db, now):
             continue
         db.execute("INSERT OR IGNORE INTO kalshi_only_results VALUES (?,?,?)",
                    (ticker, result, now))
+        settle_paper(db, ticker, result)
         predicted = db.execute("""SELECT direction FROM kalshi_only_alerts
             WHERE ticker=? AND phase='OPEN'""", (ticker,)).fetchone()
         if predicted:
