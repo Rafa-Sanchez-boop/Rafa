@@ -13,8 +13,8 @@ SERIES = os.getenv("KALSHI_SERIES", "KXBTC15M")
 DB_PATH = os.getenv("DB_PATH", "/var/data/kalshi_bot.sqlite3")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
-DELAY = 120
+SCAN_SECONDS = max(5, int(os.getenv("SCAN_SECONDS", "10")))
+DELAY = 30
 MAX_SPREAD = Decimal(os.getenv("MAX_SPREAD", "0.04"))
 MIN_MOVE = Decimal(os.getenv("MIN_MOVE", "0.025"))
 MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
@@ -273,9 +273,9 @@ def signal(db, m, now, close_at, open_at, phase):
         rows = db.execute("""SELECT yes_mid, observed_at FROM kalshi_only_samples
             WHERE ticker=? AND observed_at<=?
             ORDER BY observed_at ASC LIMIT 1""",
-            (ticker, now - 60)).fetchone()
+            (ticker, now - 30)).fetchone()
         if not rows:
-            log.info("Waiting for 60s of observed Kalshi quotes for %s", ticker)
+            log.info("Waiting for 30s of observed Kalshi quotes for %s", ticker)
             return
         prior = dec(rows[0])
     else:
