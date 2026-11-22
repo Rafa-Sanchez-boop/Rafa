@@ -53,6 +53,7 @@ def db_open():
     db.execute('CREATE INDEX IF NOT EXISTS idx_snapshots_ticker_time ON snapshots(ticker, observed_at)')
     db.execute('CREATE TABLE IF NOT EXISTS alerts (ticker TEXT PRIMARY KEY, sent_at REAL NOT NULL, side TEXT NOT NULL, entry_price TEXT NOT NULL, reason TEXT NOT NULL)')
     db.execute('CREATE TABLE IF NOT EXISTS opening_alerts (ticker TEXT PRIMARY KEY, sent_at REAL NOT NULL)')
+    db.execute('CREATE TABLE IF NOT EXISTS final_alerts (ticker TEXT PRIMARY KEY, sent_at REAL NOT NULL)')
     db.commit()
     return db
 
@@ -123,13 +124,83 @@ def analyze(market, previous_mid):
             'spread': spread, 'volume': volume}, 'candidato'
 
 
-def opening_signal(market, now, close_at):
-    """Market-implied directional indication near the 15-minute window start.
+_btc_cache = {'at': 0, 'bars': []}
 
-    Not a trained forecast and NOT a calibrated probability of success.
-    """
-    start_at = close_at - 900
-    if not (start_at <= now <= start_at + 90):
+
+def btc_bars():
+    """Recent closed one-minute BTC/USD bars from Kraken; cached 60 seconds."""
+    now = time.time()
+    if now - _btc_cache['at'] < 60:
+        return _btc_cache['bars']
+    try:
+        response = session.get('https://api.kraken.com/0/public/OHLC',
+                               params={'pair': 'XBTUSD', 'interval': 1}, timeout=12)
+        response.raise_for_status()
+        data = response.json()
+        if data.get('error'):
+            raise ValueError(str(data['error']))
+        key = next(k for k in data['result'] if k != 'last')
+        bars = [(int(x[0]), float(x[4])) for x in data['result'][key][:-1]]
+        if len(bars) < 180 or now - bars[-1][0] > 180:
+            raise ValueError('Insufficient or stale BTC candles')
+        _btc_cache.update(at=now, bars=bars)
+        return bars
+    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        log.warning('BTC candles unavailable: %s', exc)
+        _btc_cache['at'] = now
+        return _btc_cache['bars'] if _btc_cache['bars'] and now - _btc_cache['bars'][-1][0][0] < 180 else []
+
+
+def empirical_probability(bars, horizon, strike=None):
+    """Experimental analog estimator. Not calibrated or validated for Kalshi."""
+    closes = [price for _, price in bars]
+    if len(closes) < 180 or horizon < 1:
+        return None
+    momentum = closes[-1] / closes[-6] - 1
+    samples = []
+    for i in range(6, len(closes) - horizon):
+        past_momentum = closes[i] / closes[i - 5] - 1
+        samples.append((abs(past_momentum - momentum), closes[i + horizon] / closes[i] - 1))
+    samples.sort(key=lambda x: x[0])
+    selected = [ret for _, ret in samples[:80]]
+    if len(selected) < 50:
+        return None
+    target = 0.0 if strike is None else strike / closes[-1] - 1
+    # Laplace smoothing. Descriptive historical analog frequency, not calibrated odds.
+    probability = (sum(ret > target for ret in selected) + 1) / (len(selected) + 2)
+    return probability, len(selected), closes[-1]
+
+
+def strike_price(market):
+    # Never substitute contract bid/ask for BTC settlement strike.
+    for field in ('floor_strike', 'strike_price'):
+        value = dec(market.get(field))
+        if value is not None and value > 1000:
+            return float(value)
+    return None
+
+
+def prediction_message(market, now, close_at, phase):
+    remaining = int(close_at - now)
+    if phase == 'OPEN' and not (810 <= remaining <= 900):
+        return None
+    if phase == 'FINAL' and not (20 <= remaining <= 180):
+        return None
+    bars = btc_bars()
+    if not bars:
+        return None
+    strike = strike_price(market)
+    if phase == 'FINAL' and strike is None:
+        log.info('FINAL skipped: no verified BTC strike for %s', market.get('ticker'))
+        return None
+    horizon = 15 if phase == 'OPEN' else max(1, round(remaining / 60))
+    estimate = empirical_probability(bars, horizon, strike if phase == 'FINAL' else None)
+    if estimate is None:
+        return None
+    probability, count, spot = estimate
+    side = 'UP ▲' if probability > 0.5 else 'DOWN ▼'
+    confidence = max(probability, 1 - probability)
+    if confidence < 0.65:
         return None
     bid = dec(market.get('yes_bid_dollars'))
     ask = dec(market.get('yes_ask_dollars'))
@@ -137,22 +208,24 @@ def opening_signal(market, now, close_at):
         return None
     if ask - bid > MAX_SPREAD:
         return None
-    midpoint = (bid + ask) / 2
-    up = midpoint * 100
-    down = (Decimal(1) - midpoint) * 100
-    direction = 'UP ▲' if midpoint > Decimal('0.5') else ('DOWN ▼' if midpoint < Decimal('0.5') else 'SIN VENTAJA')
-    strike = market.get('floor_strike') or market.get('strike_price') or 'No disponible'
-    remaining = max(0, int(close_at - now))
+    entry = ask if probability > 0.5 else 1 - bid
+    # Only flag positive theoretical edge versus contract ask.
+    if float(entry) + 0.08 >= confidence:
+        return None
     return (
-        f'📊 KALSHI BTC — VENTANA 15 MIN\\n'
-        f'Señal según mercado: {direction}\\n'
-        f'UP implícito: {up:.1f}%\\n'
-        f'DOWN implícito: {down:.1f}%\\n'
-        f'Precio de referencia (si disponible): {strike}\\n'
-        f'Tiempo restante: {remaining // 60:02d}:{remaining % 60:02d}\\n'
-        f'Contrato: {market.get("ticker", "")}\\n\\n'
-        '⚠️ Porcentajes derivados de cotizaciones Kalshi, NO probabilidad '
-        'de acierto validada ni recomendación de entrada.'
+        f'📊 BTC 15M — {phase}\\n'
+        f'Señal experimental: {side}\\n'
+        f'UP histórico comparable: {probability:.1%}\\n'
+        f'DOWN histórico comparable: {1 - probability:.1%}\\n'
+        f'Muestras: {count}\\n'
+        f'BTC Kraken: ${spot:,.2f}\\n'
+        f'Referencia contrato: {strike if strike else "pendiente"}\\n'
+        f'Precio contrato estimado: ${entry:.3f}\\n'
+        f'Restante: {remaining // 60:02d}:{remaining % 60:02d}\\n'
+        f'Contrato: {market.get("ticker", "")}\\n'
+        '⚠️ Frecuencias históricas NO calibradas; no son probabilidades '
+        'fiables de acierto. Kraken puede diferir del índice de liquidación '
+        'Kalshi. Sin garantía ni recomendación de apuesta.'
     )
 
 
@@ -185,13 +258,13 @@ def scan():
             if open_at and close_at - open_at > 960:
                 count('duracion_invalida')
                 continue
-            opening = opening_signal(market, now, close_at)
-            if opening and not db.execute('SELECT 1 FROM opening_alerts WHERE ticker=?', (ticker,)).fetchone():
-                if send_telegram(opening):
-                    db.execute('INSERT INTO opening_alerts VALUES (?,?)', (ticker, now))
-                    log.info('Señal de apertura enviada: %s', ticker)
-                else:
-                    count('telegram_apertura_fallo')
+            for phase, table in (('OPEN', 'opening_alerts'), ('FINAL', 'final_alerts')):
+                if db.execute(f'SELECT 1 FROM {table} WHERE ticker=?', (ticker,)).fetchone():
+                    continue
+                message = prediction_message(market, now, close_at, phase)
+                if message and send_telegram(message):
+                    db.execute(f'INSERT INTO {table} VALUES (?,?)', (ticker, now))
+                    log.info('Experimental %s signal sent: %s', phase, ticker)
             bid = dec(market.get('yes_bid_dollars'))
             ask = dec(market.get('yes_ask_dollars'))
             if bid is None or ask is None or not (0 < bid <= ask < 1):
@@ -205,45 +278,7 @@ def scan():
             midpoint = (bid + ask) / 2
             db.execute('INSERT OR IGNORE INTO snapshots VALUES (?,?,?)',
                        (ticker, now, str(midpoint)))
-            signal, reason = analyze(market, prior)
-            # Diagnóstico: registrar campos originales y valores calculados.
-            # No contiene tokens, chat IDs ni otras credenciales.
-            raw_v24 = market.get('volume_24h')
-            raw_volume = market.get('volume')
-            raw_v24_fp = market.get('volume_24h_fp')
-            spread = ask - bid
-            movement = midpoint - prior if prior is not None else None
-            log.info(
-                'DIAG ticker=%s bid=%s ask=%s spread=%s limite_spread=%s '
-                'volume_24h=%r volume=%r volume_24h_fp=%r min_volume_24h=%s '
-                'mid=%s mid_60s=%s cambio_60s=%s min_move=%s motivo=%s',
-                ticker, bid, ask, spread, MAX_SPREAD,
-                raw_v24, raw_volume, raw_v24_fp, MIN_VOLUME_24H,
-                midpoint, prior, movement, MIN_MOVE, reason
-            )
-            count(reason)
-            if signal is None:
-                continue
-            if db.execute('SELECT 1 FROM alerts WHERE ticker=?', (ticker,)).fetchone():
-                count('ya_alertado')
-                continue
-            minutes = int((close_at - now) // 60)
-            message = (f'📊 KALSHI BTC 15M — MOVIMIENTO DE COTIZACIÓN\n'
-                       f'Contrato: {ticker}\nLado observado: {signal["side"]}\n'
-                       f'Precio de referencia: ${signal["entry"]:.3f}\n'
-                       f'Cambio en precio YES: {signal["change"]:+.3f}\n'
-                       f'Spread: ${signal["spread"]:.3f}\nVolumen 24h: {signal["volume"]}\n'
-                       f'Tiempo restante: {minutes} min\n\n'
-                       'â ï¸ Movimiento observado, no predicciÃ³n validada ni recomendaciÃ³n de compra.')
-            if send_telegram(message):
-                db.execute('INSERT INTO alerts VALUES (?,?,?,?,?)',
-                           (ticker, now, signal['side'], str(signal['entry']), 'contract_quote_momentum'))
-                sent += 1
-                log.info('Alerta enviada: %s %s', ticker, signal['side'])
-                if sent >= TOP_ALERTS:
-                    break
-            else:
-                count('telegram_fallo')
+            count('historial_actualizado')
         db.execute('DELETE FROM snapshots WHERE observed_at < ?', (now - 48 * 3600,))
         # BTC 15m tickers are unique. Keep alert history so a restart never
         # re-sends an old contract; only snapshot history is pruned.
@@ -253,7 +288,7 @@ def scan():
 
 
 def main():
-    log.info('Kalshi BTC15M v3.4 — volumen fp y diagnostico, solo alertas')
+    log.info('Kalshi BTC15M experimental historical analog signals; no trading')
     if TELEGRAM_TEST_ON_START:
         if send_telegram('🧪 Prueba de conexión Kalshi Bot v3.3: Telegram funciona. No es una señal de mercado.'):
             log.info('Prueba Telegram enviada correctamente')
