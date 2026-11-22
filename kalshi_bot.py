@@ -431,10 +431,8 @@ def scan():
         db.commit()
 
 def main():
-    from kalshi_auth import check_private_api
-    if check_private_api():
-        from kalshi_reconcile import startup_reconciliation
-        startup_reconciliation()  # Read-only; fail closed, no orders.
+    from kalshi_reconcile import startup_reconciliation
+    startup_reconciliation()  # Single read-only startup check; avoid duplicate balance GET.
     log.info("Kalshi BTC15M v5.5: rolling 30-90s signal baseline; no live trading")
     while True:
         try:
