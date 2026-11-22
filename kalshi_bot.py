@@ -1,213 +1,182 @@
+"""Kalshi BTC 15-minute market monitor. Alerts only; no trading.
 
-import os
-import time
+Market prices are NOT independent predictions of BTC direction.
+"""
 import logging
+import os
 import sqlite3
+import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 import requests
 
-BASE = "https://external-api.kalshi.com/trade-api/v2"
-SERIES = "KXBTC15M"
+BASE = 'https://external-api.kalshi.com/trade-api/v2'
+SERIES = os.getenv('KALSHI_SERIES', 'KXBTC15M')
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+DB_PATH = os.getenv('DB_PATH', '/var/data/kalshi_bot.sqlite3')
+SCAN_SECONDS = max(20, int(os.getenv('SCAN_SECONDS', '30')))
+MAX_SPREAD = Decimal(os.getenv('MAX_SPREAD', '0.04'))
+MIN_MOVE = Decimal(os.getenv('MIN_MOVE', '0.025'))
+MIN_VOLUME_24H = int(os.getenv('MIN_VOLUME_24H', '100'))
+MIN_REMAINING_SECONDS = int(os.getenv('MIN_REMAINING_SECONDS', '90'))
+ALERT_COOLDOWN_HOURS = max(0, float(os.getenv('ALERT_COOLDOWN_HOURS', '6')))
+TOP_ALERTS = max(1, int(os.getenv('TOP_ALERTS', '15')))
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-DB_PATH = os.getenv("DB_PATH", "/tmp/btc_alerts.sqlite3")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-log = logging.getLogger("BTC15M")
-
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger('kalshi-btc-monitor')
 session = requests.Session()
-session.headers.update({"User-Agent": "BTC15MAlerts/1.0"})
+session.headers.update({'User-Agent': 'KalshiBTC15MMonitor/3.0'})
 
 
-def database():
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS sent (
-            ticker TEXT PRIMARY KEY,
-            sent_at REAL NOT NULL
-        )
-    """)
-    conn.commit()
-    return conn
+def dec(value):
+    try:
+        result = Decimal(str(value))
+        return result if result.is_finite() else None
+    except (InvalidOperation, ValueError, TypeError):
+        return None
 
 
-def request_markets():
-    url = f"{BASE}/markets"
-    params = {
-        "series_ticker": SERIES,
-        "status": "open",
-        "limit": 10
-    }
+def timestamp(value):
+    try:
+        return datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp() if value else None
+    except (ValueError, AttributeError):
+        return None
 
+
+def db_open():
+    os.makedirs(os.path.dirname(DB_PATH) or '.', exist_ok=True)
+    db = sqlite3.connect(DB_PATH, timeout=30)
+    db.execute('CREATE TABLE IF NOT EXISTS snapshots (ticker TEXT NOT NULL, observed_at REAL NOT NULL, midpoint TEXT NOT NULL, PRIMARY KEY(ticker, observed_at))')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_snapshots_ticker_time ON snapshots(ticker, observed_at)')
+    db.execute('CREATE TABLE IF NOT EXISTS alerts (ticker TEXT PRIMARY KEY, sent_at REAL NOT NULL, side TEXT NOT NULL, entry_price TEXT NOT NULL, reason TEXT NOT NULL)')
+    db.commit()
+    return db
+
+
+def fetch_markets():
     for attempt in range(5):
-        response = session.get(
-            url, params=params, timeout=20
-        )
-
-        if response.status_code == 429:
-            delay = min(
-                int(response.headers.get("Retry-After", "0") or 0)
-                or 5 * (2 ** attempt),
-                120
-            )
-            log.warning("Rate limit. Esperando %s s", delay)
-            time.sleep(delay)
-            continue
-
-        response.raise_for_status()
-        return response.json().get("markets", [])
-
-    raise RuntimeError("Kalshi sigue limitando solicitudes")
-
-
-def number(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def parse_time(value):
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(
-            value.replace("Z", "+00:00")
-        ).timestamp()
-    except ValueError:
-        return None
+        try:
+            response = session.get(f'{BASE}/markets', params={'series_ticker': SERIES, 'status': 'open', 'limit': 100}, timeout=20)
+            if response.status_code == 429 or response.status_code >= 500:
+                retry = response.headers.get('Retry-After', '')
+                delay = min(120, int(retry) if retry.isdigit() else 2 ** (attempt + 1))
+                log.warning('HTTP %s; reintento en %ss', response.status_code, delay)
+                time.sleep(delay)
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            return payload.get('markets', [])
+        except (requests.RequestException, ValueError) as exc:
+            if attempt == 4:
+                raise
+            log.warning('Consulta fallida: %s', exc)
+            time.sleep(min(2 ** (attempt + 1), 30))
+    raise RuntimeError('Kalshi no respondiÃ³ despuÃ©s de varios intentos')
 
 
 def send_telegram(message):
     if not TOKEN or not CHAT_ID:
-        log.error("Falta configurar Telegram")
+        log.warning('Telegram sin configurar; alerta solo en logs: %s', message)
         return False
-
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-
     try:
-        response = session.post(
-            url,
-            json={
-                "chat_id": CHAT_ID,
-                "text": message
-            },
-            timeout=20
-        )
+        response = session.post(f'https://api.telegram.org/bot{TOKEN}/sendMessage', json={'chat_id': CHAT_ID, 'text': message}, timeout=20)
         response.raise_for_status()
-        return response.json().get("ok", False)
-    except requests.RequestException:
-        log.exception("Error enviando Telegram")
+        data = response.json()
+        if not data.get('ok'):
+            log.error('Telegram rechazÃ³ el mensaje: %s', data.get('description', 'sin detalle'))
+        return bool(data.get('ok'))
+    except (requests.RequestException, ValueError):
+        log.exception('No se pudo enviar alerta Telegram')
         return False
 
 
-def analyze(market):
-    yes_bid = number(market.get("yes_bid_dollars"))
-    yes_ask = number(market.get("yes_ask_dollars"))
-
-    if yes_bid is None or yes_ask is None:
-        return "SIN ENTRADA", None, "Sin cotizaciones"
-
-    if not (0 < yes_bid <= yes_ask < 1):
-        return "SIN ENTRADA", None, "Cotizaciones inválidas"
-
-    midpoint = (yes_bid + yes_ask) / 2
-    spread = yes_ask - yes_bid
-
-    if spread > 0.08:
-        return "SIN ENTRADA", None, "Spread elevado"
-
-    # Señal simple basada en precios del mercado.
-    # NO es una predicción validada de Bitcoin.
-    if midpoint >= 0.60:
-        return "SUBE - YES", yes_ask, "Mercado favorece YES"
-
-    if midpoint <= 0.40:
-        return "BAJA - NO", 1 - yes_bid, "Mercado favorece NO"
-
-    return "SIN ENTRADA", None, "Mercado sin dirección clara"
+def analyze(market, previous_mid):
+    bid = dec(market.get('yes_bid_dollars'))
+    ask = dec(market.get('yes_ask_dollars'))
+    if bid is None or ask is None or not (0 < bid <= ask < 1):
+        return None
+    spread = ask - bid
+    if spread > MAX_SPREAD:
+        return None
+    volume = market.get('volume_24h')
+    try:
+        volume = int(volume or 0)
+    except (ValueError, TypeError):
+        volume = 0
+    if volume < MIN_VOLUME_24H:
+        return None
+    mid = (bid + ask) / 2
+    if previous_mid is None:
+        return {'mid': mid, 'signal': None}
+    change = mid - previous_mid
+    if abs(change) < MIN_MOVE:
+        return {'mid': mid, 'signal': None}
+    # Movement of contract quote, not BTC spot price and not calibrated probability.
+    side = 'YES' if change > 0 else 'NO'
+    entry = ask if side == 'YES' else Decimal(1) - bid
+    return {'mid': mid, 'signal': {'side': side, 'entry': entry, 'change': change, 'spread': spread, 'volume': volume}}
 
 
 def scan():
-    markets = request_markets()
+    markets = fetch_markets()
     now = time.time()
-    conn = database()
-
-    try:
+    sent = 0
+    with db_open() as db:
         for market in markets:
-            ticker = market.get("ticker", "")
-
-            if not ticker.startswith(SERIES + "-"):
+            ticker = market.get('ticker', '')
+            if not isinstance(ticker, str) or not ticker.startswith(SERIES + '-'):
                 continue
-
-            close_ts = parse_time(market.get("close_time"))
-            open_ts = parse_time(market.get("open_time"))
-
-            if not close_ts or close_ts <= now:
+            close_at = timestamp(market.get('close_time'))
+            open_at = timestamp(market.get('open_time'))
+            if close_at is None or close_at - now < MIN_REMAINING_SECONDS or (open_at and open_at > now):
                 continue
-
-            if open_ts and open_ts > now:
+            if open_at and close_at - open_at > 960:
                 continue
-
-            if open_ts and close_ts - open_ts > 960:
+            row = db.execute('SELECT midpoint FROM snapshots WHERE ticker=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 1', (ticker, now - 60)).fetchone()
+            prior = dec(row[0]) if row else None
+            bid = dec(market.get('yes_bid_dollars'))
+            ask = dec(market.get('yes_ask_dollars'))
+            if bid is None or ask is None or not (0 < bid <= ask < 1):
                 continue
-
-            existing = conn.execute(
-                "SELECT 1 FROM sent WHERE ticker=?",
-                (ticker,)
-            ).fetchone()
-
-            if existing:
+            midpoint = (bid + ask) / 2
+            db.execute('INSERT OR IGNORE INTO snapshots VALUES (?,?,?)', (ticker, now, str(midpoint)))
+            result = analyze(market, prior)
+            if not result or not result['signal']:
                 continue
-
-            direction, entry, reason = analyze(market)
-            remaining = max(0, int((close_ts - now) / 60))
-
-            price_text = (
-                f"${entry:.2f}"
-                if entry is not None
-                else "No disponible"
-            )
-
-            message = (
-                "🚨 KALSHI BTC 15 MIN 🚨\n\n"
-                f"📊 SEÑAL: {direction}\n"
-                f"💰 Entrada referencia: {price_text}\n"
-                f"⏱ Tiempo restante: {remaining} min\n"
-                f"📈 Análisis: {reason}\n"
-                f"🎯 Contrato: {ticker}\n\n"
-                "Señal orientativa, no predicción "
-                "garantizada. Revisa el precio actual."
-            )
-
+            if db.execute('SELECT 1 FROM alerts WHERE ticker=?', (ticker,)).fetchone():
+                continue
+            sig = result['signal']
+            minutes = int((close_at - now) // 60)
+            message = (f'ð KALSHI BTC 15M â MOVIMIENTO DE COTIZACIÃN\n'
+                       f'Contrato: {ticker}\nLado observado: {sig["side"]}\n'
+                       f'Precio de referencia: ${sig["entry"]:.3f}\n'
+                       f'Cambio en precio YES: {sig["change"]:+.3f}\n'
+                       f'Spread: ${sig["spread"]:.3f}\nVolumen 24h: {sig["volume"]}\n'
+                       f'Tiempo restante: {minutes} min\n\n'
+                       'â ï¸ No es predicciÃ³n validada ni recomendaciÃ³n de compra. Verifica el contrato y el precio actual.')
             if send_telegram(message):
-                conn.execute(
-                    "INSERT INTO sent VALUES (?, ?)",
-                    (ticker, now)
-                )
-                conn.commit()
-                log.info("Alerta enviada: %s", ticker)
-    finally:
-        conn.close()
+                db.execute('INSERT INTO alerts VALUES (?,?,?,?,?)', (ticker, now, sig['side'], str(sig['entry']), 'contract_quote_momentum'))
+                sent += 1
+                log.info('Alerta enviada: %s %s', ticker, sig['side'])
+                if sent >= TOP_ALERTS:
+                    break
+        db.execute('DELETE FROM snapshots WHERE observed_at < ?', (now - 48 * 3600,))
+        db.execute('DELETE FROM alerts WHERE sent_at < ?', (now - max(48, ALERT_COOLDOWN_HOURS) * 3600,))
+        db.commit()
+    log.info('Escaneo: %s mercados, %s alertas', len(markets), sent)
 
 
 def main():
-    log.info("BTC 15M iniciado. Solo alertas.")
-
+    log.info('Kalshi BTC15M v3 â monitor de cotizaciones, solo alertas')
     while True:
         try:
             scan()
         except Exception:
-            log.exception("Error en escaneo")
+            log.exception('Error durante el escaneo')
+        time.sleep(SCAN_SECONDS)
 
-        time.sleep(20)
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
