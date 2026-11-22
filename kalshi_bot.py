@@ -282,7 +282,7 @@ def market_pattern(db, ticker, now):
     return high, low, high_touches, low_touches, rising, falling
 
 
-def signal(db, m, now, close_at, open_at, phase):
+def signal(db, m, now, close_at, open_at, phase, projection):
     ticker = m["ticker"]
     if ticker in alerted_tickers:
         return
@@ -342,8 +342,8 @@ def signal(db, m, now, close_at, open_at, phase):
     log.info("Internal learning %s: %s | %s | %s",
              ticker, learning_summary(db, direction),
              accuracy_report(db), model_assessment(db, direction, change, remaining))
-    projection = btc_projection(db, now)
     if projection is None:
+        log.info("Signal skipped: BTC/USD price projection not ready")
         return
     spot, target = projection
     if (up and target <= spot) or (not up and target >= spot):
@@ -399,6 +399,9 @@ def scan():
         return
     now = time.time()
     with db_open() as db:
+        # Warm up BTC/USD history on every scan, not only after a Kalshi signal.
+        # Keep dollar targets grounded in spot observations, never Kalshi YES prices.
+        projection = btc_projection(db, now)
         for m in payload.get("markets", []):
             ticker = m.get("ticker", "")
             if not isinstance(ticker, str) or not ticker.startswith(SERIES + "-"):
@@ -421,7 +424,7 @@ def scan():
             # Scan continuously after initial analysis, until the contract closes.
             # OPEN phase is used for one alert per contract.
             if now - window_start >= DELAY and remaining >= MIN_REMAINING:
-                signal(db, m, now, closes, opened, "OPEN")
+                signal(db, m, now, closes, opened, "OPEN", projection)
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
