@@ -121,5 +121,5 @@ def startup_reconciliation():
             LOG.warning("Unrecognized orders/positions exist; live entry must remain blocked")
         return snap
     except (ReconciliationError, ValueError, TypeError) as exc:
-        LOG.error("Portfolio reconciliation blocked: %s; trading disabled", type(exc).__name__)
+        LOG.error("Portfolio reconciliation blocked: %s; trading disabled", str(exc))
         return None
