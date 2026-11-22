@@ -429,7 +429,9 @@ def scan():
 
 def main():
     from kalshi_auth import check_private_api
-    check_private_api()  # Read-only startup check; no order placement.
+    if check_private_api():
+        from kalshi_reconcile import startup_reconciliation
+        startup_reconciliation()  # Read-only; fail closed, no orders.
     log.info("Kalshi BTC15M v5.3: daily retraining with temporal holdout")
     while True:
         try:
