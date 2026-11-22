@@ -21,7 +21,7 @@ MIN_REMAINING = 0  # Allow alerts until contract closes, including final 2-3 min
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-only")
 http = requests.Session()
-http.headers["User-Agent"] = "KalshiOnlyBTC15M/4.8"
+http.headers["User-Agent"] = "KalshiOnlyBTC15M/4.9"
 # Extra in-process protection against opposite alerts during a worker lifetime.
 alerted_tickers = set()
 
@@ -143,6 +143,15 @@ def signal(db, m, now, close_at, open_at, phase):
     direction = "UP" if up else "DOWN"
     entry = ask if up else Decimal(1) - bid
     remaining = max(0, int(close_at - now))
+    interpretation = (
+        "\n🧠 INTERPRETACIÓN — cotizaciones de Kalshi\n"
+        + f"📊 Probabilidad implícita YES aproximada: {mid * 100:.1f}%\n"
+        + f"📈 Posible subida: YES podría superar ${mid:.3f} si continúa la presión compradora; sin objetivo cuantificado.\n"
+        + f"📉 Posible bajada: YES podría caer por debajo de ${mid:.3f} si domina la presión vendedora; sin objetivo cuantificado.\n"
+        + f"🔄 Referencia de cambio de rumbo: YES ${prior:.3f} (cotización observada hace al menos 60 segundos).\n"
+        + f"🔎 Interpretación: YES {'subió' if up else 'bajó'} {abs(change) * 100:.1f} centavos respecto a esa referencia.\n"
+        + "⚠️ Estas cifras son del contrato, NO del precio BTC/USD. No hay base para calcular objetivos BTC en dólares ni una confianza estadística validada.\n"
+    )
     phase_name = "OPORTUNIDAD A TIEMPO"
     message = (
         "📊 BTC KALSHI — " + phase_name + "\n"
@@ -154,6 +163,7 @@ def signal(db, m, now, close_at, open_at, phase):
         + f"🎟️ Entrada indicativa {direction}: ${entry:.2f}\n"
         + f"⏳ Tiempo restante: {remaining//60:02d}:{remaining%60:02d}\n"
         + f"🧾 Contrato: {ticker}\n"
+        + interpretation
         +  "⚠️ Señal basada exclusivamente en cotizaciones de Kalshi. "
           "El movimiento de cotización no garantiza el resultado final. "
           "No se fija objetivo de venta; comisiones y liquidez pueden impedir beneficio. "
@@ -219,7 +229,7 @@ def scan():
         db.commit()
 
 def main():
-    log.info("Kalshi-only BTC15M v4.8: contract signals and final-minute alerts")
+    log.info("Kalshi-only BTC15M v4.9: contract signals and final-minute alerts")
     while True:
         try:
             scan()
