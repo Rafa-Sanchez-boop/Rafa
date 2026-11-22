@@ -16,8 +16,6 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
 DELAY = 120
-TARGET_TICKS = 35
-TICK = Decimal("0.01")
 MAX_SPREAD = Decimal(os.getenv("MAX_SPREAD", "0.04"))
 MIN_MOVE = Decimal(os.getenv("MIN_MOVE", "0.025"))
 MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
@@ -25,7 +23,7 @@ MIN_REMAINING = max(300, int(os.getenv("MIN_REMAINING_SECONDS", "300")))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-only")
 http = requests.Session()
-http.headers["User-Agent"] = "KalshiOnlyBTC15M/4.2"
+http.headers["User-Agent"] = "KalshiOnlyBTC15M/4.3"
 
 def dec(x):
     try:
@@ -136,10 +134,6 @@ def signal(db, m, now, close_at, open_at, phase):
     up = change > 0
     direction = "UP" if up else "DOWN"
     entry = ask if up else Decimal(1) - bid
-    target = entry + TICK * TARGET_TICKS
-    target_valid = target <= Decimal("0.99")
-    if not target_valid:
-        log.info("35-tick target infeasible for %s; sending directional observation without target", ticker)
     remaining = max(0, int(close_at - now))
     phase_name = "OPORTUNIDAD A TIEMPO"
     message = (
@@ -150,12 +144,11 @@ def signal(db, m, now, close_at, open_at, phase):
         + f"📈 Precio YES actual (Kalshi): ${mid:.3f}\n"
         + f"📏 Cambio en cotización YES: {change:+.3f}\n"
         + f"🎟️ Entrada indicativa {direction}: ${entry:.2f}\n"
-        + (f"🎯 Objetivo de venta: ${target:.2f} (+{TARGET_TICKS} ticks brutos)\n" if target_valid else "🎯 Objetivo de 35 ticks no viable a este precio; sin objetivo de venta.\n")
         + f"⏳ Tiempo restante: {remaining//60:02d}:{remaining%60:02d}\n"
         + f"🧾 Contrato: {ticker}\n"
         + "⚠️ Solo datos de Kalshi. El cambio de cotización no predice "
           "necesariamente el precio BTC ni el resultado final. "
-          "Objetivo no garantizado; comisiones y liquidez pueden impedir beneficio. "
+          "No se fija objetivo de venta; comisiones y liquidez pueden impedir beneficio. "
           "Alerta informativa, no operación automática."
     )
     if notify(message):
@@ -185,7 +178,7 @@ def check_results(db, now):
                    f"🏁 Resultado final Kalshi: {result.upper()}\n"
                    f"{'Coincidió' if correct else 'No coincidió'} con el resultado final.\n"
                    "⚠️ La señal mide momentum de cotización, no predice "
-                   "el resultado final ni confirma venta al objetivo.")
+                   "el resultado final ni confirma beneficio de compraventa.")
 
 def scan():
     payload = get_json("/markets", {"series_ticker": SERIES, "status": "open", "limit": 100})
@@ -217,7 +210,7 @@ def scan():
         db.commit()
 
 def main():
-    log.info("Kalshi-only BTC15M v4.2: continuous opportunities after 120s; no late alerts; no Kraken")
+    log.info("Kalshi-only BTC15M v4.3: continuous opportunities after 120s; no late alerts; no Kraken")
     while True:
         try:
             scan()
