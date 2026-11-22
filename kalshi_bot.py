@@ -425,6 +425,8 @@ def scan():
         db.commit()
 
 def main():
+    from kalshi_auth import check_private_api
+    check_private_api()  # Read-only startup check; no order placement.
     log.info("Kalshi BTC15M v5.3: daily retraining with temporal holdout")
     while True:
         try:
