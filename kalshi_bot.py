@@ -1,7 +1,9 @@
 """Kalshi BTC 15-minute alerts with Kraken BTC/USD confirmation; no automatic trading.
 Signals describe Kalshi YES/NO contract momentum, not BTC/USD price forecasts.
 """
+import json
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -216,13 +218,18 @@ def db_open():
                 issued_at REAL, close_at REAL, start_price TEXT,
                 target_price TEXT, actual_price TEXT, evaluated_at REAL,
                 status TEXT NOT NULL, source TEXT NOT NULL, note TEXT)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS adaptive_models
+               (name TEXT PRIMARY KEY, model_json TEXT NOT NULL,
+                trained_at REAL NOT NULL, samples INTEGER NOT NULL,
+                validation_score REAL NOT NULL)""")
     # Upgrade persistent databases created by earlier bot versions.
     feedback_columns = {row[1] for row in db.execute(
         "PRAGMA table_info(kalshi_prediction_feedback)")}
     for column, declaration in (
             ("high_after_signal", "TEXT"),
             ("low_after_signal", "TEXT"),
-            ("target_reached", "INTEGER")):
+            ("target_reached", "INTEGER"),
+            ("model_features", "TEXT")):
         if column not in feedback_columns:
             db.execute(f"ALTER TABLE kalshi_prediction_feedback ADD COLUMN {column} {declaration}")
     db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
@@ -308,6 +315,150 @@ def journal_opening_quote(db, market, now, open_at, close_at):
         VALUES (?,?,?,?,?,?,?)""",
         (market["ticker"], now, close_at, str(bid), str(ask), str(mid), kraken_price))
 
+def make_model_features(phase, mid, kalshi_change, remaining):
+    """Capture only values available when the forecast is issued."""
+    snapshot = kraken_5m_snapshot
+    if (snapshot is None or time.time() - snapshot[0] > 30
+            or snapshot[1] <= 0):
+        return None
+    btc_return = float((snapshot[2] - snapshot[1]) / snapshot[1])
+    return [
+        1.0 if phase == "LAST_5M" else 0.0,
+        float(mid),
+        float(kalshi_change) * 10.0,
+        btc_return * 1000.0,
+        max(0.0, min(1.0, float(remaining) / 900.0)),
+    ]
+
+
+def _sigmoid(value):
+    value = max(-30.0, min(30.0, value))
+    return 1.0 / (1.0 + math.exp(-value))
+
+
+def train_adaptive_model(db, now):
+    """Fit a small local classifier from settled, out-of-sample bot forecasts."""
+    rows = db.execute("""SELECT model_features, actual_direction
+        FROM kalshi_prediction_feedback
+        WHERE status='evaluated' AND source='bot_forecast'
+          AND model_features IS NOT NULL
+          AND actual_direction IN ('UP','DOWN')
+        ORDER BY evaluated_at ASC""").fetchall()
+    examples = []
+    for raw_features, actual in rows:
+        try:
+            features = json.loads(raw_features)
+            if len(features) == 5 and all(math.isfinite(float(v)) for v in features):
+                examples.append(([float(v) for v in features], 1.0 if actual == "UP" else 0.0))
+        except (TypeError, ValueError):
+            continue
+    if len(examples) < 30:
+        log.info("Adaptive training waiting for 30 scored forecasts; currently %d", len(examples))
+        return False
+    split = int(len(examples) * 0.8)
+    split = max(20, min(split, len(examples) - 6))
+    training, validation = examples[:split], examples[split:]
+    if (sum(y for _, y in training) < 8
+            or len(training) - sum(y for _, y in training) < 8
+            or not any(y == 1.0 for _, y in validation)
+            or not any(y == 0.0 for _, y in validation)):
+        log.info("Adaptive training waiting for balanced UP/DOWN examples")
+        return False
+    columns = list(zip(*(x for x, _ in training)))
+    means = [sum(col) / len(col) for col in columns]
+    scales = []
+    for col, mean in zip(columns, means):
+        variance = sum((value - mean) ** 2 for value in col) / len(col)
+        scales.append(math.sqrt(variance) or 1.0)
+
+    def normalize(features):
+        return [(value - mean) / scale for value, mean, scale in zip(features, means, scales)]
+
+    weights = [0.0] * 6
+    learning_rate = 0.04
+    for _ in range(500):
+        gradients = [0.0] * len(weights)
+        for features, label in training:
+            vector = [1.0] + normalize(features)
+            error = _sigmoid(sum(w * x for w, x in zip(weights, vector))) - label
+            for index, value in enumerate(vector):
+                gradients[index] += error * value
+        for index in range(len(weights)):
+            gradient = gradients[index] / len(training)
+            if index:
+                gradient += 0.01 * weights[index]
+            weights[index] -= learning_rate * gradient
+
+    true_up = true_down = hit_up = hit_down = 0
+    for features, label in validation:
+        probability = _sigmoid(sum(w * x for w, x in zip(weights, [1.0] + normalize(features))))
+        predicted_up = probability >= 0.5
+        if label == 1.0:
+            true_up += 1
+            hit_up += int(predicted_up)
+        else:
+            true_down += 1
+            hit_down += int(not predicted_up)
+    balanced_accuracy = ((hit_up / true_up) + (hit_down / true_down)) / 2
+    if balanced_accuracy < 0.52:
+        log.info("Adaptive model kept previous version; validation balanced accuracy %.3f",
+                 balanced_accuracy)
+        return False
+    payload = {
+        "weights": weights, "means": means, "scales": scales,
+        "balanced_accuracy": balanced_accuracy, "samples": len(examples),
+        "validation_samples": len(validation),
+    }
+    db.execute("""INSERT INTO adaptive_models(name, model_json, trained_at, samples, validation_score)
+        VALUES ('btc_direction', ?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET model_json=excluded.model_json,
+          trained_at=excluded.trained_at, samples=excluded.samples,
+          validation_score=excluded.validation_score""",
+        (json.dumps(payload, separators=(",", ":")), now, len(examples), balanced_accuracy))
+    log.info("Adaptive BTC model trained: n=%d, validation balanced accuracy=%.3f",
+             len(examples), balanced_accuracy)
+    return True
+
+
+def adaptive_model_allows(db, features, direction):
+    """Use a validated model as a veto when it strongly disagrees with the signal."""
+    if features is None:
+        return True
+    row = db.execute("SELECT model_json FROM adaptive_models WHERE name='btc_direction'").fetchone()
+    if not row:
+        return True
+    try:
+        model = json.loads(row[0])
+        if (model.get("samples", 0) < 30
+                or model.get("balanced_accuracy", 0) < 0.52):
+            return True
+        vector = [1.0] + [
+            (value - mean) / scale
+            for value, mean, scale in zip(features, model["means"], model["scales"])
+        ]
+        probability_up = _sigmoid(sum(w * x for w, x in zip(model["weights"], vector)))
+        model_direction = "UP" if probability_up >= 0.5 else "DOWN"
+        confidence = max(probability_up, 1.0 - probability_up)
+        if model_direction != direction and confidence >= 0.58:
+            log.info("Adaptive model vetoed %s signal: model favors %s (%.1f%%)",
+                     direction, model_direction, confidence * 100)
+            return False
+    except (KeyError, TypeError, ValueError, IndexError, ZeroDivisionError):
+        log.exception("Adaptive model could not read its saved parameters")
+    return True
+
+
+def maybe_train_adaptive_model(db, now):
+    """Attempt one persisted model update per UTC day, after scored results arrive."""
+    today = time.strftime("%Y-%m-%d", time.gmtime(now))
+    row = db.execute("SELECT value FROM telegram_state WHERE key='adaptive_training_day'").fetchone()
+    if row and row[0] == today:
+        return
+    train_adaptive_model(db, now)
+    db.execute("""INSERT INTO telegram_state(key,value) VALUES ('adaptive_training_day',?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (today,))
+
+
 def adaptive_direction_gate(db, phase, direction):
     """Pause a weak signal bucket using settled bot forecasts; never auto-reverse."""
     rows = db.execute("""SELECT actual_direction
@@ -384,6 +535,9 @@ def signal(db, m, now, close_at, open_at, phase, btc_trend):
         return
     if not adaptive_direction_gate(db, phase, direction):
         return
+    model_features = make_model_features(phase, mid, change, remaining)
+    if not adaptive_model_allows(db, model_features, direction):
+        return
     btc_projection = kraken_close_projection(now, remaining)
     if btc_projection is None:
         log.info("Skipping %s %s: no fresh five-minute BTC/USD data for estimate",
@@ -414,10 +568,11 @@ def signal(db, m, now, close_at, open_at, phase, btc_trend):
                    (ticker, phase, now, direction))
         db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
             (id, ticker, phase, predicted_direction, issued_at, close_at,
-             start_price, target_price, status, source, note)
-            VALUES (?,?,?,?,?,?,?,?, 'pending', 'bot_forecast', ?)""",
+             start_price, target_price, model_features, status, source, note)
+            VALUES (?,?,?,?,?,?,?,?,?, 'pending', 'bot_forecast', ?)""",
             (ticker + ":" + phase, ticker, phase, direction, now, close_at,
              str(btc_now), str(btc_close),
+             json.dumps(model_features, separators=(",", ":")) if model_features is not None else None,
              "Awaiting Kraken BTC/USD close-price evaluation."))
         log.info("Kalshi %s alert: %s %s", phase, ticker, direction)
 
@@ -492,12 +647,12 @@ def evaluate_btc_forecasts(db, now):
                            "Primer objetivo: sin dato")
             reversal_line = ("🔄 El precio tocó el objetivo y luego revirtió antes del cierre.\n"
                              if reached and actual != predicted else "")
-            notify("🧠 BTC — REVISIÓN DE PREDICCIÓN\\n"
-                   f"🧾 {ticker} ({phase})\\n"
-                   f"🔮 Pronóstico: {predicted} desde USD {start_price:,.2f}\\n"
-                   f"📈 Máximo/mínimo después de la señal: USD {peak:,.2f} / USD {trough:,.2f}\\n"
-                   f"🎯 {target_line} ({'USD ' + format(target_price, ',.2f') if target_price is not None else 'sin dato'})\\n"
-                   f"📍 Cierre aproximado: {actual} en USD {actual_price:,.2f}\\n"
+            notify("🧠 BTC — REVISIÓN DE PREDICCIÓN\n"
+                   f"🧾 {ticker} ({phase})\n"
+                   f"🔮 Pronóstico: {predicted} desde USD {start_price:,.2f}\n"
+                   f"📈 Máximo/mínimo después de la señal: USD {peak:,.2f} / USD {trough:,.2f}\n"
+                   f"🎯 {target_line} ({'USD ' + format(target_price, ',.2f') if target_price is not None else 'sin dato'})\n"
+                   f"📍 Cierre aproximado: {actual} en USD {actual_price:,.2f}\n"
                    + reversal_line
                    + ("✅ Dirección al cierre coincidió." if correct else
                       "❌ Dirección al cierre falló; datos guardados."))
@@ -586,6 +741,7 @@ def scan():
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
+        maybe_train_adaptive_model(db, now)
         db.execute("DELETE FROM kalshi_only_samples WHERE observed_at < ?", (now - 48 * 3600,))
         db.commit()
 
