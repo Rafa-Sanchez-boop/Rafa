@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import requests
+import btc_assistant
 
 BASE = "https://external-api.kalshi.com/trade-api/v2"
 SERIES = os.getenv("KALSHI_SERIES", "KXBTC15M")
@@ -98,6 +99,8 @@ def ts(x):
 def db_open():
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     db = sqlite3.connect(DB_PATH, timeout=30)
+    db.execute("""CREATE TABLE IF NOT EXISTS telegram_state
+               (key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_only_samples
                (ticker TEXT, observed_at REAL, yes_mid TEXT,
                 PRIMARY KEY(ticker, observed_at))""")
@@ -423,12 +426,18 @@ def telegram_test_once():
         log.error("Telegram diagnostic: test message failed or was not accepted")
 
 def main():
-    log.info("Kalshi BTC15M with Kraken confirmation and short UP/DOWN messages")
+    log.info("Kalshi BTC15M with Kraken confirmation and Telegram BTC assistant")
+    btc_assistant.register_commands()
     while True:
         try:
             scan()
         except Exception:
             log.exception("Scan failed")
+        try:
+            with db_open() as db:
+                btc_assistant.process_updates(db)
+        except Exception:
+            log.exception("Telegram assistant polling failed")
         time.sleep(SCAN_SECONDS)
 
 if __name__ == "__main__":
