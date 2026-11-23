@@ -106,6 +106,19 @@ def db_open():
                 PRIMARY KEY(ticker,phase))""")
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_only_results
                (ticker TEXT PRIMARY KEY, result TEXT, observed_at REAL)""")
+    # Durable forecast feedback: keep reported corrections and score each
+    # sent BTC/USD projection against Kraken's one-minute close near settlement.
+    db.execute("""CREATE TABLE IF NOT EXISTS kalshi_prediction_feedback
+               (id TEXT PRIMARY KEY, ticker TEXT, phase TEXT,
+                predicted_direction TEXT, actual_direction TEXT,
+                issued_at REAL, close_at REAL, start_price TEXT,
+                target_price TEXT, actual_price TEXT, evaluated_at REAL,
+                status TEXT NOT NULL, source TEXT NOT NULL, note TEXT)""")
+    db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
+        (id, predicted_direction, actual_direction, status, source, note)
+        VALUES ('user-report-2026-11-23', 'DOWN', 'UP', 'reported',
+                'user_report',
+                'User reported the bot forecast moved left/down; BTC actually rose right/up. Exact ticker, time, and prices were not provided.')""")
     # Shadow journal: captures only the first quote observed during the
     # market's opening minute. It never sends alerts or places orders.
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_opening_journal
@@ -248,9 +261,70 @@ def signal(db, m, now, close_at, open_at, phase, btc_trend):
         alerted_tickers.add(alert_key)
         db.execute("INSERT OR IGNORE INTO kalshi_only_alerts VALUES (?,?,?,?)",
                    (ticker, phase, now, direction))
+        db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
+            (id, ticker, phase, predicted_direction, issued_at, close_at,
+             start_price, target_price, status, source, note)
+            VALUES (?,?,?,?,?,?,?,?, 'pending', 'bot_forecast', ?)""",
+            (ticker + ":" + phase, ticker, phase, direction, now, close_at,
+             str(btc_now), str(btc_close),
+             "Awaiting Kraken BTC/USD close-price evaluation."))
         log.info("Kalshi %s alert: %s %s", phase, ticker, direction)
 
+def evaluate_btc_forecasts(db, now):
+    """Score pending BTC/USD forecasts using Kraken's one-minute close near expiry."""
+    rows = db.execute("""SELECT id, ticker, phase, predicted_direction, close_at,
+                                start_price
+                         FROM kalshi_prediction_feedback
+                         WHERE status='pending' AND close_at <= ?
+                         ORDER BY close_at LIMIT 100""", (now,)).fetchall()
+    for row in rows:
+        forecast_id, ticker, phase, predicted, close_at, start_text = row
+        try:
+            response = http.get(
+                "https://api.kraken.com/0/public/OHLC",
+                params={"pair": "XBTUSD", "interval": 1,
+                        "since": max(0, int(close_at) - 60)},
+                timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("error"):
+                continue
+            series = payload.get("result", {})
+            key = next((k for k in series if k != "last"), None)
+            if key is None:
+                continue
+            candles = series.get(key, [])
+            candle = min(candles, key=lambda c: abs(float(c[0]) - close_at),
+                         default=None)
+            if candle is None or abs(float(candle[0]) - close_at) > 60:
+                continue
+            actual_price = dec(candle[4])
+            start_price = dec(start_text)
+            if actual_price is None or start_price is None:
+                continue
+            actual = ("UP" if actual_price > start_price else
+                      "DOWN" if actual_price < start_price else "FLAT")
+            correct = predicted == actual
+            db.execute("""UPDATE kalshi_prediction_feedback
+                SET actual_direction=?, actual_price=?, evaluated_at=?,
+                    status='evaluated', note=? WHERE id=? AND status='pending'""",
+                (actual, str(actual_price), now,
+                 "Direction matched" if correct else "Direction missed",
+                 forecast_id))
+            notify("🧠 BTC — REVISIÓN DE PREDICCIÓN\\n"
+                   f"🧾 {ticker} ({phase})\\n"
+                   f"🔮 Pronóstico: {predicted} desde ${start_price:,.2f}\\n"
+                   f"📍 Resultado cerca del cierre: {actual} a ${actual_price:,.2f}\\n"
+                   f"{'✅ Coincidió' if correct else '❌ Falló; error guardado'}\\n"
+                   "El resultado quedó guardado para medir el desempeño futuro.")
+        except (requests.RequestException, ValueError, KeyError, IndexError,
+                TypeError, StopIteration):
+            log.exception("Could not evaluate BTC forecast for %s", ticker)
+
 def check_results(db, now):
+    # Separately score BTC/USD price forecasts against Kraken. Kalshi settlement
+    # below remains the official outcome for the prediction-market contract.
+    evaluate_btc_forecasts(db, now)
     # Use Kalshi's official result field, never Kraken, for completed markets.
     rows = db.execute("""SELECT DISTINCT ticker FROM kalshi_only_alerts
         WHERE ticker NOT IN (SELECT ticker FROM kalshi_only_results)""").fetchall()
