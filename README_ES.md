@@ -8,8 +8,21 @@
 - Guarda observaciones y evita repetir la misma alerta durante un periodo configurable.
 - **No tiene código de compra/venta, no usa claves de trading y no coloca órdenes.**
 
+## Asistente de Bitcoin en Telegram
+El mismo bot admite estos comandos en el chat configurado:
+
+- `/ayuda` — muestra el menú de comandos.
+- `/btc` — consulta precio, rango y volumen de 24 horas, cambio de 5 y 15 minutos, RSI, EMA 9/21, MACD y niveles recientes.
+- `/mercado` — consulta el contrato BTC15M activo en Kalshi, sus precios YES/NO y el tiempo restante.
+- `/pregunta ¿En el minuto 8 seguirá subiendo?` — responde con la IA y una captura actual de Kraken y Kalshi.
+- También puedes escribir una pregunta normal en el chat.
+
+Para habilitar respuestas de lenguaje libre, configura `OPENAI_API_KEY` como secreto del servicio en Render. El modelo predeterminado es `gpt-5.5`; se puede cambiar con `OPENAI_MODEL`. Sin esa clave, `/btc` y `/mercado` siguen disponibles y el bot explica que la IA conversacional necesita configuración.
+
+La IA puede analizar los datos que recibe del mercado, pero no puede garantizar la dirección futura. No coloca órdenes. Si preguntas por un cálculo de contratos, indica la cantidad, el lado y el precio de entrada; el bot no supone una cantidad ni incluye comisiones si no tiene esos datos.
+
 ## Límite honesto del modelo
-Esta versión es un monitor cuantitativo de movimiento del precio, no una IA que conozca el resultado futuro. El movimiento de un escaneo al siguiente NO es una probabilidad de ganar. La etiqueta `WATCH YES/NO` significa “revisar este mercado”, no “apostar”. No uses dinero real basándote únicamente en la alerta. Para crear un predictor de verdad se necesita recopilar histórico, incorporar datos externos relevantes por categoría y validar calibración y rendimiento fuera de muestra.
+Las señales y el análisis técnico no aseguran el resultado de Bitcoin ni una ganancia. Los indicadores describen datos recientes y pueden cambiar con rapidez. Las noticias y métricas on-chain no se presentan como datos en vivo, a menos que se conecte una fuente para ellas.
 
 ## Despliegue recomendado: Render Background Worker
 1. Crea un repositorio privado en GitHub y sube estos archivos.
