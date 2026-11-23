@@ -65,6 +65,23 @@ def kraken_trend_5m(now):
         return None
     return "UP" if current[1] > prior[1] else "DOWN"
 
+def kraken_close_projection(now, remaining):
+    """Estimate BTC/USD at contract close by extending the latest five-minute move."""
+    if not kraken_samples or kraken_last_quote is None:
+        return None
+    quote_time, current = kraken_last_quote
+    if now - quote_time > 30 or remaining < 0:
+        return None
+    target_time = now - 300
+    prior_time, prior = min(kraken_samples, key=lambda sample: abs(sample[0] - target_time))
+    if abs(prior_time - target_time) > 45 or current == prior:
+        return None
+    change_5m = current - prior
+    projected = current + change_5m * Decimal(str(remaining)) / Decimal("300")
+    if projected <= 0:
+        return None
+    return current, projected
+
 def dec(x):
     try:
         v = Decimal(str(x))
@@ -211,15 +228,24 @@ def signal(db, m, now, close_at, open_at, phase, btc_trend):
         log.info("Skipping %s %s: Kalshi %s, Kraken 5m %s",
                  phase, ticker, direction, btc_trend)
         return
-    projected = min(Decimal("0.99"), max(Decimal("0.01"), mid + change))
+    btc_projection = kraken_close_projection(now, remaining)
+    if btc_projection is None:
+        log.info("Skipping %s %s: no fresh five-minute BTC/USD data for estimate",
+                 phase, ticker)
+        return
+    btc_now, btc_close = btc_projection
+    move = btc_close - btc_now
+    move_word = "subida" if move > 0 else "bajada"
     phase_name = ("primeros cinco minutos" if phase == "EARLY_5M"
                   else "últimos cinco minutos")
     message = (
-        ("🔺 UP" if up else "🔻 DOWN") + "\n"
-        + ("📈 Posible subida" if up else "📉 Posible bajada")
-        + f" desde ${mid:.3f} hacia ${projected:.3f}.\n"
-        + f"⏱️ Análisis: {phase_name}; Kalshi y BTC/Kraken coinciden.\n"
-        + "🔄 Después el precio puede cambiar de rumbo."
+        ("🔺 UP" if up else "🔻 DOWN") + "\\n"
+        + f"₿ BTC ahora: ${btc_now:,.2f}\\n"
+        + f"📈 Posible {move_word}: desde ${btc_now:,.2f} "
+        + f"hasta aprox. ${btc_close:,.2f} "
+        + f"({move:+,.2f} USD) al cierre.\\n"
+        + f"⏱️ Ventana: {phase_name}.\\n"
+        + "🔄 Estimación por el movimiento reciente; puede cambiar."
     )
     if notify(message):
         alerted_tickers.add(alert_key)
