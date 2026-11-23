@@ -7,7 +7,7 @@ import math
 import os
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import requests
 import btc_assistant
@@ -205,6 +205,13 @@ def db_open():
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_only_samples
                (ticker TEXT, observed_at REAL, yes_mid TEXT,
                 PRIMARY KEY(ticker, observed_at))""")
+    # Persist completed Kraken BTC/USD 15-minute candles for the visual streak chart.
+    db.execute("""CREATE TABLE IF NOT EXISTS btc_15m_candles
+               (open_time INTEGER PRIMARY KEY, close_time INTEGER NOT NULL,
+                open_price TEXT NOT NULL, close_price TEXT NOT NULL,
+                direction TEXT NOT NULL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS btc_15m_chart_sent
+               (close_time INTEGER PRIMARY KEY)""")
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_only_alerts
                (ticker TEXT, phase TEXT, sent_at REAL, direction TEXT,
                 PRIMARY KEY(ticker,phase))""")
@@ -297,6 +304,82 @@ def quote(m):
 def sample(db, ticker, now, mid):
     db.execute("INSERT OR IGNORE INTO kalshi_only_samples VALUES (?,?,?)",
                (ticker, now, str(mid)))
+
+def record_btc_15m_chart(db, now):
+    """Store completed Kraken BTC/USD 15m candles and send a compact streak chart."""
+    try:
+        response = http.get(KRAKEN_URL.replace("/Ticker", "/OHLC"),
+                            params={"pair": "XBTUSD", "interval": 15}, timeout=15)
+        response.raise_for_status()
+        payload = response.json()
+        result = payload.get("result") or {}
+        key = next((name for name in result if name != "last"), None)
+        candles = result.get(key, []) if key else []
+        completed = []
+        for candle in candles:
+            if len(candle) < 5:
+                continue
+            open_time = int(float(candle[0]))
+            close_time = open_time + 15 * 60
+            if close_time > now:
+                continue
+            open_price, close_price = dec(candle[1]), dec(candle[4])
+            if open_price is None or close_price is None or open_price <= 0:
+                continue
+            direction = ("UP" if close_price > open_price else
+                         "DOWN" if close_price < open_price else "FLAT")
+            completed.append((open_time, close_time, str(open_price),
+                              str(close_price), direction))
+        for row in completed:
+            db.execute("""INSERT OR IGNORE INTO btc_15m_candles
+                (open_time, close_time, open_price, close_price, direction)
+                VALUES (?,?,?,?,?)""", row)
+        db.execute("DELETE FROM btc_15m_candles WHERE close_time < ?",
+                   (int(now) - 30 * 24 * 60 * 60,))
+        latest = db.execute("""SELECT open_time, close_time, open_price,
+                                      close_price, direction
+                               FROM btc_15m_candles
+                               ORDER BY close_time DESC LIMIT 1""").fetchone()
+        if latest is None:
+            return
+        open_time, close_time, open_text, close_text, direction = latest
+        if db.execute("SELECT 1 FROM btc_15m_chart_sent WHERE close_time=?",
+                      (close_time,)).fetchone():
+            return
+        rows = db.execute("""SELECT open_time, close_time, open_price,
+                                    close_price, direction
+                             FROM btc_15m_candles
+                             ORDER BY close_time DESC LIMIT 16""").fetchall()
+        rows.reverse()
+        last_four = rows[-4:]
+        up_16 = sum(row[4] == "UP" for row in rows)
+        down_16 = sum(row[4] == "DOWN" for row in rows)
+        up_4 = sum(row[4] == "UP" for row in last_four)
+        down_4 = sum(row[4] == "DOWN" for row in last_four)
+        markers = {"UP": "🟩", "DOWN": "🟥", "FLAT": "⬜"}
+        chart = "".join(markers[row[4]] for row in rows)
+        streak = 0
+        if direction != "FLAT":
+            for row in reversed(rows):
+                if row[4] != direction:
+                    break
+                streak += 1
+        arrow = "🔺 UP" if direction == "UP" else "🔻 DOWN" if direction == "DOWN" else "➖ FLAT"
+        close_label = datetime.fromtimestamp(close_time, timezone.utc).strftime("%H:%M UTC")
+        message = (
+            "📊 BTC/USD · cierres de 15 min (Kraken)\\n"
+            f"🟥 DOWN | 🟩 UP · antiguo → reciente\\n{chart}\\n"
+            f"Últimas 4: DOWN {down_4} · UP {up_4}\\n"
+            f"Últimas 16: DOWN {down_16} · UP {up_16}\\n"
+            f"Racha actual: {arrow} × {streak}\\n"
+            f"Cierre {close_label}: ${dec(open_text):,.2f} → ${dec(close_text):,.2f}"
+        )
+        if notify(message):
+            db.execute("INSERT OR IGNORE INTO btc_15m_chart_sent VALUES (?)",
+                       (close_time,))
+    except (requests.RequestException, ValueError, KeyError, IndexError,
+            TypeError, StopIteration):
+        log.exception("Could not update BTC 15-minute candle chart")
 
 def journal_opening_quote(db, market, now, open_at, close_at):
     """Record an opening-minute quote for later out-of-sample evaluation."""
@@ -711,11 +794,14 @@ def check_results(db, now):
 
 def scan():
     payload = get_json("/markets", {"series_ticker": SERIES, "status": "open", "limit": 100})
-    if payload is None:
-        return
     now = time.time()
+    if payload is None:
+        with db_open() as db:
+            record_btc_15m_chart(db, now)
+        return
     btc_trend = kraken_trend(now)
     with db_open() as db:
+        record_btc_15m_chart(db, now)
         for m in payload.get("markets", []):
             ticker = m.get("ticker", "")
             if not isinstance(ticker, str) or not ticker.startswith(SERIES + "-"):
