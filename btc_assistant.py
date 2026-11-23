@@ -24,6 +24,7 @@ COMMANDS = [
     {"command": "ayuda", "description": "Ver comandos del asistente"},
     {"command": "btc", "description": "Precio e indicadores de Bitcoin"},
     {"command": "mercado", "description": "Ver mercado BTC de Kalshi"},
+    {"command": "errores", "description": "Ver aciertos, fallos y objetivos"},
     {"command": "pregunta", "description": "Preguntar a la IA sobre BTC y el mercado"},
 ]
 
@@ -181,7 +182,50 @@ def market_report(snap):
         "Las cotizaciones son precios de contratos, no el precio de BTC."
     )
 
-def ai_answer(question, snap):
+def recent_feedback_context(db):
+    rows = db.execute("""SELECT source, predicted_direction, actual_direction,
+                                target_price, high_after_signal, low_after_signal,
+                                target_reached, note
+                         FROM kalshi_prediction_feedback
+                         WHERE status IN ('evaluated','reported')
+                         ORDER BY rowid DESC LIMIT 8""").fetchall()
+    if not rows:
+        return "Todavía no hay resultados guardados."
+    return "\n".join(
+        f"- {source}: {predicted or 'sin dirección'} → {actual or 'pendiente'}; "
+        f"objetivo={target or 'sin dato'}, máximo={high or 'sin dato'}, "
+        f"mínimo={low or 'sin dato'}, objetivo_tocado={reached if reached is not None else 'sin dato'}; "
+        f"{note or ''}"
+        for source, predicted, actual, target, high, low, reached, note in rows)
+
+def feedback_report(db):
+    evaluated = db.execute("""SELECT predicted_direction, actual_direction,
+                                      target_reached
+                               FROM kalshi_prediction_feedback
+                               WHERE status='evaluated' AND source='bot_forecast'
+                               ORDER BY evaluated_at DESC LIMIT 20""").fetchall()
+    reported = db.execute("""SELECT COUNT(*) FROM kalshi_prediction_feedback
+                             WHERE status='reported'""").fetchone()[0]
+    if not evaluated and not reported:
+        return "Aún no hay resultados evaluados ni errores reportados guardados."
+    correct = sum(predicted == actual for predicted, actual, _ in evaluated)
+    target_rows = [row[2] for row in evaluated if row[2] is not None]
+    touched = sum(bool(value) for value in target_rows)
+    lines = ["🧠 RAFA — HISTORIAL DE RESULTADOS"]
+    if evaluated:
+        lines.append(f"Últimas {len(evaluated)} evaluaciones: {correct}/{len(evaluated)} direcciones coincidieron.")
+    else:
+        lines.append("Aún no hay evaluaciones automáticas completas.")
+    if target_rows:
+        lines.append(f"Primer objetivo tocado: {touched}/{len(target_rows)}.")
+    lines.append(f"Errores reportados por ti: {reported}.")
+    for predicted, actual, reached in evaluated[:5]:
+        status = "acertó al cierre" if predicted == actual else "falló al cierre"
+        target = "objetivo tocado" if reached else "objetivo no tocado" if reached is False else "objetivo sin dato"
+        lines.append(f"{predicted} → {actual}: {status}; {target}.")
+    return "\n".join(lines)
+
+def ai_answer(question, snap, feedback_context=""):
     if not OPENAI_API_KEY:
         return ("La conexión con la IA conversacional aún no está activada. "
                 "Puedo mostrar el análisis técnico en /btc y el contrato actual en /mercado. "
@@ -197,7 +241,9 @@ def ai_answer(question, snap):
         "cantidad, lado, precio o los datos necesarios; no supongas cantidad. Si faltan precio de entrada, "
         "lado o cantidad, pregunta cuál falta. Las comisiones de Kalshi no están incluidas salvo que se "
         "proporcionen. Si consultan noticias, datos on-chain o liquidaciones y esos datos no aparecen en "
-        "el JSON, dilo claramente y no los inventes. Esto es análisis informativo, no asesoría financiera."
+        "el JSON, dilo claramente y no los inventes. Usa el historial de errores como advertencias, "
+        "separa los reportes manuales de resultados automáticos y no afirmes que el sistema se "
+        "reentrenó solo. Esto es análisis informativo, no asesoría financiera."
     )
     try:
         response = session.post(
@@ -206,6 +252,8 @@ def ai_answer(question, snap):
             json={"model": OPENAI_MODEL, "instructions": system,
                   "input": "DATOS DE MERCADO (capturados ahora):\n"
                            + json.dumps(snap, ensure_ascii=False)
+                           + "\n\nERRORES Y RESULTADOS RECIENTES:\n"
+                           + (feedback_context or "Sin historial disponible.")
                            + "\n\nPREGUNTA DEL USUARIO: " + question,
                   "max_output_tokens": 350},
             timeout=25)
@@ -226,6 +274,7 @@ def help_text():
         "🤖 RAFA — COMANDOS\n"
         "/btc — precio BTC e indicadores: RSI, EMA, MACD, volumen y rangos\n"
         "/mercado — contrato BTC15M activo de Kalshi\n"
+        "/errores — ver aciertos, fallos y objetivos\n"
         "/pregunta tu pregunta — consultar la IA con datos actuales\n"
         "También puedes escribir una pregunta normal en el chat.\n"
         "No se fija una cantidad de contratos: inclúyela solo si quieres calcular un escenario."
@@ -284,15 +333,17 @@ def process_updates(db):
                     reply = btc_report(get_snapshot())
                 elif command == "/mercado":
                     reply = market_report(get_snapshot())
+                elif command == "/errores":
+                    reply = feedback_report(db)
                 elif command == "/pregunta":
                     if not question:
                         reply = "Escribe: /pregunta ¿Bitcoin seguirá subiendo en el minuto 8?"
                     else:
                         snap = get_snapshot()
-                        reply = ai_answer(question, snap)
+                        reply = ai_answer(question, snap, recent_feedback_context(db))
                 elif not text.strip().startswith("/"):
                     snap = get_snapshot()
-                    reply = ai_answer(text.strip(), snap)
+                    reply = ai_answer(text.strip(), snap, recent_feedback_context(db))
                 else:
                     reply = "No reconozco ese comando. Usa /ayuda."
                 send_message(chat_id, reply)
