@@ -43,7 +43,7 @@ class Trading:
 
     @classmethod
     def from_environment(cls, session):
-        mode = os.getenv("RAFA_TRADING_MODE", "alerts")
+        mode = os.getenv("RAFA_TRADING_MODE", "verify")
         if mode not in {"verify", "live"}:
             return None
         key_id = os.getenv("KALSHI_API_KEY_ID") or os.getenv("KALSHI_API_KEY")
