@@ -18,7 +18,6 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
 DELAY = 0
-MIN_REMAINING = max(300, int(os.getenv("MIN_REMAINING_SECONDS", "300")))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-only")
 http = requests.Session()
@@ -235,9 +234,9 @@ def scan(trading=None):
             if q:
                 sample(db, ticker, now, q[2])
             remaining = closes - now
-            # Scan continuously after initial analysis, until five minutes remain.
+            # Scan the full 15-minute contract window; quote-history checks still apply.
             # OPEN phase is used for one alert per contract.
-            if 300 < remaining <= 780:
+            if 0 < remaining <= 900:
                 signal(db, m, now, closes, opened, "OPEN", trading)
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
