@@ -258,6 +258,17 @@ def feedback_report(db):
     if target_rows:
         lines.append(f"Primer objetivo tocado: {touched}/{len(target_rows)}.")
     lines.append(f"Errores reportados por ti: {reported}.")
+    model = db.execute("""SELECT samples, validation_score, trained_at
+        FROM adaptive_models WHERE name='btc_direction'""").fetchone()
+    if model:
+        samples, score, trained_at = model
+        trained_label = datetime.fromtimestamp(trained_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        lines.append(f"Modelo local: {samples} señales; validación {score * 100:.1f}%; actualizado {trained_label}.")
+    else:
+        feature_count = db.execute("""SELECT COUNT(*) FROM kalshi_prediction_feedback
+            WHERE status='evaluated' AND source='bot_forecast' AND model_features IS NOT NULL
+              AND actual_direction IN ('UP','DOWN')""").fetchone()[0]
+        lines.append(f"Modelo local: reuniendo señales evaluadas ({feature_count}/30 mínimo inicial).")
     for predicted, actual, reached in evaluated[:5]:
         status = "acertó al cierre" if predicted == actual else "falló al cierre"
         target = "objetivo tocado" if reached == 1 else "objetivo no tocado" if reached == 0 else "objetivo sin dato"
