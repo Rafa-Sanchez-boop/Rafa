@@ -168,9 +168,9 @@ def signal(db, m, now, close_at, open_at, phase, btc_trend):
                       f"📈 Interpretación: posible subida de la cotización YES de Kalshi "
                       f"desde ${mid:.3f} hacia ${projected:.3f}; después el precio puede cambiar de rumbo.")
     message = (
-        ("🔺 UP" if up else "🔻 DOWN") + "\\n"
+        ("🔺 UP" if up else "🔻 DOWN") + "\n"
         + ("📈 Posible subida" if up else "📉 Posible bajada")
-        + f" desde ${mid:.3f} hacia ${projected:.3f}.\\n"
+        + f" desde ${mid:.3f} hacia ${projected:.3f}.\n"
         + "🔄 Después el precio puede cambiar de rumbo."
     )
     if notify(message):
