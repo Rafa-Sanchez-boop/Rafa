@@ -1,4 +1,4 @@
-"""Kalshi BTC 15-minute alerts with Kalshi-only confirmation; optional Kalshi order execution.
+"""Kalshi-only BTC 15-minute alerts. No Kraken, no automatic trading.
 Signals describe Kalshi YES/NO contract momentum, not BTC/USD price forecasts.
 """
 import logging
@@ -9,21 +9,24 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import requests
 
-from kalshi_trading import Trading
-
 BASE = "https://external-api.kalshi.com/trade-api/v2"
 SERIES = os.getenv("KALSHI_SERIES", "KXBTC15M")
 DB_PATH = os.getenv("DB_PATH", "/var/data/kalshi_bot.sqlite3")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
-DELAY = 0
+DELAY = 120
+MAX_SPREAD = Decimal(os.getenv("MAX_SPREAD", "0.04"))
+MIN_MOVE = Decimal(os.getenv("MIN_MOVE", "0.025"))
+MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
+MIN_REMAINING = max(300, int(os.getenv("MIN_REMAINING_SECONDS", "300")))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-only")
 http = requests.Session()
 http.headers["User-Agent"] = "KalshiOnlyBTC15M/4.5"
 # Extra in-process protection against opposite alerts during a worker lifetime.
 alerted_tickers = set()
+
 def dec(x):
     try:
         v = Decimal(str(x))
@@ -67,11 +70,7 @@ def get_json(path, params=None):
             time.sleep(2 ** attempt)
     return None
 
-ALERTS_ENABLED = os.getenv("RAFA_ALERTS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
-
 def notify(msg):
-    if not ALERTS_ENABLED:
-        return False
     if not TOKEN or not CHAT_ID:
         log.warning("Telegram not configured: %s", msg)
         return False
@@ -88,27 +87,15 @@ def quote(m):
     bid, ask = dec(m.get("yes_bid_dollars")), dec(m.get("yes_ask_dollars"))
     if bid is None or ask is None or not (Decimal(0) < bid <= ask < Decimal(1)):
         return None
+    if ask - bid > MAX_SPREAD:
+        return None
     return bid, ask, (bid + ask) / 2
 
 def sample(db, ticker, now, mid):
     db.execute("INSERT OR IGNORE INTO kalshi_only_samples VALUES (?,?,?)",
                (ticker, now, str(mid)))
 
-def confirms_pullback(samples, up):
-    """Check an impulse, a Fibonacci pullback, and two continuation quotes."""
-    if len(samples) != 5 or any(price is None for price in samples):
-        return False
-    direction = 1 if up else -1
-    start, peak, pullback, first, latest = (direction * price for price in samples)
-    impulse = peak - start
-    if impulse <= 0:
-        return False
-    retracement = (peak - pullback) / impulse
-    return (Decimal("0.50") <= retracement <= Decimal("0.786")
-            and pullback < first < latest)
-
-
-def signal(db, m, now, close_at, open_at, phase, trading=None):
+def signal(db, m, now, close_at, open_at, phase):
     ticker = m["ticker"]
     if ticker in alerted_tickers:
         return
@@ -120,6 +107,11 @@ def signal(db, m, now, close_at, open_at, phase, trading=None):
     if q is None:
         return
     bid, ask, mid = q
+    volume = dec(m.get("volume_24h_fp"))
+    if volume is None:
+        volume = dec(m.get("volume_24h"))
+    if volume is None or volume < MIN_VOLUME:
+        return
     if phase == "OPEN":
         # Use the first actually observed Kalshi quote as baseline. The
         # market's open_time can predate the 15-minute trading window, and
@@ -141,17 +133,12 @@ def signal(db, m, now, close_at, open_at, phase, trading=None):
     if prior is None:
         return
     change = mid - prior
-    if change == 0:
-        # No observed direction; avoid inventing UP or DOWN.
+    if abs(change) < MIN_MOVE:
+        # No strong Kalshi direction; retry on subsequent scans.
         return
     up = change > 0
     direction = "UP" if up else "DOWN"
-    recent = db.execute("""SELECT yes_mid FROM kalshi_only_samples
-        WHERE ticker=? AND observed_at BETWEEN ? AND ?
-        ORDER BY observed_at DESC LIMIT 5""", (ticker, now - 120, now)).fetchall()
-    if not confirms_pullback([dec(row[0]) for row in reversed(recent)], up):
-        return
-    direction = "UP" if up else "DOWN"
+    entry = ask if up else Decimal(1) - bid
     remaining = max(0, int(close_at - now))
     phase_name = "OPORTUNIDAD A TIEMPO"
     # Projection is for the Kalshi YES contract quote, NOT BTC/USD.
@@ -163,16 +150,22 @@ def signal(db, m, now, close_at, open_at, phase, trading=None):
                       f"📈 Interpretación: posible subida de la cotización YES de Kalshi "
                       f"desde ${mid:.3f} hacia ${projected:.3f}; después el precio puede cambiar de rumbo.")
     message = (
-        ("🔺 UP" if up else "🔻 DOWN") + "\n"
-        + ("📈 Posible subida" if up else "📉 Posible bajada")
-        + f" desde ${mid:.3f} hacia ${projected:.3f}.\n"
-        + "🔄 Después el precio puede cambiar de rumbo."
+        "📊 BTC KALSHI — " + phase_name + "\n"
+        + ("🔺 UP" if up else "🔻 DOWN") + " | SEÑAL EXPERIMENTAL\n"
+        + "━━━━━━━━━━━━━━━━━━\n"
+        + f"📈 Precio YES anterior (Kalshi): ${prior:.3f}\n"
+        + f"📈 Precio YES actual (Kalshi): ${mid:.3f}\n"
+        + f"📏 Cambio en cotización YES: {change:+.3f}\n"
+        + f"🎟️ Entrada indicativa {direction}: ${entry:.2f}\n"
+        + f"⏳ Tiempo restante: {remaining//60:02d}:{remaining%60:02d}\n"
+        + f"🧾 Contrato: {ticker}\n"
+        + interpretation + "\n"
+        + "🎯 Proyección ilustrativa de cotización YES, no precio BTC/USD ni objetivo de compra/venta.\n"
+        + "⚠️ Solo datos de Kalshi. El cambio de cotización no predice "
+          "necesariamente el precio BTC ni el resultado final. "
+          "No se fija objetivo de venta; comisiones y liquidez pueden impedir beneficio. "
+          "Alerta informativa, no operación automática."
     )
-    # Orders run independently of Telegram delivery, including while alerts are paused.
-    if trading is not None:
-        db.commit()
-        entry = ask if up else Decimal(1) - bid
-        trading.open(m, "yes" if up else "no", entry, standard_fees(m))
     if notify(message):
         alerted_tickers.add(ticker)
         db.execute("INSERT OR IGNORE INTO kalshi_only_alerts VALUES (?,?,?,?)",
@@ -203,31 +196,10 @@ def check_results(db, now):
                    "⚠️ La señal mide momentum de cotización, no predice "
                    "el resultado final ni confirma beneficio de compraventa.")
 
-def standard_fees(market):
-    event_ticker = market.get("event_ticker")
-    if not event_ticker:
-        return False
-    series = (get_json("/series/" + SERIES) or {}).get("series", {})
-    event = (get_json("/events/" + event_ticker) or {}).get("event", {})
-    if not event or event.get("series_ticker") != SERIES:
-        return False
-    multiplier = dec(event.get("fee_multiplier_override"))
-    if multiplier is None or multiplier == 0:
-        multiplier = dec(series.get("fee_multiplier"))
-    fee_type = event.get("fee_type_override") or series.get("fee_type")
-    return (fee_type in {"quadratic", "quadratic_with_maker_fees"}
-            and multiplier is not None and Decimal(0) <= multiplier <= Decimal(1))
-
-
-def scan(trading=None):
+def scan():
     payload = get_json("/markets", {"series_ticker": SERIES, "status": "open", "limit": 100})
     if payload is None:
         return
-    if trading is not None:
-        markets = {m["ticker"]: m for m in payload.get("markets", []) if m.get("ticker")}
-        trading.maintain(markets, lambda ticker: (
-            get_json("/markets/" + ticker) or {}
-        ).get("market"), standard_fees)
     now = time.time()
     with db_open() as db:
         for m in payload.get("markets", []):
@@ -243,47 +215,21 @@ def scan(trading=None):
             if q:
                 sample(db, ticker, now, q[2])
             remaining = closes - now
-            # Scan the full 15-minute contract window; quote-history checks still apply.
+            # Scan continuously after initial analysis, until five minutes remain.
             # OPEN phase is used for one alert per contract.
-            if 0 < remaining <= 900:
-                signal(db, m, now, closes, opened, "OPEN", trading)
+            if now - opened >= DELAY and remaining >= MIN_REMAINING:
+                signal(db, m, now, closes, opened, "OPEN")
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
         db.execute("DELETE FROM kalshi_only_samples WHERE observed_at < ?", (now - 48 * 3600,))
         db.commit()
 
-def telegram_test_once():
-    """Send one diagnostic message, without fabricating a market signal."""
-    marker = os.path.join(os.path.dirname(DB_PATH) or ".", "telegram_test_20261122.ok")
-    if os.path.exists(marker):
-        return
-    log.info("Telegram diagnostic: attempting test delivery")
-    if notify("🤖 RAFA — PRUEBA DE TELEGRAM. Conexión funcionando. (No es señal de trading)"):
-        log.info("Telegram diagnostic: API accepted test message")
-        try:
-            os.makedirs(os.path.dirname(marker) or ".", exist_ok=True)
-            with open(marker, "w", encoding="utf-8") as out:
-                out.write("sent\\n")
-        except OSError:
-            log.exception("Telegram diagnostic marker could not be saved")
-    else:
-        log.error("Telegram diagnostic: test message failed or was not accepted")
-
 def main():
-    log.info("Kalshi BTC15M using Kalshi quotes only and short UP/DOWN messages")
-    try:
-        trading = Trading.from_environment(http)
-    except (OSError, ValueError, RuntimeError, requests.RequestException, sqlite3.Error) as exc:
-        log.error("Kalshi order initialization failed (%s). Alerts remain active.", type(exc).__name__)
-        trading = None
-    if trading is None:
-        log.info("Live orders unavailable; running alerts only")
-    else:
-        log.info("Live order mode ready; $20 cumulative loss cap and $2 per-order cap")
+    log.info("Kalshi-only BTC15M v4.5: continuous opportunities after 120s; no late alerts; no Kraken")
     while True:
         try:
-            scan(trading)
+            scan()
         except Exception:
             log.exception("Scan failed")
         time.sleep(SCAN_SECONDS)
