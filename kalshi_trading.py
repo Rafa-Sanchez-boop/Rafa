@@ -98,6 +98,7 @@ class Trading:
 
     def open(self, market, outcome, price, fee_verified):
         if not fee_verified:
+            LOG.info("Kalshi entry skipped for %s: fee schedule could not be verified", market["ticker"])
             return
         ticker = market["ticker"]
         with closing(self.connect()) as db:
@@ -107,12 +108,13 @@ class Trading:
                 (ticker,),
             ).fetchone():
                 return
-            today = datetime.now(CENTRAL).date().isoformat()
+            # Profits never increase the authorized initial bankroll.
             loss = sum((number(row[0]) for row in db.execute(
-                "SELECT loss FROM trades WHERE settled_day=? "
-                "UNION ALL SELECT loss FROM reversal_losses WHERE trading_day=?", (today, today)
+                "SELECT loss FROM trades WHERE settled_day IS NOT NULL "
+                "UNION ALL SELECT loss FROM reversal_losses"
             )), ZERO)
             if not purchase_fits(ONE, price, FEE_RESERVE, loss, ZERO):
+                LOG.info("Kalshi entry skipped for %s: cost exceeds available trading budget", ticker)
                 return
             if self.position(ticker) or not self.no_resting_orders(ticker):
                 return
