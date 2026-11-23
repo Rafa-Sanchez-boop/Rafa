@@ -23,6 +23,7 @@ session.headers["User-Agent"] = "Rafa-BTC-Market-Assistant/1.0"
 COMMANDS = [
     {"command": "ayuda", "description": "Ver comandos del asistente"},
     {"command": "btc", "description": "Precio e indicadores de Bitcoin"},
+    {"command": "ciclo", "description": "Ver fase del ciclo corto de BTC"},
     {"command": "mercado", "description": "Ver mercado BTC de Kalshi"},
     {"command": "errores", "description": "Ver aciertos, fallos y objetivos"},
     {"command": "pregunta", "description": "Preguntar a la IA sobre BTC y el mercado"},
@@ -166,6 +167,44 @@ def btc_report(snap):
         f"Lectura: {bias}. No es garantía de resultado."
     )
 
+def cycle_report(snap):
+    """Describe the observed short-term BTC cycle without assuming a reversal."""
+    price = snap.get("price")
+    trend5, trend15 = snap.get("trend_5m_pct"), snap.get("trend_15m_pct")
+    ema9, ema21 = snap.get("ema_9_1m"), snap.get("ema_21_1m")
+    rsi = snap.get("rsi_14_1m")
+    high, low = snap.get("high_20m"), snap.get("low_20m")
+    if None in (price, trend5, trend15, ema9, ema21):
+        return "🌀 BTC — CICLO CORTO\\nFase indeterminada: faltan datos recientes de precio o velas."
+    if trend5 > 0 and trend15 > 0 and ema9 > ema21:
+        phase = "impulso alcista"
+        level = "resistencia"
+        boundary = high
+    elif trend5 < 0 and trend15 < 0 and ema9 < ema21:
+        phase = "impulso bajista"
+        level = "soporte"
+        boundary = low
+    else:
+        phase = "transición o rango mixto"
+        level = "resistencia/soporte"
+        boundary = high if trend5 >= 0 else low
+    near = boundary is not None and abs(float(boundary) - float(price)) <= float(price) * 0.001
+    if near and phase == "impulso alcista":
+        phase += " cerca de resistencia"
+    elif near and phase == "impulso bajista":
+        phase += " cerca de soporte"
+    rsi_text = _fmt(rsi, 1)
+    lines = [
+        "🌀 BTC — CICLO CORTO",
+        f"Fase observada (5–15m): {phase}",
+        f"Precio: USD {_fmt(price)} | RSI(14): {rsi_text}",
+        f"Variación 5m/15m: {_fmt(trend5, 3)}% / {_fmt(trend15, 3)}%",
+    ]
+    if boundary is not None:
+        lines.append(f"Nivel cercano de {level}: USD {_fmt(boundary)}")
+    lines.append("El ciclo orienta el análisis; no asegura cuándo girará el precio.")
+    return "\\n".join(lines)
+
 def market_report(snap):
     market = snap.get("kalshi")
     if not market:
@@ -234,7 +273,7 @@ def ai_answer(question, snap, feedback_context=""):
         "Eres Rafa, un asistente de análisis de Bitcoin y del mercado BTC de Kalshi. "
         "Responde en español sencillo y breve. Usa el bloque JSON de datos actuales para precios, "
         "indicadores y contrato; no inventes datos ni digas que los tienes si faltan. "
-        "Si preguntan por un minuto específico del contrato, compara ese minuto con elapsed_minutes "
+        "Analiza los ciclos de corto plazo (impulso, retroceso, rango y transición) con tendencia, medias, RSI y niveles cercanos. " "Trata el ciclo como marco de lectura, no como ley: no afirmes que una subida debe caer de inmediato ni que una caída debe rebotar de inmediato; las tendencias pueden continuar y el momento del giro es incierto. " "Limita la lectura al horizonte de los datos disponibles. " "Si preguntan por un minuto específico del contrato, compara ese minuto con elapsed_minutes "
         "y seconds_remaining y explica el horizonte. Da un sesgo condicionado (alcista, bajista o mixto), "
         "las señales que lo respaldan y qué lo invalidaría. Nunca prometas certeza, ganancias ni 90/99%. "
         "No afirmes que una operación se hizo. Solo calcula escenarios de contratos si el usuario indica "
@@ -273,6 +312,7 @@ def help_text():
     return (
         "🤖 RAFA — COMANDOS\n"
         "/btc — precio BTC e indicadores: RSI, EMA, MACD, volumen y rangos\n"
+        "/ciclo — fase observada del ciclo corto y niveles\n"
         "/mercado — contrato BTC15M activo de Kalshi\n"
         "/errores — ver aciertos, fallos y objetivos\n"
         "/pregunta tu pregunta — consultar la IA con datos actuales\n"
@@ -331,6 +371,8 @@ def process_updates(db):
                     reply = help_text()
                 elif command == "/btc":
                     reply = btc_report(get_snapshot())
+                elif command == "/ciclo":
+                    reply = cycle_report(get_snapshot())
                 elif command == "/mercado":
                     reply = market_report(get_snapshot())
                 elif command == "/errores":
