@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 import requests
 
 from kalshi_trading import Trading
+from btc_confluence import assess
 
 BASE = "https://external-api.kalshi.com/trade-api/v2"
 SERIES = os.getenv("KALSHI_SERIES", "KXBTC15M")
@@ -142,6 +143,9 @@ def signal(db, m, now, close_at, open_at, phase, trading=None):
         # No observed direction; avoid inventing UP or DOWN.
         return
     up = change > 0
+    confluence = assess(http, direction)
+    if confluence is None or not confluence["passed"]:
+        return
     recent = db.execute("""SELECT yes_mid FROM kalshi_only_samples
         WHERE ticker=? AND observed_at BETWEEN ? AND ?
         ORDER BY observed_at DESC LIMIT 5""", (ticker, now - 120, now)).fetchall()
