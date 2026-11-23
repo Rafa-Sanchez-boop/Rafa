@@ -50,15 +50,13 @@ class Trading:
                   or os.getenv("KALSHI_API_KEY"))
         pem = os.getenv("KALSHI_PRIVATE_KEY_PEM") or os.getenv("KALSHI_PRIVATE_KEY")
         key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH") or os.getenv("KALSHI_PRIVATE_KEY_FILE")
-        if not pem and key_path:
-            pem = Path(key_path).read_text()
+        if not pem:
+            secret_file = Path(key_path or "/etc/secrets/kalshi_private.pem")
+            if key_path or secret_file.is_file():
+                pem = secret_file.read_text()
         if not key_id or not pem:
             LOG.error("Kalshi credential inputs: key ID configured=%s; private key configured=%s",
                       bool(key_id), bool(pem))
-            candidates = sorted(name for name in os.environ if name.startswith("KALSHI_"))
-            secrets = Path("/etc/secrets")
-            file_names = sorted(p.name for p in secrets.iterdir()) if secrets.is_dir() else []
-            LOG.info("Kalshi credential names: variables=%s; secret files=%s", candidates, file_names)
             return None
         orders = KalshiOrders(
             session, key_id, (pem or "").replace("\\n", "\n").encode(), production=True
