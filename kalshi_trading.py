@@ -46,11 +46,16 @@ class Trading:
         mode = os.getenv("RAFA_TRADING_MODE", "verify")
         if mode not in {"verify", "live"}:
             return None
-        key_id = os.getenv("KALSHI_API_KEY_ID") or os.getenv("KALSHI_API_KEY")
+        key_id = (os.getenv("KALSHI_API_KEY_ID") or os.getenv("KALSHI_KEY_ID")
+                  or os.getenv("KALSHI_API_KEY"))
         pem = os.getenv("KALSHI_PRIVATE_KEY_PEM") or os.getenv("KALSHI_PRIVATE_KEY")
-        key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+        key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH") or os.getenv("KALSHI_PRIVATE_KEY_FILE")
         if not pem and key_path:
             pem = Path(key_path).read_text()
+        if not key_id or not pem:
+            LOG.error("Kalshi credential inputs: key ID configured=%s; private key configured=%s",
+                      bool(key_id), bool(pem))
+            return None
         orders = KalshiOrders(
             session, key_id, (pem or "").replace("\\n", "\n").encode(), production=True
         )
