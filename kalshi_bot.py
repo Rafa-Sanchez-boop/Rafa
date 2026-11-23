@@ -1,4 +1,4 @@
-"""Kalshi BTC 15-minute alerts with Kraken BTC/USD confirmation; no automatic trading.
+"""Kalshi BTC 15-minute alerts with Kraken BTC/USD confirmation and optional Kalshi order execution.
 Signals describe Kalshi YES/NO contract momentum, not BTC/USD price forecasts.
 """
 import logging
@@ -8,6 +8,8 @@ import time
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import requests
+
+from kalshi_trading import Trading
 
 BASE = "https://external-api.kalshi.com/trade-api/v2"
 SERIES = os.getenv("KALSHI_SERIES", "KXBTC15M")
@@ -115,7 +117,7 @@ def sample(db, ticker, now, mid):
     db.execute("INSERT OR IGNORE INTO kalshi_only_samples VALUES (?,?,?)",
                (ticker, now, str(mid)))
 
-def signal(db, m, now, close_at, open_at, phase, btc_trend):
+def signal(db, m, now, close_at, open_at, phase, btc_trend, trading=None):
     ticker = m["ticker"]
     if ticker in alerted_tickers:
         return
@@ -178,6 +180,9 @@ def signal(db, m, now, close_at, open_at, phase, btc_trend):
         db.execute("INSERT OR IGNORE INTO kalshi_only_alerts VALUES (?,?,?,?)",
                    (ticker, phase, now, direction))
         log.info("Kalshi-only %s alert: %s %s", phase, ticker, direction)
+        if trading is not None:
+            db.commit()
+            trading.open(m, "yes" if up else "no", entry, standard_fees(m))
 
 def check_results(db, now):
     # Use Kalshi's official result field, never Kraken, for completed markets.
@@ -203,10 +208,31 @@ def check_results(db, now):
                    "⚠️ La señal mide momentum de cotización, no predice "
                    "el resultado final ni confirma beneficio de compraventa.")
 
-def scan():
+def standard_fees(market):
+    event_ticker = market.get("event_ticker")
+    if not event_ticker:
+        return False
+    series = (get_json("/series/" + SERIES) or {}).get("series", {})
+    event = (get_json("/events/" + event_ticker) or {}).get("event", {})
+    if not event or event.get("series_ticker") != SERIES:
+        return False
+    multiplier = dec(event.get("fee_multiplier_override"))
+    if multiplier is None or multiplier == 0:
+        multiplier = dec(series.get("fee_multiplier"))
+    fee_type = event.get("fee_type_override") or series.get("fee_type")
+    return (fee_type in {"quadratic", "quadratic_with_maker_fees"}
+            and multiplier is not None and Decimal(0) <= multiplier <= Decimal(1))
+
+
+def scan(trading=None):
     payload = get_json("/markets", {"series_ticker": SERIES, "status": "open", "limit": 100})
     if payload is None:
         return
+    if trading is not None:
+        markets = {m["ticker"]: m for m in payload.get("markets", []) if m.get("ticker")}
+        trading.maintain(markets, lambda ticker: (
+            get_json("/markets/" + ticker) or {}
+        ).get("market"), standard_fees)
     now = time.time()
     btc_trend = kraken_trend(now)
     with db_open() as db:
@@ -226,7 +252,7 @@ def scan():
             # Scan continuously after initial analysis, until five minutes remain.
             # OPEN phase is used for one alert per contract.
             if remaining > 0:
-                signal(db, m, now, closes, opened, "OPEN", btc_trend)
+                signal(db, m, now, closes, opened, "OPEN", btc_trend, trading)
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
@@ -252,9 +278,14 @@ def telegram_test_once():
 
 def main():
     log.info("Kalshi BTC15M with Kraken confirmation and short UP/DOWN messages")
+    try:
+        trading = Trading.from_environment(http)
+    except (OSError, ValueError, RuntimeError, requests.RequestException, sqlite3.Error) as exc:
+        log.error("Kalshi order initialization failed (%s). Alerts active.", type(exc).__name__)
+        trading = None
     while True:
         try:
-            scan()
+            scan(trading)
         except Exception:
             log.exception("Scan failed")
         time.sleep(SCAN_SECONDS)
