@@ -108,15 +108,17 @@ def kraken_nearest_level_projection(now, direction, projection):
             # If price has already reached the recent ceiling, don't forecast
             # another leg upward from that resistance.
             recent_ceiling = max(highs) if highs else None
-            if recent_ceiling is not None and recent_ceiling >= current * Decimal("0.9995"):
-                log.info("Skipping UP projection: BTC is already at recent resistance %s", recent_ceiling)
+            ceiling_gap = recent_ceiling - current if recent_ceiling is not None else None
+            if ceiling_gap is not None and ceiling_gap <= current * Decimal("0.0001"):
+                log.info("Skipping UP projection: BTC has touched recent resistance %s", recent_ceiling)
                 return current, current
         else:
             levels = [level for level in lows if level < current]
             level = max(levels) if levels else None
             recent_floor = min(lows) if lows else None
-            if recent_floor is not None and recent_floor <= current * Decimal("1.0005"):
-                log.info("Skipping DOWN projection: BTC is already at recent support %s", recent_floor)
+            floor_gap = current - recent_floor if recent_floor is not None else None
+            if floor_gap is not None and floor_gap <= current * Decimal("0.0001"):
+                log.info("Skipping DOWN projection: BTC has touched recent support %s", recent_floor)
                 return current, current
         if level is not None and abs(level - current) >= current * Decimal("0.0002"):
             target = min(projection[1], level) if direction == "UP" else max(projection[1], level)
