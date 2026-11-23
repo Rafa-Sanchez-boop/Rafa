@@ -18,7 +18,6 @@ SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
 DELAY = 0
 MAX_SPREAD = Decimal(os.getenv("MAX_SPREAD", "0.04"))
 MIN_MOVE = Decimal(os.getenv("MIN_MOVE", "0.025"))
-MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
 MIN_REMAINING = max(300, int(os.getenv("MIN_REMAINING_SECONDS", "300")))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-only")
@@ -107,11 +106,6 @@ def signal(db, m, now, close_at, open_at, phase):
     if q is None:
         return
     bid, ask, mid = q
-    volume = dec(m.get("volume_24h_fp"))
-    if volume is None:
-        volume = dec(m.get("volume_24h"))
-    if volume is None or volume < MIN_VOLUME:
-        return
     if phase == "OPEN":
         # Use the first actually observed Kalshi quote as baseline. The
         # market's open_time can predate the 15-minute trading window, and
