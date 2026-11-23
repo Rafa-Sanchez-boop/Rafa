@@ -239,13 +239,10 @@ def signal(db, m, now, close_at, open_at, phase, btc_trend):
     phase_name = ("primeros cinco minutos" if phase == "EARLY_5M"
                   else "últimos cinco minutos")
     message = (
-        ("🔺 UP" if up else "🔻 DOWN") + "\\n"
-        + f"₿ BTC ahora: ${btc_now:,.2f}\\n"
-        + f"📈 Posible {move_word}: desde ${btc_now:,.2f} "
-        + f"hasta aprox. ${btc_close:,.2f} "
-        + f"({move:+,.2f} USD) al cierre.\\n"
-        + f"⏱️ Ventana: {phase_name}.\\n"
-        + "🔄 Estimación por el movimiento reciente; puede cambiar."
+        ("🔺 UP" if up else "🔻 DOWN") + "\n"
+        + f"📈 BTC: posible {move_word} desde ${btc_now:,.2f} "
+        + f"hasta ${btc_close:,.2f} ({move:+,.2f} USD).\n"
+        + "🔄 El mercado puede cambiar de rumbo; objetivo estimado."
     )
     if notify(message):
         alerted_tickers.add(alert_key)
