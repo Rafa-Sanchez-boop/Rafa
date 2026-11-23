@@ -51,6 +51,10 @@ class Trading:
 
     @classmethod
     def from_environment(cls, session):
+        # Fail closed regardless of environment variables until independently
+        # verified end-to-end tests and explicit final user authorization.
+        LOG.warning("Real-money trading is disabled in this build")
+        return None
         mode = os.getenv("RAFA_TRADING_MODE", "verify")
         if mode not in {"verify", "live"}:
             return None
