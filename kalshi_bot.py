@@ -25,9 +25,11 @@ http.headers["User-Agent"] = "KalshiOnlyBTC15M/4.5"
 alerted_tickers = set()
 KRAKEN_URL = "https://api.kraken.com/0/public/Ticker"
 kraken_samples = []
+kraken_last_quote = None
 
 def kraken_trend(now):
     """Compare real Kraken BTC/USD last trades at least 60 seconds apart."""
+    global kraken_last_quote
     try:
         response = http.get(KRAKEN_URL, params={"pair": "XBTUSD"}, timeout=10)
         response.raise_for_status()
@@ -39,6 +41,7 @@ def kraken_trend(now):
         price = dec(item["c"][0])
         if price is None or price <= 0:
             return None
+        kraken_last_quote = (now, price)
         kraken_samples.append((now, price))
         kraken_samples[:] = [(t, p) for t, p in kraken_samples if now - t <= 600]
         prior = next((p for t, p in kraken_samples if t <= now - 60), None)
@@ -73,6 +76,13 @@ def db_open():
                 PRIMARY KEY(ticker,phase))""")
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_only_results
                (ticker TEXT PRIMARY KEY, result TEXT, observed_at REAL)""")
+    # Shadow journal: captures only the first quote observed during the
+    # market's opening minute. It never sends alerts or places orders.
+    db.execute("""CREATE TABLE IF NOT EXISTS kalshi_opening_journal
+               (ticker TEXT PRIMARY KEY, observed_at REAL NOT NULL,
+                close_at REAL NOT NULL, yes_bid TEXT NOT NULL,
+                yes_ask TEXT NOT NULL, yes_mid TEXT NOT NULL,
+                kraken_usd TEXT, outcome TEXT, settled_at REAL)""")
     db.commit()
     return db
 
@@ -114,6 +124,23 @@ def quote(m):
 def sample(db, ticker, now, mid):
     db.execute("INSERT OR IGNORE INTO kalshi_only_samples VALUES (?,?,?)",
                (ticker, now, str(mid)))
+
+def journal_opening_quote(db, market, now, open_at, close_at):
+    """Record an opening-minute quote for later out-of-sample evaluation."""
+    elapsed = now - open_at
+    if elapsed < 0 or elapsed > 60:
+        return
+    q = quote(market)
+    if q is None:
+        return
+    bid, ask, mid = q
+    kraken_price = None
+    if kraken_last_quote and now - kraken_last_quote[0] <= 30:
+        kraken_price = str(kraken_last_quote[1])
+    db.execute("""INSERT OR IGNORE INTO kalshi_opening_journal
+        (ticker, observed_at, close_at, yes_bid, yes_ask, yes_mid, kraken_usd)
+        VALUES (?,?,?,?,?,?,?)""",
+        (market["ticker"], now, close_at, str(bid), str(ask), str(mid), kraken_price))
 
 def signal(db, m, now, close_at, open_at, phase, btc_trend):
     ticker = m["ticker"]
@@ -203,6 +230,28 @@ def check_results(db, now):
                    "⚠️ La señal mide momentum de cotización, no predice "
                    "el resultado final ni confirma beneficio de compraventa.")
 
+    # Label every journaled opening quote with Kalshi's official settlement.
+    # The market midpoint is a benchmark probability, not a bot forecast.
+    pending = db.execute("""SELECT ticker FROM kalshi_opening_journal
+        WHERE outcome IS NULL AND close_at <= ? ORDER BY close_at LIMIT 100""",
+        (now,)).fetchall()
+    for (ticker,) in pending:
+        payload = get_json("/markets/" + ticker)
+        market = payload.get("market", {}) if payload else {}
+        result = str(market.get("result") or "").lower()
+        if result in ("yes", "no"):
+            db.execute("""UPDATE kalshi_opening_journal
+                SET outcome=?, settled_at=? WHERE ticker=? AND outcome IS NULL""",
+                (result, now, ticker))
+
+    scored = db.execute("""SELECT yes_mid, outcome FROM kalshi_opening_journal
+        WHERE outcome IN ('yes','no')""").fetchall()
+    if scored:
+        brier = sum((float(mid) - (1.0 if result == "yes" else 0.0)) ** 2
+                    for mid, result in scored) / len(scored)
+        log.info("Opening-minute Kalshi midpoint benchmark: n=%d Brier=%.4f; "
+                 "not a Rafa probability forecast", len(scored), brier)
+
 def scan():
     payload = get_json("/markets", {"series_ticker": SERIES, "status": "open", "limit": 100})
     if payload is None:
@@ -222,6 +271,7 @@ def scan():
             q = quote(m)
             if q:
                 sample(db, ticker, now, q[2])
+                journal_opening_quote(db, m, now, opened, closes)
             remaining = closes - now
             # Scan continuously after initial analysis, until five minutes remain.
             # OPEN phase is used for one alert per contract.
