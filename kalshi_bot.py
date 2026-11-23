@@ -169,6 +169,10 @@ def signal(db, m, now, close_at, open_at, phase, trading=None):
         db.execute("INSERT OR IGNORE INTO kalshi_only_alerts VALUES (?,?,?,?)",
                    (ticker, phase, now, direction))
         log.info("Kalshi-only %s alert: %s %s", phase, ticker, direction)
+        if trading is not None:
+            db.commit()
+            entry = ask if up else Decimal(1) - bid
+            trading.open(m, "yes" if up else "no", entry, standard_fees(m))
 
 def check_results(db, now):
     # Use Kalshi's official result field, never Kraken, for completed markets.
@@ -263,9 +267,15 @@ def telegram_test_once():
 
 def main():
     log.info("Kalshi BTC15M using Kalshi quotes only and short UP/DOWN messages")
-    # Hard safety interlock: this worker must never submit real orders.
-    trading = None
-    log.info("Real-money order execution disabled; alerts only")
+    try:
+        trading = Trading.from_environment(http)
+    except (OSError, ValueError, RuntimeError, requests.RequestException, sqlite3.Error) as exc:
+        log.error("Kalshi order initialization failed (%s). Alerts remain active.", type(exc).__name__)
+        trading = None
+    if trading is None:
+        log.info("Live orders unavailable; running alerts only")
+    else:
+        log.info("Live order mode ready; $20 cumulative loss cap and $2 per-order cap")
     while True:
         try:
             scan(trading)
