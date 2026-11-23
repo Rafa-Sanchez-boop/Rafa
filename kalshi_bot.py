@@ -53,29 +53,69 @@ def kraken_trend(now):
         log.exception("Kraken BTC/USD quote failed")
         return None
 
+kraken_5m_snapshot = None
+
 def kraken_trend_5m(now):
-    """Return BTC direction over a complete, recent five-minute window."""
-    if not kraken_samples:
+    """Compare the live BTC quote with Kraken's completed one-minute candle near five minutes ago."""
+    global kraken_5m_snapshot
+    if kraken_last_quote is None or now - kraken_last_quote[0] > 30:
         return None
-    target = now - 300
-    prior = min(kraken_samples, key=lambda sample: abs(sample[0] - target))
-    current = kraken_samples[-1]
-    if abs(prior[0] - target) > 45 or current[0] < now - 30:
-        return None
-    if prior[1] == current[1]:
-        return None
-    return "UP" if current[1] > prior[1] else "DOWN"
+    try:
+        response = http.get(KRAKEN_URL.replace("/Ticker", "/OHLC"),
+                            params={"pair": "XBTUSD", "interval": 1}, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("error") or not payload.get("result"):
+            raise ValueError("Kraken OHLC returned no data")
+        result = payload["result"]
+        key = next((name for name in result if name != "last"), None)
+        candles = result.get(key, []) if key else []
+        candles = [c for c in candles if len(c) > 4]
+        if not candles:
+            raise ValueError("Kraken OHLC contains no candles")
+        target_time = now - 300
+        # Compare with the close of the candle whose end is nearest to t-5m.
+        prior = min(candles, key=lambda c: abs((float(c[0]) + 60) - target_time))
+        prior_time = float(prior[0]) + 60
+        current = kraken_last_quote[1]
+        prior_price = dec(prior[4])
+        if abs(prior_time - target_time) > 45 or prior_price is None:
+            raise ValueError("No Kraken candle near the five-minute reference")
+        kraken_5m_snapshot = (now, prior_price, current)
+        if prior_price == current:
+            return None
+        return "UP" if current > prior_price else "DOWN"
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError, StopIteration):
+        # Fall back to in-process samples if Kraken's OHLC endpoint is briefly unavailable.
+        log.warning("Kraken five-minute candle unavailable; using recent samples")
+        if not kraken_samples:
+            return None
+        target_time = now - 300
+        prior_time, prior_price = min(kraken_samples, key=lambda sample: abs(sample[0] - target_time))
+        current_time, current = kraken_samples[-1]
+        if abs(prior_time - target_time) > 45 or current_time < now - 30 or prior_price == current:
+            return None
+        kraken_5m_snapshot = (now, prior_price, current)
+        return "UP" if current > prior_price else "DOWN"
 
 def kraken_close_projection(now, remaining):
-    """Estimate BTC/USD at contract close by extending the latest five-minute move."""
-    if not kraken_samples or kraken_last_quote is None:
+    """Project from Kraken's fresh five-minute reference, including across worker restarts."""
+    global kraken_5m_snapshot
+    if kraken_last_quote is None or remaining < 0:
         return None
     quote_time, current = kraken_last_quote
-    if now - quote_time > 30 or remaining < 0:
+    if now - quote_time > 30:
         return None
-    target_time = now - 300
-    prior_time, prior = min(kraken_samples, key=lambda sample: abs(sample[0] - target_time))
-    if abs(prior_time - target_time) > 45 or current == prior:
+    if kraken_5m_snapshot and now - kraken_5m_snapshot[0] <= 30:
+        _, prior, _ = kraken_5m_snapshot
+    elif kraken_samples:
+        target_time = now - 300
+        prior_time, prior = min(kraken_samples, key=lambda sample: abs(sample[0] - target_time))
+        if abs(prior_time - target_time) > 45:
+            return None
+    else:
+        return None
+    if current == prior:
         return None
     change_5m = current - prior
     projected = current + change_5m * Decimal(str(remaining)) / Decimal("300")
