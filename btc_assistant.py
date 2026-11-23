@@ -268,7 +268,7 @@ def feedback_report(db):
         feature_count = db.execute("""SELECT COUNT(*) FROM kalshi_prediction_feedback
             WHERE status='evaluated' AND source='bot_forecast' AND model_features IS NOT NULL
               AND actual_direction IN ('UP','DOWN')""").fetchone()[0]
-        lines.append(f"Modelo local: reuniendo señales evaluadas ({feature_count}/30 mínimo inicial).")
+        lines.append(f"Modelo local: reuniendo señales evaluadas ({feature_count}/50 mínimo inicial).")
     for predicted, actual, reached in evaluated[:5]:
         status = "acertó al cierre" if predicted == actual else "falló al cierre"
         target = "objetivo tocado" if reached == 1 else "objetivo no tocado" if reached == 0 else "objetivo sin dato"
