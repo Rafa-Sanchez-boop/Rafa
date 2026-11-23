@@ -174,6 +174,15 @@ def db_open():
                 issued_at REAL, close_at REAL, start_price TEXT,
                 target_price TEXT, actual_price TEXT, evaluated_at REAL,
                 status TEXT NOT NULL, source TEXT NOT NULL, note TEXT)""")
+    # Upgrade persistent databases created by earlier bot versions.
+    feedback_columns = {row[1] for row in db.execute(
+        "PRAGMA table_info(kalshi_prediction_feedback)")}
+    for column, declaration in (
+            ("high_after_signal", "TEXT"),
+            ("low_after_signal", "TEXT"),
+            ("target_reached", "INTEGER")):
+        if column not in feedback_columns:
+            db.execute(f"ALTER TABLE kalshi_prediction_feedback ADD COLUMN {column} {declaration}")
     db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
         (id, predicted_direction, actual_direction, status, source, note)
         VALUES ('user-report-2026-11-23', 'DOWN', 'UP', 'reported',
@@ -346,19 +355,20 @@ def signal(db, m, now, close_at, open_at, phase, btc_trend):
         log.info("Kalshi %s alert: %s %s", phase, ticker, direction)
 
 def evaluate_btc_forecasts(db, now):
-    """Score pending BTC/USD forecasts using Kraken's one-minute close near expiry."""
+    """Score forecast direction and whether its first target was touched before expiry."""
     rows = db.execute("""SELECT id, ticker, phase, predicted_direction, close_at,
-                                start_price
+                                start_price, target_price, issued_at
                          FROM kalshi_prediction_feedback
                          WHERE status='pending' AND close_at <= ?
                          ORDER BY close_at LIMIT 100""", (now,)).fetchall()
     for row in rows:
-        forecast_id, ticker, phase, predicted, close_at, start_text = row
+        (forecast_id, ticker, phase, predicted, close_at, start_text,
+         target_text, issued_at) = row
         try:
             response = http.get(
                 "https://api.kraken.com/0/public/OHLC",
                 params={"pair": "XBTUSD", "interval": 1,
-                        "since": max(0, int(close_at) - 60)},
+                        "since": max(0, int(issued_at) - 60)},
                 timeout=10)
             response.raise_for_status()
             payload = response.json()
@@ -369,29 +379,61 @@ def evaluate_btc_forecasts(db, now):
             if key is None:
                 continue
             candles = series.get(key, [])
-            candle = min(candles, key=lambda c: abs(float(c[0]) - close_at),
-                         default=None)
-            if candle is None or abs(float(candle[0]) - close_at) > 60:
+            window = [c for c in candles if len(c) > 6
+                      and float(c[0]) <= close_at + 1
+                      and float(c[0]) + 60 >= issued_at]
+            if not window:
                 continue
-            actual_price = dec(candle[4])
+            close_candle = min(window, key=lambda c: abs(float(c[0]) - close_at))
+            if abs(float(close_candle[0]) - close_at) > 60:
+                continue
+            actual_price = dec(close_candle[4])
             start_price = dec(start_text)
-            if actual_price is None or start_price is None:
+            target_price = dec(target_text)
+            highs = [dec(c[2]) for c in window]
+            lows = [dec(c[3]) for c in window]
+            highs = [v for v in highs if v is not None]
+            lows = [v for v in lows if v is not None]
+            if actual_price is None or start_price is None or not highs or not lows:
                 continue
+            peak = max(highs)
+            trough = min(lows)
             actual = ("UP" if actual_price > start_price else
                       "DOWN" if actual_price < start_price else "FLAT")
             correct = predicted == actual
+            reached = None
+            if target_price is not None:
+                reached = peak >= target_price if predicted == "UP" else trough <= target_price
+            if reached and actual != predicted:
+                note = "First target was touched, then price reversed before settlement."
+            elif reached:
+                note = "First target was touched; settlement direction also matched."
+            elif actual == predicted:
+                note = "Settlement direction matched; first target was not observed."
+            else:
+                note = "Direction missed and first target was not observed."
             db.execute("""UPDATE kalshi_prediction_feedback
                 SET actual_direction=?, actual_price=?, evaluated_at=?,
-                    status='evaluated', note=? WHERE id=? AND status='pending'""",
-                (actual, str(actual_price), now,
-                 "Direction matched" if correct else "Direction missed",
-                 forecast_id))
+                    high_after_signal=?, low_after_signal=?, target_reached=?,
+                    status='evaluated', note=?
+                WHERE id=? AND status='pending'""",
+                (actual, str(actual_price), now, str(peak), str(trough),
+                 int(reached) if reached is not None else None,
+                 note, forecast_id))
+            target_line = ("Primer objetivo: tocado" if reached else
+                           "Primer objetivo: no observado" if reached is False else
+                           "Primer objetivo: sin dato")
+            reversal_line = ("🔄 El precio tocó el objetivo y luego revirtió antes del cierre.\\n"
+                             if reached and actual != predicted else "")
             notify("🧠 BTC — REVISIÓN DE PREDICCIÓN\\n"
                    f"🧾 {ticker} ({phase})\\n"
-                   f"🔮 Pronóstico: {predicted} desde ${start_price:,.2f}\\n"
-                   f"📍 Resultado cerca del cierre: {actual} a ${actual_price:,.2f}\\n"
-                   f"{'✅ Coincidió' if correct else '❌ Falló; error guardado'}\\n"
-                   "El resultado quedó guardado para medir el desempeño futuro.")
+                   f"🔮 Pronóstico: {predicted} desde USD {start_price:,.2f}\\n"
+                   f"📈 Máximo/mínimo después de la señal: USD {peak:,.2f} / USD {trough:,.2f}\\n"
+                   f"🎯 {target_line} ({'USD ' + format(target_price, ',.2f') if target_price is not None else 'sin dato'})\\n"
+                   f"📍 Cierre aproximado: {actual} en USD {actual_price:,.2f}\\n"
+                   + reversal_line
+                   + ("✅ Dirección al cierre coincidió." if correct else
+                      "❌ Dirección al cierre falló; datos guardados."))
         except (requests.RequestException, ValueError, KeyError, IndexError,
                 TypeError, StopIteration):
             log.exception("Could not evaluate BTC forecast for %s", ticker)
