@@ -67,7 +67,9 @@ class Trading:
             return None
         if not os.path.ismount("/var/data"):
             raise RuntimeError("Kalshi order ledger requires a persistent mount")
-        return cls(orders, "/var/data/rafa_orders.sqlite3")
+        trading = cls(orders, "/var/data/rafa_orders.sqlite3")
+        LOG.info("Rafa live trading enabled; persistent order ledger ready")
+        return trading
 
     def connect(self):
         conn = sqlite3.connect(self.ledger, timeout=20)
