@@ -16,7 +16,6 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
 DELAY = 0
-MIN_MOVE = Decimal(os.getenv("MIN_MOVE", "0.025"))
 MIN_REMAINING = max(300, int(os.getenv("MIN_REMAINING_SECONDS", "300")))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-only")
@@ -124,8 +123,8 @@ def signal(db, m, now, close_at, open_at, phase):
     if prior is None:
         return
     change = mid - prior
-    if abs(change) < MIN_MOVE:
-        # No strong Kalshi direction; retry on subsequent scans.
+    if change == 0:
+        # No observed direction; avoid inventing UP or DOWN.
         return
     up = change > 0
     direction = "UP" if up else "DOWN"
