@@ -352,16 +352,16 @@ def train_adaptive_model(db, now):
                 examples.append(([float(v) for v in features], 1.0 if actual == "UP" else 0.0))
         except (TypeError, ValueError):
             continue
-    if len(examples) < 30:
-        log.info("Adaptive training waiting for 30 scored forecasts; currently %d", len(examples))
+    if len(examples) < 50:
+        log.info("Adaptive training waiting for 50 scored forecasts; currently %d", len(examples))
         return False
     split = int(len(examples) * 0.8)
-    split = max(20, min(split, len(examples) - 6))
+    split = max(35, min(split, len(examples) - 15))
     training, validation = examples[:split], examples[split:]
     if (sum(y for _, y in training) < 8
             or len(training) - sum(y for _, y in training) < 8
-            or not any(y == 1.0 for _, y in validation)
-            or not any(y == 0.0 for _, y in validation)):
+            or sum(y == 1.0 for _, y in validation) < 5
+            or sum(y == 0.0 for _, y in validation) < 5):
         log.info("Adaptive training waiting for balanced UP/DOWN examples")
         return False
     columns = list(zip(*(x for x, _ in training)))
@@ -400,7 +400,7 @@ def train_adaptive_model(db, now):
             true_down += 1
             hit_down += int(not predicted_up)
     balanced_accuracy = ((hit_up / true_up) + (hit_down / true_down)) / 2
-    if balanced_accuracy < 0.52:
+    if balanced_accuracy < 0.58:
         log.info("Adaptive model kept previous version; validation balanced accuracy %.3f",
                  balanced_accuracy)
         return False
@@ -429,8 +429,8 @@ def adaptive_model_allows(db, features, direction):
         return True
     try:
         model = json.loads(row[0])
-        if (model.get("samples", 0) < 30
-                or model.get("balanced_accuracy", 0) < 0.52):
+        if (model.get("samples", 0) < 50
+                or model.get("balanced_accuracy", 0) < 0.58):
             return True
         vector = [1.0] + [
             (value - mean) / scale
