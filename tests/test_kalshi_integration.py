@@ -116,6 +116,57 @@ class KalshiOrderPathIntegrationTests(unittest.TestCase):
         signed = (timestamp + "POST" + "/trade-api/v2/portfolio/events/orders").encode()
         private_key.public_key().verify(signature, signed)
 
+    def test_cancel_order_uses_v2_endpoint_and_market_auto_routing(self):
+        private_key = Ed25519PrivateKey.generate()
+        pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        response = {
+            "order_id": "order-demo-2",
+            "client_order_id": "intent-2",
+            "reduced_by": "1.00",
+            "ts_ms": 1763850000000,
+        }
+        session = RecordingSession(FakeResponse(200, response))
+        client = KalshiOrders(session, "demo-key", pem, production=False)
+
+        result = client.cancel_order("order-demo-2", market_ticker="KXBTC15M-TEST")
+
+        self.assertEqual(result, response)
+        method, url, kwargs = session.calls[0]
+        self.assertEqual(method, "DELETE")
+        self.assertEqual(
+            url,
+            DEMO + "/portfolio/events/orders/order-demo-2"
+            "?market_ticker=KXBTC15M-TEST&exchange_index=-1",
+        )
+        timestamp = kwargs["headers"]["KALSHI-ACCESS-TIMESTAMP"]
+        signature = base64.b64decode(kwargs["headers"]["KALSHI-ACCESS-SIGNATURE"])
+        signed = (
+            timestamp + "DELETE"
+            + "/trade-api/v2/portfolio/events/orders/order-demo-2"
+        ).encode()
+        private_key.public_key().verify(signature, signed)
+
+    def test_cancel_requires_order_and_market_identity(self):
+        private_key = Ed25519PrivateKey.generate()
+        pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        session = RecordingSession(FakeResponse(200, {}))
+        client = KalshiOrders(session, "demo-key", pem, production=False)
+
+        with self.assertRaises(ValueError):
+            client.cancel_order("", market_ticker="KXBTC15M-TEST")
+        with self.assertRaises(ValueError):
+            client.cancel_order("order-demo-3", market_ticker="")
+
+        self.assertEqual(session.calls, [])
+
     def test_purchase_budget_enforces_per_order_and_cumulative_cap(self):
         self.assertTrue(purchase_fits(
             Decimal("2"), Decimal("0.98"), Decimal("0.04"),
