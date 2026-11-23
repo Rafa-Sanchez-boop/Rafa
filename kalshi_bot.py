@@ -330,7 +330,7 @@ def signal(db, m, now, close_at, open_at, phase, btc_trend):
         ("🔺 UP" if up else "🔻 DOWN") + "\n"
         + f"📈 BTC: posible {move_word} desde ${btc_now:,.2f} "
         + f"hasta ${btc_close:,.2f} ({move:+,.2f} USD).\n"
-        + "🔄 El mercado puede cambiar de rumbo; objetivo estimado."
+        + "🎯 Primer tope estimado; después el mercado puede cambiar."
     )
     if notify(message):
         alerted_tickers.add(alert_key)
