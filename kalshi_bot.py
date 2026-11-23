@@ -143,6 +143,7 @@ def signal(db, m, now, close_at, open_at, phase, trading=None):
         # No observed direction; avoid inventing UP or DOWN.
         return
     up = change > 0
+    direction = "UP" if up else "DOWN"
     confluence = assess(http, direction)
     if confluence is None or not confluence["passed"]:
         return
