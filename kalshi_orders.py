@@ -3,7 +3,7 @@
 import base64
 import time
 from decimal import Decimal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
@@ -85,6 +85,16 @@ class KalshiOrders:
 
     def balance(self):
         return self._request("GET", "/portfolio/balance")
+
+    def cancel_order(self, order_id, *, market_ticker):
+        """Cancel a known order and auto-route to the market's exchange shard."""
+        if not order_id or not market_ticker:
+            raise ValueError("Order ID and market ticker are required")
+        endpoint = (
+            f"/portfolio/events/orders/{quote(str(order_id), safe='')}"
+            f"?market_ticker={quote(str(market_ticker), safe='')}&exchange_index=-1"
+        )
+        return self._request("DELETE", endpoint)
 
     def submit_ioc(self, *, ticker, outcome, selling, quantity, limit_price, client_id):
         """Submit once. The caller must persist the intent and reconcile ambiguity."""
