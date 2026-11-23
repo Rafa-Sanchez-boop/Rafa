@@ -51,12 +51,15 @@ class Trading:
 
     @classmethod
     def from_environment(cls, session):
-        # HARD SAFETY LOCK: never construct a live Trading instance.
-        # No environment variable can enable order submission before separate
-        # end-to-end verification and explicit final user approval.
-        mode = "verify"
-        if os.getenv("RAFA_TRADING_MODE", "verify") == "live":
-            LOG.warning("Live trading requested but blocked by mandatory safety lock")
+        # Fail closed unless live mode and explicit user approval are both set.
+        mode = os.getenv("RAFA_TRADING_MODE", "verify").strip().lower()
+        live_approved = os.getenv("RAFA_LIVE_APPROVED", "").strip().lower() in {"1", "true", "yes"}
+        if mode != "live":
+            LOG.info("Trading mode is not live; order submission remains disabled")
+            return None
+        if not live_approved:
+            LOG.warning("Live trading requires explicit approval; orders remain disabled")
+            return None
         key_id = (os.getenv("KALSHI_API_KEY_ID") or os.getenv("KALSHI_KEY_ID")
                   or os.getenv("KALSHI_API_KEY"))
         pem = os.getenv("KALSHI_PRIVATE_KEY_PEM") or os.getenv("KALSHI_PRIVATE_KEY")
