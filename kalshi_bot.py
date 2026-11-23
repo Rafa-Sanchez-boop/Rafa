@@ -1,4 +1,4 @@
-"""Kalshi-only BTC 15-minute alerts. No Kraken, no automatic trading.
+"""Kalshi BTC 15-minute alerts with Kraken BTC/USD confirmation; no automatic trading.
 Signals describe Kalshi YES/NO contract momentum, not BTC/USD price forecasts.
 """
 import logging
@@ -23,6 +23,31 @@ http = requests.Session()
 http.headers["User-Agent"] = "KalshiOnlyBTC15M/4.5"
 # Extra in-process protection against opposite alerts during a worker lifetime.
 alerted_tickers = set()
+KRAKEN_URL = "https://api.kraken.com/0/public/Ticker"
+kraken_samples = []
+
+def kraken_trend(now):
+    """Compare real Kraken BTC/USD last trades at least 60 seconds apart."""
+    try:
+        response = http.get(KRAKEN_URL, params={"pair": "XBTUSD"}, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("error") or not payload.get("result"):
+            log.warning("Kraken returned no valid ticker")
+            return None
+        item = next(iter(payload["result"].values()))
+        price = dec(item["c"][0])
+        if price is None or price <= 0:
+            return None
+        kraken_samples.append((now, price))
+        kraken_samples[:] = [(t, p) for t, p in kraken_samples if now - t <= 600]
+        prior = next((p for t, p in kraken_samples if t <= now - 60), None)
+        if prior is None or price == prior:
+            return None
+        return "UP" if price > prior else "DOWN"
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError, StopIteration):
+        log.exception("Kraken BTC/USD quote failed")
+        return None
 
 def dec(x):
     try:
@@ -90,7 +115,7 @@ def sample(db, ticker, now, mid):
     db.execute("INSERT OR IGNORE INTO kalshi_only_samples VALUES (?,?,?)",
                (ticker, now, str(mid)))
 
-def signal(db, m, now, close_at, open_at, phase):
+def signal(db, m, now, close_at, open_at, phase, btc_trend):
     ticker = m["ticker"]
     if ticker in alerted_tickers:
         return
@@ -128,6 +153,9 @@ def signal(db, m, now, close_at, open_at, phase):
         return
     up = change > 0
     direction = "UP" if up else "DOWN"
+    if btc_trend != direction:
+        log.info("Skipping %s: Kalshi %s, Kraken %s", ticker, direction, btc_trend)
+        return
     entry = ask if up else Decimal(1) - bid
     remaining = max(0, int(close_at - now))
     phase_name = "OPORTUNIDAD A TIEMPO"
@@ -140,21 +168,10 @@ def signal(db, m, now, close_at, open_at, phase):
                       f"📈 Interpretación: posible subida de la cotización YES de Kalshi "
                       f"desde ${mid:.3f} hacia ${projected:.3f}; después el precio puede cambiar de rumbo.")
     message = (
-        "📊 BTC KALSHI — " + phase_name + "\n"
-        + ("🔺 UP" if up else "🔻 DOWN") + " | SEÑAL EXPERIMENTAL\n"
-        + "━━━━━━━━━━━━━━━━━━\n"
-        + f"📈 Precio YES anterior (Kalshi): ${prior:.3f}\n"
-        + f"📈 Precio YES actual (Kalshi): ${mid:.3f}\n"
-        + f"📏 Cambio en cotización YES: {change:+.3f}\n"
-        + f"🎟️ Entrada indicativa {direction}: ${entry:.2f}\n"
-        + f"⏳ Tiempo restante: {remaining//60:02d}:{remaining%60:02d}\n"
-        + f"🧾 Contrato: {ticker}\n"
-        + interpretation + "\n"
-        + "🎯 Proyección ilustrativa de cotización YES, no precio BTC/USD ni objetivo de compra/venta.\n"
-        + "⚠️ Solo datos de Kalshi. El cambio de cotización no predice "
-          "necesariamente el precio BTC ni el resultado final. "
-          "No se fija objetivo de venta; comisiones y liquidez pueden impedir beneficio. "
-          "Alerta informativa, no operación automática."
+        ("🔺 UP" if up else "🔻 DOWN") + "\\n"
+        + ("📈 Posible subida" if up else "📉 Posible bajada")
+        + f" desde ${mid:.3f} hacia ${projected:.3f}.\\n"
+        + "🔄 Después el precio puede cambiar de rumbo."
     )
     if notify(message):
         alerted_tickers.add(ticker)
@@ -191,6 +208,7 @@ def scan():
     if payload is None:
         return
     now = time.time()
+    btc_trend = kraken_trend(now)
     with db_open() as db:
         for m in payload.get("markets", []):
             ticker = m.get("ticker", "")
@@ -208,7 +226,7 @@ def scan():
             # Scan continuously after initial analysis, until five minutes remain.
             # OPEN phase is used for one alert per contract.
             if remaining > 0:
-                signal(db, m, now, closes, opened, "OPEN")
+                signal(db, m, now, closes, opened, "OPEN", btc_trend)
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
@@ -233,7 +251,7 @@ def telegram_test_once():
         log.error("Telegram diagnostic: test message failed or was not accepted")
 
 def main():
-    log.info("Kalshi-only BTC15M v4.5: continuous opportunities without 120s delay or five-minute cutoff; no Kraken")
+    log.info("Kalshi BTC15M with Kraken confirmation and short UP/DOWN messages")
     while True:
         try:
             scan()
