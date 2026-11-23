@@ -307,10 +307,11 @@ def signal(db, m, now, close_at, open_at, phase):
     # Kalshi-only signal: these are observed YES contract prices, not BTC/USD.
     # Never invent a BTC spot price or imply that observed momentum is a forecast.
     message = (
-        ("🔺 UP" if up else "🔻 DOWN") + "\\n"
-        + f"📈 Kalshi YES: movimiento observado desde ${prior:.3f} hacia ${mid:.3f}.\\n"
+        ("🔺 UP" if up else "🔻 DOWN") + "\n"
+        + f"📈 Kalshi YES: movimiento observado desde ${prior:.3f} hacia ${mid:.3f}.\n"
         + "🔄 Después la cotización puede cambiar de rumbo."
     )
+    log.info("Signal candidate %s direction=%s move=%s remaining=%ds; sending Telegram", ticker, direction, change, remaining)
     if notify(message):
         alerted_tickers.add(ticker)
         db.execute("INSERT OR IGNORE INTO signal_features VALUES (?,?,?,?,?)",
@@ -319,6 +320,8 @@ def signal(db, m, now, close_at, open_at, phase):
                    (ticker, phase, now, direction))
         plan_paper_trade(db, ticker, direction, bid, ask, close_at, now)
         log.info("Kalshi-only %s alert: %s %s", phase, ticker, direction)
+    else:
+        log.error("Signal candidate %s not delivered to Telegram; will retry on next scan", ticker)
 
 def check_results(db, now):
     # Use Kalshi official settlement results for completed markets.
