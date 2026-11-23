@@ -16,7 +16,6 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
 DELAY = 0
-MAX_SPREAD = Decimal(os.getenv("MAX_SPREAD", "0.04"))
 MIN_MOVE = Decimal(os.getenv("MIN_MOVE", "0.025"))
 MIN_REMAINING = max(300, int(os.getenv("MIN_REMAINING_SECONDS", "300")))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -85,8 +84,6 @@ def notify(msg):
 def quote(m):
     bid, ask = dec(m.get("yes_bid_dollars")), dec(m.get("yes_ask_dollars"))
     if bid is None or ask is None or not (Decimal(0) < bid <= ask < Decimal(1)):
-        return None
-    if ask - bid > MAX_SPREAD:
         return None
     return bid, ask, (bid + ask) / 2
 
