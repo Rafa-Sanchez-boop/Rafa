@@ -91,6 +91,20 @@ def sample(db, ticker, now, mid):
     db.execute("INSERT OR IGNORE INTO kalshi_only_samples VALUES (?,?,?)",
                (ticker, now, str(mid)))
 
+def confirms_pullback(samples, up):
+    """Check an impulse, a Fibonacci pullback, and two continuation quotes."""
+    if len(samples) != 5 or any(price is None for price in samples):
+        return False
+    direction = 1 if up else -1
+    start, peak, pullback, first, latest = (direction * price for price in samples)
+    impulse = peak - start
+    if impulse <= 0:
+        return False
+    retracement = (peak - pullback) / impulse
+    return (Decimal("0.50") <= retracement <= Decimal("0.786")
+            and pullback < first < latest)
+
+
 def signal(db, m, now, close_at, open_at, phase, trading=None):
     ticker = m["ticker"]
     if ticker in alerted_tickers:
@@ -128,6 +142,11 @@ def signal(db, m, now, close_at, open_at, phase, trading=None):
         # No observed direction; avoid inventing UP or DOWN.
         return
     up = change > 0
+    recent = db.execute("""SELECT yes_mid FROM kalshi_only_samples
+        WHERE ticker=? AND observed_at BETWEEN ? AND ?
+        ORDER BY observed_at DESC LIMIT 5""", (ticker, now - 120, now)).fetchall()
+    if not confirms_pullback([dec(row[0]) for row in reversed(recent)], up):
+        return
     direction = "UP" if up else "DOWN"
     entry = ask if up else Decimal(1) - bid
     remaining = max(0, int(close_at - now))
