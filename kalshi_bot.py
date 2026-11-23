@@ -195,6 +195,11 @@ def db_open():
                 '61388.40', '61645.95', '61388.40', 'reported',
                 'user_report',
                 'User reported the rise reversed near 61388.40; the bot target 61645.95 overshot the observed move. Exact ticker and timestamp were not provided.')""")
+    db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
+        (id, predicted_direction, actual_direction, status, source, note)
+        VALUES ('user-report-final-down-screenshot-20261123', 'UP', 'DOWN',
+                'reported', 'user_report',
+                'User-provided BTC 15-minute screenshots show a falling chart and red move of USD 64.05 then USD 64.14 with 1%/99% displayed. User reports the bot forecast UP but the market finished DOWN. Objective text is truncated (about 61,300.5); exact ticker, timestamp, and final BTC price are unavailable, so this remains a manual report, not an OHLC-verified result.')""")
     # Shadow journal: captures only the first quote observed during the
     # market's opening minute. It never sends alerts or places orders.
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_opening_journal
