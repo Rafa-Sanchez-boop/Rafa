@@ -15,7 +15,7 @@ DB_PATH = os.getenv("DB_PATH", "/var/data/kalshi_bot.sqlite3")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
-DELAY = 120
+DELAY = 0
 MAX_SPREAD = Decimal(os.getenv("MAX_SPREAD", "0.04"))
 MIN_MOVE = Decimal(os.getenv("MIN_MOVE", "0.025"))
 MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
@@ -217,7 +217,7 @@ def scan():
             remaining = closes - now
             # Scan continuously after initial analysis, until five minutes remain.
             # OPEN phase is used for one alert per contract.
-            if now - opened >= DELAY and remaining >= MIN_REMAINING:
+            if remaining >= MIN_REMAINING:
                 signal(db, m, now, closes, opened, "OPEN")
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
@@ -244,7 +244,7 @@ def telegram_test_once():
 
 def main():
     telegram_test_once()
-    log.info("Kalshi-only BTC15M v4.5: continuous opportunities after 120s; no late alerts; no Kraken")
+    log.info("Kalshi-only BTC15M v4.5: continuous opportunities without 120s startup delay; no late alerts; no Kraken")
     while True:
         try:
             scan()
