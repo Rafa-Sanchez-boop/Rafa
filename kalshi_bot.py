@@ -217,7 +217,7 @@ def scan():
             remaining = closes - now
             # Scan continuously after initial analysis, until five minutes remain.
             # OPEN phase is used for one alert per contract.
-            if remaining >= MIN_REMAINING:
+            if remaining > 0:
                 signal(db, m, now, closes, opened, "OPEN")
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
@@ -244,7 +244,7 @@ def telegram_test_once():
 
 def main():
     telegram_test_once()
-    log.info("Kalshi-only BTC15M v4.5: continuous opportunities without 120s startup delay; no late alerts; no Kraken")
+    log.info("Kalshi-only BTC15M v4.5: continuous opportunities without 120s delay or five-minute cutoff; no Kraken")
     while True:
         try:
             scan()
