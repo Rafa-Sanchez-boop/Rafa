@@ -308,6 +308,24 @@ def journal_opening_quote(db, market, now, open_at, close_at):
         VALUES (?,?,?,?,?,?,?)""",
         (market["ticker"], now, close_at, str(bid), str(ask), str(mid), kraken_price))
 
+def adaptive_direction_gate(db, phase, direction):
+    """Pause a weak signal bucket using settled bot forecasts; never auto-reverse."""
+    rows = db.execute("""SELECT actual_direction
+        FROM kalshi_prediction_feedback
+        WHERE status='evaluated' AND source='bot_forecast'
+          AND phase=? AND predicted_direction=?
+        ORDER BY evaluated_at DESC LIMIT 12""",
+        (phase, direction)).fetchall()
+    if len(rows) < 8:
+        return True
+    accuracy = sum(actual == direction for (actual,) in rows) / len(rows)
+    if accuracy < 0.55:
+        log.info("Adaptive filter paused %s %s: %d/%d recent forecasts matched",
+                 phase, direction, sum(actual == direction for (actual,) in rows),
+                 len(rows))
+        return False
+    return True
+
 def signal(db, m, now, close_at, open_at, phase, btc_trend):
     ticker = m["ticker"]
     alert_key = (ticker, phase)
@@ -363,6 +381,8 @@ def signal(db, m, now, close_at, open_at, phase, btc_trend):
     if btc_trend != direction:
         log.info("Skipping %s %s: Kalshi %s, Kraken 5m %s",
                  phase, ticker, direction, btc_trend)
+        return
+    if not adaptive_direction_gate(db, phase, direction):
         return
     btc_projection = kraken_close_projection(now, remaining)
     if btc_projection is None:
@@ -470,7 +490,7 @@ def evaluate_btc_forecasts(db, now):
             target_line = ("Primer objetivo: tocado" if reached else
                            "Primer objetivo: no observado" if reached is False else
                            "Primer objetivo: sin dato")
-            reversal_line = ("🔄 El precio tocó el objetivo y luego revirtió antes del cierre.\\n"
+            reversal_line = ("🔄 El precio tocó el objetivo y luego revirtió antes del cierre.\n"
                              if reached and actual != predicted else "")
             notify("🧠 BTC — REVISIÓN DE PREDICCIÓN\\n"
                    f"🧾 {ticker} ({phase})\\n"
