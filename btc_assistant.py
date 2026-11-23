@@ -221,7 +221,7 @@ def feedback_report(db):
     lines.append(f"Errores reportados por ti: {reported}.")
     for predicted, actual, reached in evaluated[:5]:
         status = "acertó al cierre" if predicted == actual else "falló al cierre"
-        target = "objetivo tocado" if reached else "objetivo no tocado" if reached is False else "objetivo sin dato"
+        target = "objetivo tocado" if reached == 1 else "objetivo no tocado" if reached == 0 else "objetivo sin dato"
         lines.append(f"{predicted} → {actual}: {status}; {target}.")
     return "\n".join(lines)
 
