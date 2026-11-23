@@ -367,11 +367,11 @@ def record_btc_15m_chart(db, now):
         arrow = "🔺 UP" if direction == "UP" else "🔻 DOWN" if direction == "DOWN" else "➖ FLAT"
         close_label = datetime.fromtimestamp(close_time, timezone.utc).strftime("%H:%M UTC")
         message = (
-            "📊 BTC/USD · cierres de 15 min (Kraken)\\n"
-            f"🟥 DOWN | 🟩 UP · antiguo → reciente\\n{chart}\\n"
-            f"Últimas 4: DOWN {down_4} · UP {up_4}\\n"
-            f"Últimas 16: DOWN {down_16} · UP {up_16}\\n"
-            f"Racha actual: {arrow} × {streak}\\n"
+            "📊 BTC/USD · cierres de 15 min (Kraken)\n"
+            f"🟥 DOWN | 🟩 UP · antiguo → reciente\n{chart}\n"
+            f"Últimas 4: DOWN {down_4} · UP {up_4}\n"
+            f"Últimas 16: DOWN {down_16} · UP {up_16}\n"
+            f"Racha actual: {arrow} × {streak}\n"
             f"Cierre {close_label}: ${dec(open_text):,.2f} → ${dec(close_text):,.2f}"
         )
         if notify(message):
@@ -842,7 +842,7 @@ def telegram_test_once():
         try:
             os.makedirs(os.path.dirname(marker) or ".", exist_ok=True)
             with open(marker, "w", encoding="utf-8") as out:
-                out.write("sent\\n")
+                out.write("sent\n")
         except OSError:
             log.exception("Telegram diagnostic marker could not be saved")
     else:
