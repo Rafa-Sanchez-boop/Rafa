@@ -175,7 +175,7 @@ def cycle_report(snap):
     rsi = snap.get("rsi_14_1m")
     high, low = snap.get("high_20m"), snap.get("low_20m")
     if None in (price, trend5, trend15, ema9, ema21):
-        return "🌀 BTC — CICLO CORTO\\nFase indeterminada: faltan datos recientes de precio o velas."
+        return "🌀 BTC — CICLO CORTO\nFase indeterminada: faltan datos recientes de precio o velas."
     if trend5 > 0 and trend15 > 0 and ema9 > ema21:
         phase = "impulso alcista"
         level = "resistencia"
@@ -203,7 +203,7 @@ def cycle_report(snap):
     if boundary is not None:
         lines.append(f"Nivel cercano de {level}: USD {_fmt(boundary)}")
     lines.append("El ciclo orienta el análisis; no asegura cuándo girará el precio.")
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 def market_report(snap):
     market = snap.get("kalshi")
