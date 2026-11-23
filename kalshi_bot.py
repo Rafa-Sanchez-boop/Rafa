@@ -225,7 +225,25 @@ def scan():
         db.execute("DELETE FROM kalshi_only_samples WHERE observed_at < ?", (now - 48 * 3600,))
         db.commit()
 
+def telegram_test_once():
+    """Send one diagnostic message, without fabricating a market signal."""
+    marker = os.path.join(os.path.dirname(DB_PATH) or ".", "telegram_test_20261122.ok")
+    if os.path.exists(marker):
+        return
+    log.info("Telegram diagnostic: attempting test delivery")
+    if notify("🤖 RAFA — PRUEBA DE TELEGRAM. Conexión funcionando. (No es señal de trading)"):
+        log.info("Telegram diagnostic: API accepted test message")
+        try:
+            os.makedirs(os.path.dirname(marker) or ".", exist_ok=True)
+            with open(marker, "w", encoding="utf-8") as out:
+                out.write("sent\\n")
+        except OSError:
+            log.exception("Telegram diagnostic marker could not be saved")
+    else:
+        log.error("Telegram diagnostic: test message failed or was not accepted")
+
 def main():
+    telegram_test_once()
     log.info("Kalshi-only BTC15M v4.5: continuous opportunities after 120s; no late alerts; no Kraken")
     while True:
         try:
