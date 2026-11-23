@@ -67,7 +67,11 @@ def get_json(path, params=None):
             time.sleep(2 ** attempt)
     return None
 
+ALERTS_ENABLED = os.getenv("RAFA_ALERTS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
 def notify(msg):
+    if not ALERTS_ENABLED:
+        return False
     if not TOKEN or not CHAT_ID:
         log.warning("Telegram not configured: %s", msg)
         return False
@@ -164,15 +168,16 @@ def signal(db, m, now, close_at, open_at, phase, trading=None):
         + f" desde ${mid:.3f} hacia ${projected:.3f}.\n"
         + "🔄 Después el precio puede cambiar de rumbo."
     )
+    # Orders run independently of Telegram delivery, including while alerts are paused.
+    if trading is not None:
+        db.commit()
+        entry = ask if up else Decimal(1) - bid
+        trading.open(m, "yes" if up else "no", entry, standard_fees(m))
     if notify(message):
         alerted_tickers.add(ticker)
         db.execute("INSERT OR IGNORE INTO kalshi_only_alerts VALUES (?,?,?,?)",
                    (ticker, phase, now, direction))
         log.info("Kalshi-only %s alert: %s %s", phase, ticker, direction)
-        if trading is not None:
-            db.commit()
-            entry = ask if up else Decimal(1) - bid
-            trading.open(m, "yes" if up else "no", entry, standard_fees(m))
 
 def check_results(db, now):
     # Use Kalshi's official result field, never Kraken, for completed markets.
