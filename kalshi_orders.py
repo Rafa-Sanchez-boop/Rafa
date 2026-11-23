@@ -10,25 +10,25 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
 
 
 MAX_PURCHASE = Decimal("2.00")
-DAILY_LOSS_LIMIT = Decimal("0.50")
+TRADING_BANKROLL = Decimal("20.00")
 PROFIT_MULTIPLIER = Decimal("1.50")
 PRODUCTION = "https://external-api.kalshi.com/trade-api/v2"
 DEMO = "https://external-api.demo.kalshi.co/trade-api/v2"
 
 
-def purchase_fits(quantity, limit_price, maximum_fee, daily_losses, open_risk):
+def purchase_fits(quantity, limit_price, maximum_fee, realized_losses, open_risk):
     """Reserve the entire order's worst-case cost before submission."""
-    values = (quantity, limit_price, maximum_fee, daily_losses, open_risk)
+    values = (quantity, limit_price, maximum_fee, realized_losses, open_risk)
     if any(not value.is_finite() for value in values):
         return False
     if quantity <= 0 or not (0 < limit_price < 1):
         return False
-    if min(maximum_fee, daily_losses, open_risk) < 0:
+    if min(maximum_fee, realized_losses, open_risk) < 0:
         return False
     order_cost = quantity * limit_price + maximum_fee
     return (
         order_cost <= MAX_PURCHASE
-        and daily_losses + open_risk + order_cost <= DAILY_LOSS_LIMIT
+        and realized_losses + open_risk + order_cost <= TRADING_BANKROLL
     )
 
 
