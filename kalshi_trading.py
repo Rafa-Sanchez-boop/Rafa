@@ -31,6 +31,8 @@ class Trading:
     def __init__(self, orders, ledger):
         self.orders = orders
         self.ledger = ledger
+        self.exit_quotes = {}
+
         with closing(self.connect()) as db, db:
             db.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
@@ -38,6 +40,12 @@ class Trading:
                     quantity TEXT NOT NULL, cost TEXT NOT NULL,
                     loss TEXT NOT NULL DEFAULT '0', settled_day TEXT,
                     pending_id TEXT
+                )
+            """)
+
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS reversal_losses (
+                    order_id TEXT PRIMARY KEY, trading_day TEXT NOT NULL, loss TEXT NOT NULL
                 )
             """)
 
@@ -101,7 +109,8 @@ class Trading:
                 return
             today = datetime.now(CENTRAL).date().isoformat()
             loss = sum((number(row[0]) for row in db.execute(
-                "SELECT loss FROM trades WHERE settled_day=?", (today,)
+                "SELECT loss FROM trades WHERE settled_day=? "
+                "UNION ALL SELECT loss FROM reversal_losses WHERE trading_day=?", (today, today)
             )), ZERO)
             if not purchase_fits(ONE, price, FEE_RESERVE, loss, ZERO):
                 return
@@ -143,7 +152,16 @@ class Trading:
             if bid is None:
                 return
             price = number(bid)
-            if not (ZERO < price < ONE) or not reaches_profit_target(cost, price * quantity, FEE_RESERVE * quantity):
+            if not (FEE_RESERVE < price < ONE):
+                return
+            now = datetime.now(CENTRAL).timestamp()
+            history = self.exit_quotes.get(ticker, [])
+            history = [(ts, bid) for ts, bid in history if now - ts <= 120]
+            history = (history + [(now, price)])[-3:]
+            self.exit_quotes = {ticker: history}
+            take_profit = reaches_profit_target(cost, price * quantity, FEE_RESERVE * quantity)
+            reversal = len(history) == 3 and history[0][1] > history[1][1] > price
+            if not take_profit and not reversal:
                 return
             signed_quantity = quantity if outcome == "yes" else -quantity
             if self.position(ticker) != signed_quantity or not self.no_resting_orders(ticker):
@@ -152,9 +170,9 @@ class Trading:
             intent = uuid4().hex
             db.execute("UPDATE trades SET pending_id=? WHERE ticker=?", (intent, ticker))
             db.commit()
-            self.execute(db, ticker, outcome, quantity, price, intent, selling=True)
+            self.execute(db, ticker, outcome, quantity, price, intent, selling=True, reversal=not take_profit)
 
-    def execute(self, db, ticker, outcome, count, limit, intent, *, selling):
+    def execute(self, db, ticker, outcome, count, limit, intent, *, selling, reversal=False):
         # Commit the intent before sending. An ambiguous or invalid response
         # leaves the ledger blocked, including across process restarts.
         response = self.orders.submit_ioc(
@@ -177,8 +195,15 @@ class Trading:
             if selling:
                 row = db.execute("SELECT cost FROM trades WHERE ticker=?", (ticker,)).fetchone()
                 basis = number(row["cost"])
-                if price < limit or not reaches_profit_target(basis * filled / count, price * filled, fee):
-                    raise RuntimeError("Kalshi sale did not satisfy the profit threshold")
+                sold_basis = basis * filled / count
+                proceeds = price * filled - fee
+                if price < limit or (not reversal and not reaches_profit_target(sold_basis, price * filled, fee)):
+                    raise RuntimeError("Kalshi sale did not satisfy its limit")
+                if reversal:
+                    db.execute("INSERT INTO reversal_losses VALUES (?, ?, ?)", (
+                        response["order_id"], today, str(max(ZERO, sold_basis - proceeds)),
+                    ))
+                    LOG.info("Kalshi reversal exit: %s", ticker)
                 remaining = count - filled
                 cost = basis * remaining / count
                 settled = today if remaining == ZERO else None
