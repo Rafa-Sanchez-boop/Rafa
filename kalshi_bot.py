@@ -233,7 +233,6 @@ def telegram_test_once():
         log.error("Telegram diagnostic: test message failed or was not accepted")
 
 def main():
-    telegram_test_once()
     log.info("Kalshi-only BTC15M v4.5: continuous opportunities without 120s delay or five-minute cutoff; no Kraken")
     while True:
         try:
