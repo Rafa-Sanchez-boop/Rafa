@@ -10,7 +10,6 @@ from decimal import Decimal, InvalidOperation
 import requests
 
 from kalshi_trading import Trading
-from btc_confluence import assess
 
 BASE = "https://external-api.kalshi.com/trade-api/v2"
 SERIES = os.getenv("KALSHI_SERIES", "KXBTC15M")
@@ -144,16 +143,12 @@ def signal(db, m, now, close_at, open_at, phase, trading=None):
         return
     up = change > 0
     direction = "UP" if up else "DOWN"
-    confluence = assess(http, direction)
-    if confluence is None or not confluence["passed"]:
-        return
     recent = db.execute("""SELECT yes_mid FROM kalshi_only_samples
         WHERE ticker=? AND observed_at BETWEEN ? AND ?
         ORDER BY observed_at DESC LIMIT 5""", (ticker, now - 120, now)).fetchall()
     if not confirms_pullback([dec(row[0]) for row in reversed(recent)], up):
         return
     direction = "UP" if up else "DOWN"
-    entry = ask if up else Decimal(1) - bid
     remaining = max(0, int(close_at - now))
     phase_name = "OPORTUNIDAD A TIEMPO"
     # Projection is for the Kalshi YES contract quote, NOT BTC/USD.
@@ -175,9 +170,6 @@ def signal(db, m, now, close_at, open_at, phase, trading=None):
         db.execute("INSERT OR IGNORE INTO kalshi_only_alerts VALUES (?,?,?,?)",
                    (ticker, phase, now, direction))
         log.info("Kalshi-only %s alert: %s %s", phase, ticker, direction)
-        if trading is not None:
-            db.commit()
-            trading.open(m, "yes" if up else "no", entry, standard_fees(m))
 
 def check_results(db, now):
     # Use Kalshi's official result field, never Kraken, for completed markets.
@@ -272,11 +264,9 @@ def telegram_test_once():
 
 def main():
     log.info("Kalshi BTC15M using Kalshi quotes only and short UP/DOWN messages")
-    try:
-        trading = Trading.from_environment(http)
-    except (OSError, ValueError, RuntimeError, requests.RequestException, sqlite3.Error) as exc:
-        log.error("Kalshi order initialization failed (%s). Alerts active.", type(exc).__name__)
-        trading = None
+    # Hard safety interlock: this worker must never submit real orders.
+    trading = None
+    log.info("Real-money order execution disabled; alerts only")
     while True:
         try:
             scan(trading)
