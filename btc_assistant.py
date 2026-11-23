@@ -245,8 +245,6 @@ def feedback_report(db):
                                ORDER BY evaluated_at DESC LIMIT 20""").fetchall()
     reported = db.execute("""SELECT COUNT(*) FROM kalshi_prediction_feedback
                              WHERE status='reported'""").fetchone()[0]
-    if not evaluated and not reported:
-        return "Aún no hay resultados evaluados ni errores reportados guardados."
     correct = sum(predicted == actual for predicted, actual, _ in evaluated)
     target_rows = [row[2] for row in evaluated if row[2] is not None]
     touched = sum(bool(value) for value in target_rows)
