@@ -1,24 +1,30 @@
-# Evaluación preliminar del pronóstico al abrir KXBTC15M
+# Evaluación del pronóstico al abrir KXBTC15M
 
-## Alcance
+## Alcance y método
 
-- Datos públicos de Kalshi: 80 contratos KXBTC15M ya cerrados, del 22 de noviembre de 2026 10:30 UTC al 23 de noviembre de 2026 06:15 UTC.
-- Para cada contrato se usó la primera vela de un minuto y el resultado oficial YES/NO.
-- Corte temporal: 23 de noviembre de 2026 06:41 UTC. No se usaron cierres posteriores al corte.
-- División cronológica: primeras 56 ventanas para ajustar; últimas 24 para evaluar.
-- Este es un estudio exploratorio pequeño, no una validación de rentabilidad.
+- Se consultaron 360 contratos KXBTC15M cerrados y sus primeras velas de un minuto.
+- Se estimó la probabilidad de YES usando solo el precio YES de Kalshi en bandas fijas de 10¢ y resultados anteriores; se aplicó suavizado estadístico y se exigieron al menos 8 casos por banda.
+- Umbral fijo de alerta: probabilidad estimada de UP ≥65% o ≤35% para DOWN.
+- Evaluación walk-forward: cada bloque se probó con ventanas posteriores a las usadas para ajustarlo. No se usaron datos de cierre futuros para la predicción.
+- La señal ocurre alrededor del cierre de la primera vela de un minuto, no instantáneamente al abrir.
 
-## Resultados
+## Resultados walk-forward
 
-| Regla exploratoria | Señales en holdout | Aciertos | Brier |
-|---|---:|---:|---:|
-| Calibración por precio YES en bandas de 10¢; alertar si p ≥ 58% o p ≤ 42% | 11 | 54.5% | 0.2362 |
-| Bandas YES de 20¢ + signo del retorno Kraken en los 15 minutos previos; mismo umbral | 12 | 33.3% | 0.3054 |
+| Bloque | Entrenamiento | Prueba | Señales | Aciertos | Brier | Retorno bruto estimado |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 180 | 61 | 23 | 69.6% | 0.2282 | +2.6% por contrato |
+| 2 | 241 | 61 | 15 | 73.3% | 0.2344 | +6.5% por contrato |
+| 3 | 302 | 58 | 15 | 66.7% | 0.2393 | −0.2% por contrato |
+| Total de prueba | — | 180 | 53 | 69.8% | — | — |
 
-El promedio YES de entrenamiento fue 55.4%; en el holdout, 37.5%. El cambio entre periodos y el tamaño de muestra muestran que las estimaciones son inestables. La segunda regla no mejoró la primera.
+El retorno es una estimación bruta al comprar al precio de entrada observado y mantener hasta la liquidación. No descuenta comisiones y no evalúa la venta rápida que pidió el usuario. El tercer bloque tuvo retorno bruto negativo.
+
+## Comparación con Kraken
+
+Una prueba exploratoria anterior combinó bandas de precio YES de 20¢ con el signo del retorno Kraken de los 15 minutos anteriores. En 12 señales de prueba acertó 4 (33.3%) y no mejoró el resultado de Kalshi por sí solo. No se incluye Kraken en la regla evaluada arriba.
 
 ## Decisión
 
-No conectar todavía una probabilidad generada por estas reglas al bot ni activar un precio objetivo de compra/venta. Los resultados no respaldan una señal fiable ni demuestran beneficio después del spread, comisiones y ejecución. El estudio de velas de un minuto también solo permite evaluar una señal alrededor del cierre del primer minuto, no una señal instantánea al abrir.
+La calibración de Kalshi sola merece más evaluación, pero aún no demuestra una estrategia de compra y venta rápida rentable: 53 señales es una muestra limitada, un bloque terminó en negativo antes de comisiones y no se ha probado una salida anticipada. No conectar todavía esta regla al bot ni desplegarla en Render.
 
-Siguiente trabajo: ampliar el histórico, hacer evaluación walk-forward con más ventanas y comparar contra la probabilidad implícita en el precio YES del propio mercado. Solo añadir alertas probabilísticas si la precisión y la calibración mejoran de forma estable; el bot seguirá sin enviar órdenes.
+Siguiente trabajo: backtestear objetivos de salida anticipada con precios bid/ask de las velas, comisiones aplicables y ventanas de prueba nuevas. Solo integrar alertas si la precisión y el retorno neto se sostienen en varios bloques. El bot seguirá en modo de predicciones y sin órdenes automáticas.
