@@ -83,6 +83,53 @@ def kraken_close_projection(now, remaining):
         return None
     return current, projected
 
+def kraken_nearest_level_projection(now, direction, projection):
+    """Cap an extrapolated target at the nearest nearby swing level."""
+    if projection is None or kraken_last_quote is None:
+        return projection
+    quote_time, current = kraken_last_quote
+    if now - quote_time > 30:
+        return None
+    try:
+        response = http.get(KRAKEN_URL.replace("/Ticker", "/OHLC"),
+                            params={"pair": "XBTUSD", "interval": 1}, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        result = payload.get("result") or {}
+        key = next((name for name in result if name != "last"), None)
+        candles = result.get(key, [])[-20:] if key else []
+        highs = [dec(candle[2]) for candle in candles if len(candle) > 4]
+        lows = [dec(candle[3]) for candle in candles if len(candle) > 4]
+        highs = [price for price in highs if price is not None]
+        lows = [price for price in lows if price is not None]
+        if direction == "UP":
+            levels = [level for level in highs if level > current]
+            level = min(levels) if levels else None
+        else:
+            levels = [level for level in lows if level < current]
+            level = max(levels) if levels else None
+        if level is not None and abs(level - current) >= current * Decimal("0.0002"):
+            target = min(projection[1], level) if direction == "UP" else max(projection[1], level)
+            if target != projection[1]:
+                log.info("Capping %s target at nearest recent swing level: %s", direction, level)
+            return current, target
+        # No usable swing level: limit the linear projection so one recent
+        # five-minute impulse cannot be extended without bound to the close.
+        cap = current * Decimal("0.0025")
+        projected_move = projection[1] - current
+        if direction == "UP":
+            target = current + min(max(projected_move, Decimal(0)), cap)
+        else:
+            target = current - min(max(-projected_move, Decimal(0)), cap)
+        return current, target
+    except (requests.RequestException, ValueError, KeyError, IndexError,
+            TypeError, StopIteration):
+        log.exception("Could not get nearby BTC swing levels; using conservative fallback")
+        cap = current * Decimal("0.0025")
+        move = projection[1] - current
+        target = current + min(max(move, Decimal(0)), cap) if direction == "UP" else current - min(max(-move, Decimal(0)), cap)
+        return current, target
+
 def dec(x):
     try:
         v = Decimal(str(x))
@@ -122,6 +169,13 @@ def db_open():
         VALUES ('user-report-2026-11-23', 'DOWN', 'UP', 'reported',
                 'user_report',
                 'User reported the bot forecast moved left/down; BTC actually rose right/up. Exact ticker, time, and prices were not provided.')""")
+    db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
+        (id, predicted_direction, actual_direction, start_price, target_price,
+         actual_price, status, source, note)
+        VALUES ('user-report-target-61388-61645', 'UP', 'REVERSAL_NEAR_LEVEL',
+                '61388.40', '61645.95', '61388.40', 'reported',
+                'user_report',
+                'User reported the rise reversed near 61388.40; the bot target 61645.95 overshot the observed move. Exact ticker and timestamp were not provided.')""")
     # Shadow journal: captures only the first quote observed during the
     # market's opening minute. It never sends alerts or places orders.
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_opening_journal
@@ -249,7 +303,15 @@ def signal(db, m, now, close_at, open_at, phase, btc_trend):
         log.info("Skipping %s %s: no fresh five-minute BTC/USD data for estimate",
                  phase, ticker)
         return
+    btc_projection = kraken_nearest_level_projection(now, direction, btc_projection)
+    if btc_projection is None:
+        log.info("Skipping %s %s: no fresh BTC quote for level target", phase, ticker)
+        return
     btc_now, btc_close = btc_projection
+    if (direction == "UP" and btc_close <= btc_now) or (
+            direction == "DOWN" and btc_close >= btc_now):
+        log.info("Skipping %s %s: no remaining move to the next level", phase, ticker)
+        return
     move = btc_close - btc_now
     move_word = "subida" if move > 0 else "bajada"
     phase_name = ("primeros cinco minutos" if phase == "EARLY_5M"
