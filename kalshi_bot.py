@@ -666,6 +666,20 @@ def shadow_daily(db, now):
     db.execute("INSERT INTO rafa_shadow_daily VALUES (?,?)",(day,json.dumps(rows)))
     log.info("Rafa shadow daily evaluation %s: %s",day,rows)
 
+def rafa_context(db, ticker, phase, now, direction, q, volume, kraken_direction):
+    # Historical agreement is descriptive, not a calibrated probability.
+    rows = db.execute("""SELECT s.direction,r.result FROM rafa_shadow s
+        JOIN kalshi_only_results r ON r.ticker=s.ticker
+        WHERE s.phase=? AND s.direction=? AND r.observed_at<?
+        ORDER BY s.issued DESC LIMIT 100""",(phase,direction,now)).fetchall()
+    n = len(rows)
+    rate = sum((d=="UP")== (y=="yes") for d,y in rows)/n if n else None
+    confidence = "sin historial suficiente" if n<30 else f"acierto histórico de cierre {rate:.0%} (n={n})"
+    prices = [float(p) for t,p in kraken_samples if now-300<=t<=now]
+    span = (max(prices)-min(prices))/prices[0]*100 if len(prices)>1 and prices[0]>0 else None
+    volatility = f"{span:.3f}%" if span is not None else "N/D"
+    return f"📊 {confidence}; rango BTC 5m {volatility}; spread YES {q[1]-q[0]:.3f}; volumen 24h {volume}."
+
 def signal(db, m, now, phase, kraken_direction=None):
     """Send one Kalshi-only forecast per contract window after real quote history."""
     ticker = m["ticker"]
@@ -712,6 +726,7 @@ def signal(db, m, now, phase, kraken_direction=None):
         + f"📈 Posible {movement} de Kalshi YES desde ${mid:.3f} "
         + f"hacia ${projected:.3f}.\n"
         + f"🌐 Kraken BTC/USD: {kraken_direction or 'N/D'} ({confirmation})\n"
+        + rafa_context(db, ticker, phase, now, direction, q, volume, kraken_direction) + "\n"
         + "🔄 Después la cotización puede cambiar de rumbo."
     )
     if notify(message, db=db, broadcast=True):
@@ -910,6 +925,8 @@ def dashboard_snapshot(db, now):
             "target": str(target) if target is not None else "",
             "observed": str(observed) if observed is not None else "",
             "actual": actual, "official": str(official or "").upper(),
+            "officialCorrect": ((direction == "UP") == (str(official).lower() == "yes")) if str(official).lower() in ("yes","no") else None,
+            "quoteDirectionCorrect": (direction == actual) if actual else None,
             "version": version or "No registrada en el historial",
             "rules": rule_text or "Reglas no guardadas en este registro",
             "tag": "Momentum de la cotización YES; resultado oficial conservado por separado.",
@@ -935,7 +952,8 @@ def dashboard_snapshot(db, now):
             "observed": actual_price or "",
             "actual": actual_direction if evaluated and actual_direction in ("UP","DOWN","FLAT") else "",
             "reportedActual": actual_direction if status == "reported" else "",
-            "official": "", "version": version or "No registrada en el historial",
+            "official": "", "btcDirectionCorrect": (predicted == actual_direction) if evaluated and actual_direction in ("UP","DOWN","FLAT") else None,
+            "targetReached": bool(reached) if reached in (0,1) else None, "version": version or "No registrada en el historial",
             "rules": rules or (f"Fuente: {source}" if source else "Reglas no registradas"),
             "tag": " · ".join(part for part in [
                 note or "",
