@@ -18,21 +18,21 @@ DB_PATH = os.getenv("DB_PATH", "/var/data/kalshi_bot.sqlite3")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
-DELAY = 120
-MAX_SPREAD = Decimal(os.getenv("MAX_SPREAD", "0.04"))
-MIN_MOVE = Decimal(os.getenv("MIN_MOVE", "0.025"))
+OBSERVE_SECONDS = max(60, int(os.getenv("OBSERVE_SECONDS", "60")))
+EARLY_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("EARLY_WINDOW_SECONDS", "300")))
+LATE_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("LATE_WINDOW_SECONDS", "300")))
 MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
-MIN_REMAINING = max(300, int(os.getenv("MIN_REMAINING_SECONDS", "300")))
-BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-v4.5-restored")
+BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-v4.5-dual-window")
 PANEL_URL = os.getenv("RAFA_PANEL_URL", "").rstrip("/")
 PANEL_SECRET = os.getenv("RAFA_PANEL_SECRET", "")
 PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
 RULES_SNAPSHOT = json.dumps({
-    "series": SERIES, "scan_seconds": SCAN_SECONDS, "observe_seconds": 60,
-    "minimum_elapsed_seconds": DELAY, "minimum_remaining_seconds": MIN_REMAINING,
-    "minimum_move": str(MIN_MOVE), "maximum_spread": str(MAX_SPREAD),
+    "series": SERIES, "scan_seconds": SCAN_SECONDS,
+    "observe_seconds": OBSERVE_SECONDS,
+    "early_window_seconds": EARLY_WINDOW_SECONDS,
+    "late_window_seconds": LATE_WINDOW_SECONDS,
     "minimum_volume_24h": str(MIN_VOLUME),
-    "signal_rule": "direction of observed Kalshi YES midpoint change after 60 seconds",
+    "signal_rule": "Kalshi YES midpoint direction after the observation period; first and last contract windows",
     "automatic_orders": False,
 }, separators=(",", ":"), sort_keys=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -40,7 +40,7 @@ log = logging.getLogger("kalshi-only")
 http = requests.Session()
 http.headers["User-Agent"] = "KalshiOnlyBTC15M/4.5"
 # Extra in-process protection against duplicate alerts during a worker lifetime.
-alerted_tickers = set()
+alerted_phases = set()
 KRAKEN_URL = "https://api.kraken.com/0/public/Ticker"
 kraken_samples = []
 kraken_last_quote = None
@@ -319,8 +319,6 @@ def quote(m):
     bid, ask = dec(m.get("yes_bid_dollars")), dec(m.get("yes_ask_dollars"))
     if bid is None or ask is None or not (Decimal(0) < bid <= ask < Decimal(1)):
         return None
-    if ask - bid > MAX_SPREAD:
-        return None
     return bid, ask, (bid + ask) / 2
 
 def sample(db, ticker, now, mid):
@@ -569,14 +567,15 @@ def adaptive_direction_gate(db, phase, direction):
         return False
     return True
 
-def signal(db, m, now, close_at, open_at):
-    """Send one Kalshi-only momentum forecast after a real quote history exists."""
+def signal(db, m, now, phase):
+    """Send one Kalshi-only forecast per contract window after real quote history."""
     ticker = m["ticker"]
-    if ticker in alerted_tickers:
+    alert_key = (ticker, phase)
+    if alert_key in alerted_phases:
         return
-    if db.execute("SELECT 1 FROM kalshi_only_alerts WHERE ticker=? LIMIT 1",
-                  (ticker,)).fetchone():
-        alerted_tickers.add(ticker)
+    if db.execute("SELECT 1 FROM kalshi_only_alerts WHERE ticker=? AND phase=? LIMIT 1",
+                  (ticker, phase)).fetchone():
+        alerted_phases.add(alert_key)
         return
     q = quote(m)
     if q is None:
@@ -587,37 +586,40 @@ def signal(db, m, now, close_at, open_at):
         volume = dec(m.get("volume_24h"))
     if volume is None or volume < MIN_VOLUME:
         return
-    # Compare with the first real quote observed at least 60 seconds earlier.
-    # Do not invent a baseline after a worker restart.
-    row = db.execute("""SELECT yes_mid FROM kalshi_only_samples
+    # Use a real Kalshi quote at least one observation window earlier.
+    # The early window uses its first sample; the close window uses the latest prior sample.
+    ordering = "ASC" if phase == "EARLY_5M" else "DESC"
+    row = db.execute(f"""SELECT yes_mid FROM kalshi_only_samples
         WHERE ticker=? AND observed_at<=?
-        ORDER BY observed_at ASC LIMIT 1""",
-        (ticker, now - 60)).fetchone()
+        ORDER BY observed_at {ordering} LIMIT 1""",
+        (ticker, now - OBSERVE_SECONDS)).fetchone()
     if not row:
-        log.info("Waiting for 60s of observed Kalshi quotes for %s", ticker)
+        log.info("Waiting for %ss of observed Kalshi quotes for %s (%s)",
+                 OBSERVE_SECONDS, ticker, phase)
         return
     prior = dec(row[0])
     if prior is None:
         return
     change = mid - prior
-    if abs(change) < MIN_MOVE:
+    if change == 0:
         return
     direction = "UP" if change > 0 else "DOWN"
     projected = min(Decimal("0.99"), max(Decimal("0.01"), mid + change))
     movement = "subida" if direction == "UP" else "bajada"
+    phase_label = "PRIMEROS 5 MIN" if phase == "EARLY_5M" else "ÚLTIMOS 5 MIN"
     message = (
-        ("🔺 UP" if direction == "UP" else "🔻 DOWN") + "\n"
+        ("🔺 UP" if direction == "UP" else "🔻 DOWN") + f" · {phase_label}\\n"
         + f"📈 Posible {movement} de Kalshi YES desde ${mid:.3f} "
-        + f"hacia ${projected:.3f}.\n"
+        + f"hacia ${projected:.3f}.\\n"
         + "🔄 Después la cotización puede cambiar de rumbo."
     )
     if notify(message):
-        alerted_tickers.add(ticker)
+        alerted_phases.add(alert_key)
         db.execute("""INSERT OR IGNORE INTO kalshi_only_alerts
             (ticker,phase,sent_at,direction,bot_version,rules_snapshot)
             VALUES (?,?,?,?,?,?)""",
-            (ticker, "OPEN", now, direction, BOT_VERSION, RULES_SNAPSHOT))
-        log.info("Kalshi-only OPEN forecast: %s %s", ticker, direction)
+            (ticker, phase, now, direction, BOT_VERSION, RULES_SNAPSHOT))
+        log.info("Kalshi-only %s forecast: %s %s", phase, ticker, direction)
 
 def evaluate_btc_forecasts(db, now):
     """Score forecast direction and whether its first target was touched before expiry."""
@@ -905,10 +907,13 @@ def scan():
                 journal_opening_quote(db, m, now, opened, closes)
             elapsed = now - opened
             remaining = closes - now
-            # Match the working midnight behavior: one alert per contract,
-            # after 2 minutes of observation and at least 5 minutes before close.
-            if elapsed >= DELAY and MIN_REMAINING <= remaining <= 900:
-                signal(db, m, now, closes, opened)
+            phase = None
+            if OBSERVE_SECONDS <= elapsed <= EARLY_WINDOW_SECONDS:
+                phase = "EARLY_5M"
+            elif 0 < remaining <= LATE_WINDOW_SECONDS:
+                phase = "LATE_5M"
+            if phase:
+                signal(db, m, now, phase)
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
