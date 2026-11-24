@@ -836,108 +836,24 @@ def closing_confidence(db, ticker, phase, direction, now, remaining, start, proj
 
 def forecast_display(ticker, phase_label, direction, confidence, start, target, projected,
                      bias_direction, bias_evidence):
-    confidence_high = confidence is not None and confidence >= 90
-    confidence_marker = "🟢" if confidence_high else "🟡"
-    projection = "cierre alcista" if direction == "UP" else "cierre bajista"
+    """Format the plain-text BTC/Kalshi alert without the forecast card image."""
     if bias_direction == "UP":
-        bias_color, bias_label = "#21d07a", "PODRÍA SUBIR"
-        bias_text = "🎯 Posible giro en el objetivo: 🟢 evidencia apunta a una subida (>80%)."
+        bias_text = "🔄 Posible giro en el objetivo: 🟢 UP · sesgo de cierre por encima del objetivo."
     elif bias_direction == "DOWN":
-        bias_color, bias_label = "#ff5f68", "PODRÍA BAJAR"
-        bias_text = "🎯 Posible giro en el objetivo: 🔴 evidencia apunta a una bajada (>80%)."
+        bias_text = "🔄 Posible giro en el objetivo: 🔴 DOWN · sesgo de cierre por debajo del objetivo."
     else:
-        bias_color, bias_label = "#f6c945", "NO CONFIRMADO"
-        bias_text = "🎯 Posible giro en el objetivo: 🟡 no confirmado · evidencia insuficiente."
-    if bias_evidence is not None:
-        evidence_line = f"Momentum reciente alineado: {bias_evidence:.0%}."
-    else:
-        evidence_line = "Momentum reciente: datos insuficientes."
+        bias_text = "🔄 Posible giro en el objetivo: 🟡 no confirmado · evidencia insuficiente."
     message = (
-        "📊 BTC KALSHI | 15 MIN\n\n"
-        f"{direction_label(direction)}\n"
-        + (f"📊 Confianza estimada: {confidence}%\n" if confidence is not None
-           else "📊 Confianza estimada: reuniendo datos\n")
-        + f"📈 Proyección: {projection} desde el precio de señal.\n"
-        + f"BTC/USD: USD {start:,.2f} → USD {target:,.2f} (primer objetivo)\n"
-        + f"📍 Cierre estimado: USD {projected:,.2f}\n"
-        + bias_text + "\n"
-        + evidence_line + "\n"
-        + f"⏱️ {phase_label} · temporalidad 15 minutos\n"
-        + f"🎯 Nivel de confianza: {confidence_marker} {'ALTO' if confidence_high else 'INCIERTO'}\n"
-        + f"🧾 {ticker}\n\n"
-        + "⚠️ Proyección experimental; no garantiza el resultado."
+        f"{direction_label(direction)} · {phase_label}\n"
+        f"🧾 {ticker}\n"
+        f"🌐 Kraken BTC/USD inicial: USD {start:,.2f}\n"
+        f"🎯 Primer objetivo: USD {target:,.2f}\n"
+        f"{bias_text}\n"
+        f"📍 Cierre estimado por momentum: USD {projected:,.2f}\n"
+        "Kalshi: resultado oficial se evalúa por separado.\n"
+        "Proyección experimental, no garantía."
     )
-    photo = None
-    try:
-        from io import BytesIO
-        from PIL import Image, ImageDraw, ImageFont
-
-        bg, panel = "#08111f", "#111d2e"
-        muted, fg = "#a9b8cc", "#f5f8fc"
-        signal_accent = "#21d07a" if direction == "UP" else "#ff5f68"
-        confidence_accent = signal_accent if confidence_high else "#f6c945"
-        canvas = Image.new("RGB", (900, 1120), bg)
-        draw = ImageDraw.Draw(canvas)
-
-        def font(size):
-            return ImageFont.load_default(size=size)
-
-        def centered(y, value, size, color=fg):
-            draw.text((450, y), value, font=font(size), fill=color, anchor="mt")
-
-        def fit(value, max_width, size):
-            f = font(size)
-            while size > 18 and draw.textbbox((0, 0), value, font=f)[2] > max_width:
-                size -= 2
-                f = font(size)
-            return f
-
-        draw.rounded_rectangle((20, 20, 880, 1100), radius=34, fill=panel, outline="#26374d", width=3)
-        centered(58, "BTC KALSHI  ·  15 MIN", 48)
-        draw.rounded_rectangle((290, 112, 610, 164), radius=22, fill="#1b2b40")
-        draw.text((450, 138), phase_label, font=fit(phase_label, 290, 25), fill=muted, anchor="mm")
-        draw.line((70, 190, 830, 190), fill="#26374d", width=2)
-
-        signal_label = f"{direction} {'↑' if direction == 'UP' else '↓'}"
-        draw.rounded_rectangle((250, 220, 650, 355), radius=34, fill="#0b1625", outline=signal_accent, width=3)
-        centered(251, signal_label, 88, signal_accent)
-
-        centered(385, f"{confidence}%" if confidence is not None else "—", 125, confidence_accent)
-        centered(515, "CONFIANZA ESTIMADA", 30, muted)
-        draw.rounded_rectangle((100, 562, 800, 596), radius=17, fill="#26374d")
-        if confidence is not None:
-            fill_width = int(700 * max(0, min(100, confidence)) / 100)
-            if fill_width > 0:
-                draw.rounded_rectangle((100, 562, 100 + fill_width, 596), radius=17, fill=confidence_accent)
-
-        centered(625, "PROYECCIÓN", 27, muted)
-        centered(664, projection.upper(), 37, signal_accent)
-
-        draw.rounded_rectangle((68, 710, 832, 825), radius=24, fill="#0b1625")
-        centered(727, "BTC/USD  ·  PRIMER OBJETIVO", 23, muted)
-        price_line = f"USD {start:,.2f}  →  USD {target:,.2f}"
-        draw.text((450, 786), price_line, font=fit(price_line, 700, 35), fill=fg, anchor="mm")
-
-        centered(844, f"CIERRE ESTIMADO  ·  USD {projected:,.2f}", 31, fg)
-
-        draw.rounded_rectangle((68, 895, 832, 1015), radius=24, fill="#0b1625")
-        centered(910, "POSIBLE GIRO EN EL OBJETIVO", 23, muted)
-        draw.ellipse((118, 960, 144, 986), fill=bias_color)
-        draw.text((450, 973), bias_label, font=fit(bias_label, 570, 34), fill=bias_color, anchor="mm")
-        score_label = f"Evidencia de momentum: {bias_evidence:.0%}" if bias_evidence is not None else "Evidencia insuficiente"
-        centered(1032, score_label, 24, muted)
-        status = f"Nivel de confianza: {'ALTO' if confidence_high else 'INCIERTO'}"
-        confidence_marker_color = "#21d07a" if confidence_high else "#f6c945"
-        draw.ellipse((125, 1070, 149, 1094), fill=confidence_marker_color)
-        draw.text((450, 1082), status, font=fit(status, 560, 24), fill=confidence_marker_color, anchor="mm")
-        photo_buffer = BytesIO()
-        canvas.save(photo_buffer, format="PNG")
-        photo = photo_buffer.getvalue()
-    except Exception:
-        log.exception("Rafa signal card unavailable; using text")
-    return message, photo
-
-
+    return message, None
 
 def signal(db, m, now, phase, kraken_direction=None):
     """Send a Kraken BTC/USD forecast; keep Kalshi settlement separate."""
