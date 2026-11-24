@@ -770,6 +770,10 @@ def signal(db, m, now, phase, kraken_direction=None):
             (id,ticker,phase,predicted_direction,issued_at,close_at,start_price,target_price,status,source,bot_version,rules_snapshot)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (f"kraken-primary:{ticker}:{phase}",ticker,phase,direction,now,close_at,str(start),str(first_target),"pending","bot_forecast",BOT_VERSION,"Kraken BTC/USD separate first target and close estimate"))
+        features = make_model_features(phase, mid, change, close_at-now)
+        if features is not None:
+            db.execute("UPDATE kalshi_prediction_feedback SET model_features=? WHERE id=?",
+                       (json.dumps(features), f"kraken-primary:{ticker}:{phase}"))
         db.execute("INSERT OR IGNORE INTO rafa_close_estimates (id,estimated) VALUES (?,?)",
                    (f"kraken-primary:{ticker}:{phase}",str(projected)))
         try:
