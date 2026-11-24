@@ -741,6 +741,12 @@ def signal(db, m, now, phase, kraken_direction=None):
         return
     start, projected = projection
     direction = "UP" if projected > start else "DOWN"
+    first_projection = kraken_nearest_level_projection(now, direction, projection)
+    if first_projection is None or first_projection[1] == start:
+        return
+    first_target = first_projection[1]
+    db.execute("""CREATE TABLE IF NOT EXISTS rafa_close_estimates
+        (id TEXT PRIMARY KEY, estimated TEXT, absolute_error TEXT)""")
     change = Decimal("0")
     confirmation = "Kraken BTC/USD"
     phase_label = "PRIMEROS 5 MIN" if phase == "EARLY_5M" else "ÚLTIMOS 5 MIN"
@@ -748,7 +754,9 @@ def signal(db, m, now, phase, kraken_direction=None):
         ("🔺 UP" if direction == "UP" else "🔻 DOWN") + f" · {phase_label}\n"
         + f"🧾 {ticker}\n"
         + f"🌐 Kraken BTC/USD inicial: USD {start:,.2f}\n"
-        + f"🎯 Cierre estimado: USD {projected:,.2f}\n"
+        + f"🎯 Primer objetivo: USD {first_target:,.2f}\n"
+        + "🔄 Posible giro en el objetivo; no confirmado.\n"
+        + f"📍 Cierre estimado por momentum: USD {projected:,.2f}\n"
         + "Kalshi: resultado oficial se evalúa por separado.\n"
         + "Proyección experimental, no garantía."
     )
@@ -761,7 +769,9 @@ def signal(db, m, now, phase, kraken_direction=None):
         db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
             (id,ticker,phase,predicted_direction,issued_at,close_at,start_price,target_price,status,source,bot_version,rules_snapshot)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (f"kraken-primary:{ticker}:{phase}",ticker,phase,direction,now,close_at,str(start),str(projected),"pending","bot_forecast",BOT_VERSION,"Kraken BTC/USD five-minute momentum projection"))
+            (f"kraken-primary:{ticker}:{phase}",ticker,phase,direction,now,close_at,str(start),str(first_target),"pending","bot_forecast",BOT_VERSION,"Kraken BTC/USD separate first target and close estimate"))
+        db.execute("INSERT OR IGNORE INTO rafa_close_estimates (id,estimated) VALUES (?,?)",
+                   (f"kraken-primary:{ticker}:{phase}",str(projected)))
         try:
             shadow_record(db, ticker, phase, now, direction, q, change, volume, kraken_direction)
         except Exception:
@@ -834,6 +844,15 @@ def evaluate_btc_forecasts(db, now):
                 (actual, str(actual_price), now, str(peak), str(trough),
                  int(reached) if reached is not None else None,
                  note, forecast_id))
+            db.execute("""CREATE TABLE IF NOT EXISTS rafa_close_estimates
+                (id TEXT PRIMARY KEY, estimated TEXT, absolute_error TEXT)""")
+            estimate_row = db.execute("SELECT estimated FROM rafa_close_estimates WHERE id=?", (forecast_id,)).fetchone()
+            estimate = dec(estimate_row[0]) if estimate_row else None
+            estimate_line = ""
+            if estimate is not None:
+                error = abs(actual_price-estimate)
+                db.execute("UPDATE rafa_close_estimates SET absolute_error=? WHERE id=?", (str(error),forecast_id))
+                estimate_line = f"📐 Cierre estimado: USD {estimate:,.2f}; error: USD {error:,.2f}\\n".replace("\\n", "\n")
             target_line = ("Primer objetivo: tocado" if reached else
                            "Primer objetivo: no observado" if reached is False else
                            "Primer objetivo: sin dato")
@@ -845,6 +864,7 @@ def evaluate_btc_forecasts(db, now):
                    f"📈 Máximo/mínimo después de la señal: USD {peak:,.2f} / USD {trough:,.2f}\n"
                    f"🎯 {target_line} ({'USD ' + format(target_price, ',.2f') if target_price is not None else 'sin dato'})\n"
                    f"📍 Cierre aproximado: {actual} en USD {actual_price:,.2f}\n"
+                   + estimate_line
                    + reversal_line
                    + ("✅ Dirección al cierre coincidió." if correct else
                       "❌ Dirección al cierre falló; datos guardados."),
