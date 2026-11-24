@@ -1173,6 +1173,51 @@ def evaluate_btc_forecasts(db, now):
                 TypeError, StopIteration):
             log.exception("Could not evaluate BTC forecast for %s", ticker)
 
+
+def evaluate_combo_reviews(db, now):
+    db.execute("""CREATE TABLE IF NOT EXISTS kalshi_combo_forecasts
+        (combo_key TEXT PRIMARY KEY, btc_ticker TEXT NOT NULL, eth_ticker TEXT NOT NULL,
+         issued_at REAL NOT NULL, close_at REAL NOT NULL,
+         btc_direction TEXT NOT NULL, eth_direction TEXT NOT NULL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS kalshi_combo_reviews
+        (combo_key TEXT PRIMARY KEY, reviewed_at REAL NOT NULL)""")
+    pending = db.execute("""SELECT c.combo_key,c.btc_ticker,c.eth_ticker,
+            c.btc_direction,c.eth_direction,b.result,e.result
+        FROM kalshi_combo_forecasts c
+        JOIN kalshi_only_results b ON b.ticker=c.btc_ticker
+        JOIN kalshi_only_results e ON e.ticker=c.eth_ticker
+        LEFT JOIN kalshi_combo_reviews r ON r.combo_key=c.combo_key
+        WHERE r.combo_key IS NULL AND b.result IN ('yes','no') AND e.result IN ('yes','no')
+        ORDER BY c.close_at,c.combo_key""").fetchall()
+    for combo_key, btc_ticker, eth_ticker, btc_pred, eth_pred, btc_result, eth_result in pending:
+        btc_actual = "UP" if btc_result == "yes" else "DOWN"
+        eth_actual = "UP" if eth_result == "yes" else "DOWN"
+        btc_ok = btc_pred == btc_actual
+        eth_ok = eth_pred == eth_actual
+        combo_ok = btc_ok and eth_ok
+        evaluated = db.execute("""SELECT c.btc_direction,c.eth_direction,b.result,e.result
+            FROM kalshi_combo_forecasts c
+            JOIN kalshi_only_results b ON b.ticker=c.btc_ticker
+            JOIN kalshi_only_results e ON e.ticker=c.eth_ticker
+            WHERE b.result IN ('yes','no') AND e.result IN ('yes','no')""").fetchall()
+        wins = sum((bd == "UP") == (br == "yes") and
+                   (ed == "UP") == (er == "yes")
+                   for bd, ed, br, er in evaluated)
+        total = len(evaluated)
+        losses = total-wins
+        accuracy = wins/total if total else 0.0
+        message = "\n".join([
+            "🧠 REVISIÓN DEL COMBO BTC + ETH",
+            f"🧾 BTC {btc_ticker}: pronóstico {direction_label(btc_pred)} · oficial {btc_result.upper()} {'✅' if btc_ok else '❌'}",
+            f"🧾 ETH {eth_ticker}: pronóstico {direction_label(eth_pred)} · oficial {eth_result.upper()} {'✅' if eth_ok else '❌'}",
+            f"🏁 Combo: {'✅ ACERTÓ LAS DOS PATAS' if combo_ok else '❌ NO ACERTÓ EL COMBO'}",
+            f"📊 Acumulado: {wins} acertados · {losses} fallados de {total} ({accuracy:.0%} de combos completos).",
+        ])
+        if notify(message, db=db, broadcast=True):
+            db.execute("INSERT OR IGNORE INTO kalshi_combo_reviews VALUES (?,?)",
+                       (combo_key, now))
+
+
 def check_results(db, now):
     # Separately score BTC/USD price forecasts against Kraken. Kalshi settlement
     # below remains the official outcome for the prediction-market contract.
@@ -1191,6 +1236,8 @@ def check_results(db, now):
         predictions = db.execute("""SELECT phase, direction FROM kalshi_only_alerts
             WHERE ticker=?""", (ticker,)).fetchall()
         for phase, direction in predictions:
+            if phase == "COMBO_6M":
+                continue
             correct = (direction == "UP" and result == "yes") or (
                 direction == "DOWN" and result == "no")
             notify(f"🧠 BTC — REVISIÓN DE PREDICCIÓN\n🧾 {ticker}\n"
@@ -1198,6 +1245,8 @@ def check_results(db, now):
                    f"🏁 Resultado oficial: {result.upper()}\n"
                    f"{'✅ Coincidió' if correct else '❌ No coincidió'} con el resultado oficial.",
                    db=db, broadcast=True)
+
+    evaluate_combo_reviews(db, now)
 
     # Label every journaled opening quote with Kalshi's official settlement.
     # The market midpoint is a benchmark probability, not a bot forecast.
