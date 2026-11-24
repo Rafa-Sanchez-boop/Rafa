@@ -18,7 +18,7 @@ DB_PATH = os.getenv("DB_PATH", "/var/data/kalshi_bot.sqlite3")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
-DELAY = 0
+DELAY = 120
 MIN_REMAINING = max(300, int(os.getenv("MIN_REMAINING_SECONDS", "300")))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-only")
@@ -546,104 +546,48 @@ def adaptive_direction_gate(db, phase, direction):
         return False
     return True
 
-def signal(db, m, now, close_at, open_at, phase, btc_trend):
+def signal(db, m, now, close_at, open_at):
+    """Send one Kalshi-only momentum forecast after a real quote history exists."""
     ticker = m["ticker"]
-    alert_key = (ticker, phase)
-    if alert_key in alerted_tickers:
+    if ticker in alerted_tickers:
         return
-    if db.execute("SELECT 1 FROM kalshi_only_alerts WHERE ticker=? AND phase=?",
-                  (ticker, phase)).fetchone():
-        alerted_tickers.add(alert_key)
+    if db.execute("SELECT 1 FROM kalshi_only_alerts WHERE ticker=? LIMIT 1",
+                  (ticker,)).fetchone():
+        alerted_tickers.add(ticker)
         return
     q = quote(m)
     if q is None:
         return
-    bid, ask, mid = q
-    elapsed = now - open_at
-    remaining = close_at - now
-    if phase == "EARLY_5M":
-        if elapsed < 0 or elapsed > 300:
-            return
-        # Require an observed Kalshi quote at least 60 seconds earlier.
-        rows = db.execute("""SELECT yes_mid FROM kalshi_only_samples
-            WHERE ticker=? AND observed_at<=? AND observed_at>=?
-            ORDER BY observed_at DESC LIMIT 1""",
-            (ticker, now - 60, open_at - 120)).fetchone()
-        if not rows:
-            log.info("Waiting for an earlier Kalshi quote for %s", ticker)
-            return
-        prior = dec(rows[0])
-    elif phase == "LAST_5M":
-        if remaining < 0 or remaining > 300:
-            return
-        # Compare Kalshi's YES midpoint with the closest real quote to the
-        # start of the same five-minute interval.
-        target = now - 300
-        rows = db.execute("""SELECT yes_mid, observed_at FROM kalshi_only_samples
-            WHERE ticker=? AND observed_at BETWEEN ? AND ?
-            ORDER BY ABS(observed_at - ?) LIMIT 1""",
-            (ticker, target - 45, target + 45, target)).fetchone()
-        if not rows:
-            log.info("Waiting for five-minute Kalshi history for %s", ticker)
-            return
-        prior = dec(rows[0])
-        if prior is None or abs(rows[1] - target) > 45:
-            return
-    else:
+    _, _, mid = q
+    # Compare with the first real quote observed at least 60 seconds earlier.
+    # Do not invent a baseline after a worker restart.
+    row = db.execute("""SELECT yes_mid FROM kalshi_only_samples
+        WHERE ticker=? AND observed_at<=?
+        ORDER BY observed_at ASC LIMIT 1""",
+        (ticker, now - 60)).fetchone()
+    if not row:
+        log.info("Waiting for 60s of observed Kalshi quotes for %s", ticker)
         return
+    prior = dec(row[0])
     if prior is None:
         return
     change = mid - prior
     if change == 0:
         return
-    up = change > 0
-    direction = "UP" if up else "DOWN"
-    if btc_trend != direction:
-        log.info("Skipping %s %s: Kalshi %s, Kraken 5m %s",
-                 phase, ticker, direction, btc_trend)
-        return
-    if not adaptive_direction_gate(db, phase, direction):
-        return
-    model_features = make_model_features(phase, mid, change, remaining)
-    if not adaptive_model_allows(db, model_features, direction):
-        return
-    btc_projection = kraken_close_projection(now, remaining)
-    if btc_projection is None:
-        log.info("Skipping %s %s: no fresh five-minute BTC/USD data for estimate",
-                 phase, ticker)
-        return
-    btc_projection = kraken_nearest_level_projection(now, direction, btc_projection)
-    if btc_projection is None:
-        log.info("Skipping %s %s: no fresh BTC quote for level target", phase, ticker)
-        return
-    btc_now, btc_close = btc_projection
-    if (direction == "UP" and btc_close <= btc_now) or (
-            direction == "DOWN" and btc_close >= btc_now):
-        log.info("Skipping %s %s: no remaining move to the next level", phase, ticker)
-        return
-    move = btc_close - btc_now
-    move_word = "subida" if move > 0 else "bajada"
-    phase_name = ("primeros cinco minutos" if phase == "EARLY_5M"
-                  else "últimos cinco minutos")
+    direction = "UP" if change > 0 else "DOWN"
+    projected = min(Decimal("0.99"), max(Decimal("0.01"), mid + change))
+    movement = "subida" if direction == "UP" else "bajada"
     message = (
-        ("🔺 UP" if up else "🔻 DOWN") + "\n"
-        + f"📈 BTC: posible {move_word} desde ${btc_now:,.2f} "
-        + f"hasta ${btc_close:,.2f} ({move:+,.2f} USD).\n"
-        + "🎯 Primer tope estimado; después el mercado puede cambiar."
+        ("🔺 UP" if direction == "UP" else "🔻 DOWN") + "\n"
+        + f"📈 Posible {movement} de Kalshi YES desde ${mid:.3f} "
+        + f"hacia ${projected:.3f}.\n"
+        + "🔄 Después la cotización puede cambiar de rumbo."
     )
     if notify(message):
-        alerted_tickers.add(alert_key)
+        alerted_tickers.add(ticker)
         db.execute("INSERT OR IGNORE INTO kalshi_only_alerts VALUES (?,?,?,?)",
-                   (ticker, phase, now, direction))
-        db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
-            (id, ticker, phase, predicted_direction, issued_at, close_at,
-             start_price, target_price, model_features, status, source, note)
-            VALUES (?,?,?,?,?,?,?,?,?, 'pending', 'bot_forecast', ?)""",
-            (ticker + ":" + phase, ticker, phase, direction, now, close_at,
-             str(btc_now), str(btc_close),
-             json.dumps(model_features, separators=(",", ":")) if model_features is not None else None,
-             "Awaiting Kraken BTC/USD close-price evaluation."))
-        log.info("Kalshi %s alert: %s %s", phase, ticker, direction)
+                   (ticker, "OPEN", now, direction))
+        log.info("Kalshi-only OPEN forecast: %s %s", ticker, direction)
 
 def evaluate_btc_forecasts(db, now):
     """Score forecast direction and whether its first target was touched before expiry."""
@@ -749,12 +693,10 @@ def check_results(db, now):
         for phase, direction in predictions:
             correct = (direction == "UP" and result == "yes") or (
                 direction == "DOWN" and result == "no")
-            notify(f"📊 KALSHI — RESULTADO OFICIAL\n🧾 {ticker}\n"
-                   f"📈 Dirección de momentum observada: {direction} ({phase})\n"
-                   f"🏁 Resultado final Kalshi: {result.upper()}\n"
-                   f"{'Coincidió' if correct else 'No coincidió'} con el resultado final.\n"
-                   "⚠️ La señal mide momentum de cotización, no predice "
-                   "el resultado final ni confirma beneficio de compraventa.")
+            notify(f"🧠 BTC — REVISIÓN DE PREDICCIÓN\n🧾 {ticker}\n"
+                   f"🔮 Pronóstico Kalshi: {direction}\n"
+                   f"🏁 Resultado oficial: {result.upper()}\n"
+                   f"{'✅ Coincidió' if correct else '❌ No coincidió'} con el resultado oficial.")
 
     # Label every journaled opening quote with Kalshi's official settlement.
     # The market midpoint is a benchmark probability, not a bot forecast.
@@ -785,7 +727,6 @@ def scan():
         with db_open() as db:
             record_kalshi_15m_chart(db, now)
         return
-    btc_trend = kraken_trend(now)
     with db_open() as db:
         record_kalshi_15m_chart(db, now)
         for m in payload.get("markets", []):
@@ -803,13 +744,10 @@ def scan():
                 journal_opening_quote(db, m, now, opened, closes)
             elapsed = now - opened
             remaining = closes - now
-            # One prediction opportunity during the opening five minutes and
-            # one during the final five minutes before settlement.
-            trend_5m = kraken_trend_5m(now)
-            if 0 <= elapsed <= 300:
-                signal(db, m, now, closes, opened, "EARLY_5M", trend_5m)
-            if 0 <= remaining <= 300:
-                signal(db, m, now, closes, opened, "LAST_5M", trend_5m)
+            # Match the working midnight behavior: one alert per contract,
+            # after 2 minutes of observation and at least 5 minutes before close.
+            if elapsed >= DELAY and MIN_REMAINING <= remaining <= 900:
+                signal(db, m, now, closes, opened)
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
@@ -835,7 +773,7 @@ def telegram_test_once():
         log.error("Telegram diagnostic: test message failed or was not accepted")
 
 def main():
-    log.info("Kalshi BTC15M with Kraken confirmation and Telegram BTC assistant")
+    log.info("Kalshi BTC15M quote-momentum alerts and Telegram BTC assistant; no automatic trading")
     btc_assistant.register_commands()
     while True:
         try:
