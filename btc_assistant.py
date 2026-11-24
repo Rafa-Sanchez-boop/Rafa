@@ -26,7 +26,8 @@ session = requests.Session()
 session.headers["User-Agent"] = "Rafa-BTC-Market-Assistant/1.0"
 
 COMMANDS = [
-    {"command": "start", "description": "Activar señales y resultados"},
+    {"command": "start", "description": "Mostrar bienvenida e instrucciones"},
+    {"command": "play", "description": "Activar señales y resultados"},
     {"command": "ayuda", "description": "Ver comandos del asistente"},
     {"command": "btc", "description": "Precio e indicadores de Bitcoin"},
     {"command": "ciclo", "description": "Ver fase del ciclo corto de BTC"},
@@ -416,7 +417,8 @@ def help_text(is_owner=False):
         "/ciclo — fase observada del ciclo corto y niveles",
         "/mercado — contrato BTC15M activo de Kalshi",
         "/senales — ver las últimas señales de Rafa",
-        "/start — activar las señales y resultados en este chat",
+        "/play — activar señales, revisiones y resultados en este chat",
+        "/start — abrir bienvenida; usa /play para activar los avisos",
         "/parar — dejar de recibir avisos",
     ]
     if is_owner:
@@ -494,17 +496,15 @@ def process_updates(db):
                 elif not is_owner and sensitive_request:
                     reply = "No puedo compartir detalles internos ni información personal del bot o del propietario."
                 elif command in ("/start", "/ayuda", "/help"):
-                    if command == "/start":
-                        db.execute("INSERT OR IGNORE INTO telegram_subscribers(chat_id) VALUES (?)",
-                                   (chat_id,))
-                        reply = (help_text(is_owner)
-                                 + "\n\n✅ Este chat recibirá señales, revisiones y resultados oficiales. "
-                                 "Usa /parar para dejar de recibirlos.")
-                    else:
-                        reply = help_text(is_owner)
+                    reply = help_text(is_owner)
+                elif command == "/play":
+                    db.execute("INSERT OR IGNORE INTO telegram_subscribers(chat_id) VALUES (?)",
+                               (chat_id,))
+                    reply = ("✅ Suscripción activada. Este chat recibirá señales, revisiones "
+                             "y resultados oficiales. Usa /parar para dejar de recibirlos.")
                 elif command in ("/parar", "/stop"):
                     db.execute("DELETE FROM telegram_subscribers WHERE chat_id=?", (chat_id,))
-                    reply = "Listo. Este chat ya no recibirá avisos. Puedes volver con /start."
+                    reply = "Listo. Este chat ya no recibirá avisos. Puedes volver con /play."
                 elif command == "/btc":
                     reply = btc_report(get_snapshot())
                 elif command == "/ciclo":
