@@ -592,14 +592,20 @@ def adaptive_model_allows(db, features, direction):
 
 
 def maybe_train_adaptive_model(db, now):
-    """Attempt one persisted model update per UTC day, after scored results arrive."""
+    """Train daily, retrying after five more scored examples when data/model checks fail."""
     today = time.strftime("%Y-%m-%d", time.gmtime(now))
-    row = db.execute("SELECT value FROM telegram_state WHERE key='adaptive_training_day'").fetchone()
-    if row and row[0] == today:
-        return
-    train_adaptive_model(db, now)
-    db.execute("""INSERT INTO telegram_state(key,value) VALUES ('adaptive_training_day',?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (today,))
+    count = db.execute("""SELECT COUNT(*) FROM kalshi_prediction_feedback
+        WHERE status='evaluated' AND source='bot_forecast' AND model_features IS NOT NULL
+          AND actual_direction IN ('UP','DOWN')""").fetchone()[0]
+    row = db.execute("SELECT value FROM telegram_state WHERE key='adaptive_training_state'").fetchone()
+    if row and row[0].startswith(today + ":"):
+        _, status, previous_count = row[0].split(":")
+        if status == "trained" or count < int(previous_count) + 5:
+            return
+    trained = train_adaptive_model(db, now)
+    state = f"{today}:{'trained' if trained else 'pending'}:{count}"
+    db.execute("""INSERT INTO telegram_state(key,value) VALUES ('adaptive_training_state',?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (state,))
 
 
 def adaptive_direction_gate(db, phase, direction):
