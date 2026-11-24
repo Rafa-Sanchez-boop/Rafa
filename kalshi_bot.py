@@ -22,7 +22,7 @@ OBSERVE_SECONDS = max(60, int(os.getenv("OBSERVE_SECONDS", "60")))
 EARLY_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("EARLY_WINDOW_SECONDS", "300")))
 LATE_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("LATE_WINDOW_SECONDS", "300")))
 MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
-BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-v4.5-dual-window")
+BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-v4.6-close-guards")
 PANEL_URL = os.getenv("RAFA_PANEL_URL", "").rstrip("/")
 PANEL_SECRET = os.getenv("RAFA_PANEL_SECRET", "")
 PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
@@ -135,7 +135,12 @@ def kraken_close_projection(now, remaining):
     if current == prior:
         return None
     change_5m = current - prior
-    projected = current + change_5m * Decimal(str(remaining)) / Decimal("300")
+    # Ignore tiny five-minute changes that are too small to support a directional projection.
+    if abs(change_5m) < current * Decimal("0.0001"):
+        return None
+    # Do not extend one observed five-minute impulse across a longer horizon.
+    horizon = min(max(Decimal("0"), Decimal(str(remaining))), Decimal("300"))
+    projected = current + change_5m * horizon / Decimal("300")
     if projected <= 0:
         return None
     return current, projected
@@ -587,32 +592,44 @@ def adaptive_model_allows(db, features, direction):
 
 
 def maybe_train_adaptive_model(db, now):
-    """Attempt one persisted model update per UTC day, after scored results arrive."""
+    """Train daily, retrying after five more scored examples when data/model checks fail."""
     today = time.strftime("%Y-%m-%d", time.gmtime(now))
-    row = db.execute("SELECT value FROM telegram_state WHERE key='adaptive_training_day'").fetchone()
-    if row and row[0] == today:
-        return
-    train_adaptive_model(db, now)
-    db.execute("""INSERT INTO telegram_state(key,value) VALUES ('adaptive_training_day',?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (today,))
+    count = db.execute("""SELECT COUNT(*) FROM kalshi_prediction_feedback
+        WHERE status='evaluated' AND source='bot_forecast' AND model_features IS NOT NULL
+          AND actual_direction IN ('UP','DOWN')""").fetchone()[0]
+    row = db.execute("SELECT value FROM telegram_state WHERE key='adaptive_training_state'").fetchone()
+    if row and row[0].startswith(today + ":"):
+        _, status, previous_count = row[0].split(":")
+        if status == "trained" or count < int(previous_count) + 5:
+            return
+    trained = train_adaptive_model(db, now)
+    state = f"{today}:{'trained' if trained else 'pending'}:{count}"
+    db.execute("""INSERT INTO telegram_state(key,value) VALUES ('adaptive_training_state',?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (state,))
 
 
 def adaptive_direction_gate(db, phase, direction):
-    """Pause a weak signal bucket using settled bot forecasts; never auto-reverse."""
-    rows = db.execute("""SELECT actual_direction
+    """Pause weak recent phase or direction buckets; never auto-reverse."""
+    phase_rows = db.execute("""SELECT predicted_direction, actual_direction
         FROM kalshi_prediction_feedback
-        WHERE status='evaluated' AND source='bot_forecast'
-          AND phase=? AND predicted_direction=?
-        ORDER BY evaluated_at DESC LIMIT 12""",
-        (phase, direction)).fetchall()
-    if len(rows) < 8:
-        return True
-    accuracy = sum(actual == direction for (actual,) in rows) / len(rows)
-    if accuracy < 0.55:
-        log.info("Adaptive filter paused %s %s: %d/%d recent forecasts matched",
-                 phase, direction, sum(actual == direction for (actual,) in rows),
-                 len(rows))
-        return False
+        WHERE status='evaluated' AND source='bot_forecast' AND phase=?
+        ORDER BY evaluated_at DESC LIMIT 12""", (phase,)).fetchall()
+    if len(phase_rows) >= 4:
+        phase_hits = sum(predicted == actual for predicted, actual in phase_rows)
+        phase_accuracy = phase_hits / len(phase_rows)
+        if phase_accuracy < 0.55:
+            log.info("Adaptive filter paused %s: %d/%d recent forecasts matched",
+                     phase, phase_hits, len(phase_rows))
+            return False
+    direction_rows = [(predicted, actual) for predicted, actual in phase_rows
+                      if predicted == direction][:8]
+    if len(direction_rows) >= 4:
+        hits = sum(actual == direction for _, actual in direction_rows)
+        accuracy = hits / len(direction_rows)
+        if accuracy < 0.55:
+            log.info("Adaptive filter paused %s %s: %d/%d recent forecasts matched",
+                     phase, direction, hits, len(direction_rows))
+            return False
     return True
 
 def rafa_candle_context(db, ticker, phase, now):
@@ -944,13 +961,33 @@ def signal(db, m, now, phase, kraken_direction=None):
     close_at = ts(m.get("close_time"))
     if close_at is None or close_at <= now:
         return
-    if not kraken_trend_5m(now):
+    five_min_direction = kraken_trend_5m(now)
+    if five_min_direction not in ("UP", "DOWN") or kraken_direction not in ("UP", "DOWN"):
+        log.info("Skipping %s %s: Kraken trend is unavailable", ticker, phase)
+        return
+    if five_min_direction != kraken_direction:
+        log.info("Skipping %s %s: one-minute and five-minute Kraken trends disagree", ticker, phase)
         return
     projection = kraken_close_projection(now, close_at-now)
     if projection is None:
         return
     start, projected = projection
     direction = "UP" if projected > start else "DOWN"
+    if direction != five_min_direction:
+        log.info("Skipping %s %s: close projection conflicts with five-minute direction", ticker, phase)
+        return
+    if not adaptive_direction_gate(db, phase, direction):
+        log.info("Skipping %s %s: recent outcomes paused this phase/direction", ticker, phase)
+        return
+    prior_quote = db.execute("""SELECT yes_mid FROM kalshi_only_samples
+        WHERE ticker=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 1""",
+        (ticker, now-60)).fetchone()
+    prior_mid = dec(prior_quote[0]) if prior_quote else None
+    kalshi_change = float(mid-prior_mid) if prior_mid is not None else 0.0
+    model_features = make_model_features(phase, mid, kalshi_change, close_at-now)
+    if not adaptive_model_allows(db, model_features, direction):
+        log.info("Skipping %s %s: validated BTC model disagrees", ticker, phase)
+        return
     first_projection = kraken_nearest_level_projection(now, direction, projection)
     if first_projection is None or first_projection[1] == start:
         return
@@ -958,7 +995,6 @@ def signal(db, m, now, phase, kraken_direction=None):
     bias, bias_evidence = target_close_bias(now, close_at-now, start, first_target, projected, kraken_samples)
     db.execute("""CREATE TABLE IF NOT EXISTS rafa_close_estimates
         (id TEXT PRIMARY KEY, estimated TEXT, absolute_error TEXT)""")
-    change = Decimal("0")
     confirmation = "Kraken BTC/USD"
     phase_label = "PRIMEROS 5 MIN" if phase == "EARLY_5M" else "ÚLTIMOS 5 MIN"
     confidence = closing_confidence(db, ticker, phase, direction, now, close_at-now, start, projected)
@@ -971,13 +1007,14 @@ def signal(db, m, now, phase, kraken_direction=None):
             VALUES (?,?,?,?,?,?)""",
             (ticker, phase, now, direction, BOT_VERSION, RULES_SNAPSHOT))
         db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
-            (id,ticker,phase,predicted_direction,issued_at,close_at,start_price,target_price,status,source,bot_version,rules_snapshot)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (f"kraken-primary:{ticker}:{phase}",ticker,phase,direction,now,close_at,str(start),str(first_target),"pending","bot_forecast",BOT_VERSION,"Kraken BTC/USD separate first target and close estimate"))
+            (id,ticker,phase,predicted_direction,issued_at,close_at,start_price,target_price,status,source,bot_version,rules_snapshot,model_features)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (f"kraken-primary:{ticker}:{phase}",ticker,phase,direction,now,close_at,str(start),str(first_target),"pending","bot_forecast",BOT_VERSION,"Kraken BTC/USD separate first target and close estimate",
+             json.dumps(model_features, separators=(",", ":")) if model_features is not None else None))
         db.execute("INSERT OR IGNORE INTO rafa_close_estimates (id,estimated) VALUES (?,?)",
                    (f"kraken-primary:{ticker}:{phase}",str(projected)))
         try:
-            shadow_record(db, ticker, phase, now, direction, q, change, volume, kraken_direction)
+            shadow_record(db, ticker, phase, now, direction, q, Decimal(str(kalshi_change)), volume, kraken_direction)
         except Exception:
             log.exception("Rafa shadow recording failed")
         log.info("Kalshi %s forecast: %s %s; Kraken=%s (%s)", phase, ticker, direction, kraken_direction, confirmation)
