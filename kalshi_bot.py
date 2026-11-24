@@ -20,6 +20,16 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
 DELAY = 120
 MIN_REMAINING = max(300, int(os.getenv("MIN_REMAINING_SECONDS", "300")))
+BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-sync-1")
+PANEL_URL = os.getenv("RAFA_PANEL_URL", "").rstrip("/")
+PANEL_SECRET = os.getenv("RAFA_PANEL_SECRET", "")
+PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
+RULES_SNAPSHOT = json.dumps({
+    "series": SERIES, "scan_seconds": SCAN_SECONDS, "observe_seconds": 60,
+    "minimum_elapsed_seconds": DELAY, "minimum_remaining_seconds": MIN_REMAINING,
+    "signal_rule": "direction of observed Kalshi YES midpoint change after 60 seconds",
+    "automatic_orders": False,
+}, separators=(",", ":"), sort_keys=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-only")
 http = requests.Session()
@@ -214,6 +224,10 @@ def db_open():
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_only_alerts
                (ticker TEXT, phase TEXT, sent_at REAL, direction TEXT,
                 PRIMARY KEY(ticker,phase))""")
+    alert_columns = {row[1] for row in db.execute("PRAGMA table_info(kalshi_only_alerts)")}
+    for column in ("bot_version", "rules_snapshot"):
+        if column not in alert_columns:
+            db.execute(f"ALTER TABLE kalshi_only_alerts ADD COLUMN {column} TEXT")
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_only_results
                (ticker TEXT PRIMARY KEY, result TEXT, observed_at REAL)""")
     # Durable forecast feedback: keep reported corrections and score each
@@ -235,7 +249,9 @@ def db_open():
             ("high_after_signal", "TEXT"),
             ("low_after_signal", "TEXT"),
             ("target_reached", "INTEGER"),
-            ("model_features", "TEXT")):
+            ("model_features", "TEXT"),
+            ("bot_version", "TEXT"),
+            ("rules_snapshot", "TEXT")):
         if column not in feedback_columns:
             db.execute(f"ALTER TABLE kalshi_prediction_feedback ADD COLUMN {column} {declaration}")
     db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
@@ -585,8 +601,10 @@ def signal(db, m, now, close_at, open_at):
     )
     if notify(message):
         alerted_tickers.add(ticker)
-        db.execute("INSERT OR IGNORE INTO kalshi_only_alerts VALUES (?,?,?,?)",
-                   (ticker, "OPEN", now, direction))
+        db.execute("""INSERT OR IGNORE INTO kalshi_only_alerts
+            (ticker,phase,sent_at,direction,bot_version,rules_snapshot)
+            VALUES (?,?,?,?,?,?)""",
+            (ticker, "OPEN", now, direction, BOT_VERSION, RULES_SNAPSHOT))
         log.info("Kalshi-only OPEN forecast: %s %s", ticker, direction)
 
 def evaluate_btc_forecasts(db, now):
@@ -720,12 +738,143 @@ def check_results(db, now):
         log.info("Opening-minute Kalshi midpoint benchmark: n=%d Brier=%.4f; "
                  "not a Rafa probability forecast", len(scored), brier)
 
+
+def _dashboard_time(value):
+    return datetime.fromtimestamp(float(value), timezone.utc).isoformat() if value else None
+
+def dashboard_snapshot(db, now):
+    signals = []
+    alerts = db.execute("""SELECT ticker,phase,sent_at,direction,bot_version,rules_snapshot
+                           FROM kalshi_only_alerts ORDER BY sent_at DESC LIMIT 2000""").fetchall()
+    for ticker, phase, sent_at, direction, version, rules in alerts:
+        samples = db.execute("""SELECT observed_at,yes_mid FROM kalshi_only_samples
+                                WHERE ticker=? ORDER BY observed_at ASC""", (ticker,)).fetchall()
+        prior = next(((float(t), dec(price)) for t, price in samples
+                      if float(t) <= float(sent_at) - 60 and dec(price) is not None), None)
+        at_signal = next(((float(t), dec(price)) for t, price in reversed(samples)
+                          if float(t) <= float(sent_at) + 1 and dec(price) is not None), None)
+        outcome = db.execute("""SELECT result,close_time FROM kalshi_15m_outcomes
+                                WHERE ticker=? ORDER BY close_time DESC LIMIT 1""", (ticker,)).fetchone()
+        separate_result = db.execute("SELECT result FROM kalshi_only_results WHERE ticker=?", (ticker,)).fetchone()
+        official = (outcome[0] if outcome else separate_result[0] if separate_result else "")
+        close_at = float(outcome[1]) if outcome and outcome[1] else None
+        observed = None
+        actual = ""
+        status = "pending"
+        if close_at is not None and prior:
+            close_sample = next(((float(t), dec(price)) for t, price in reversed(samples)
+                                 if float(t) <= close_at and float(t) >= close_at - 90
+                                 and dec(price) is not None), None)
+            if close_sample:
+                observed = close_sample[1]
+                if observed > prior[1]:
+                    actual = "UP"
+                elif observed < prior[1]:
+                    actual = "DOWN"
+                else:
+                    actual = "FLAT"
+                status = "evaluated"
+        initial = prior[1] if prior else None
+        midpoint = at_signal[1] if at_signal else None
+        target = (midpoint + (midpoint - initial)) if midpoint is not None and initial is not None else None
+        try:
+            rule_text = json.dumps(json.loads(rules), ensure_ascii=False, sort_keys=True) if rules else ""
+        except (TypeError, ValueError):
+            rule_text = rules or ""
+        signals.append({
+            "id": f"kalshi:{ticker}:{phase}", "time": _dashboard_time(sent_at),
+            "contract": ticker, "direction": direction, "basis": "Kalshi",
+            "priceUnit": "Kalshi YES", "precision": 3,
+            "start": str(initial) if initial is not None else "",
+            "target": str(target) if target is not None else "",
+            "observed": str(observed) if observed is not None else "",
+            "actual": actual, "official": str(official or "").upper(),
+            "version": version or "No registrada en el historial",
+            "rules": rule_text or "Reglas no guardadas en este registro",
+            "tag": "Momentum de la cotización YES; resultado oficial conservado por separado.",
+            "status": status, "phase": phase, "origin": "bot",
+        })
+
+    feedback = db.execute("""SELECT id,ticker,phase,predicted_direction,actual_direction,
+            issued_at,start_price,target_price,actual_price,evaluated_at,status,source,note,
+            high_after_signal,low_after_signal,target_reached,bot_version,rules_snapshot
+            FROM kalshi_prediction_feedback ORDER BY COALESCE(issued_at,evaluated_at,rowid) DESC
+            LIMIT 2000""").fetchall()
+    for row in feedback:
+        (record_id,ticker,phase,predicted,actual_direction,issued_at,start_price,
+         target_price,actual_price,evaluated_at,status,source,note,high,low,reached,
+         version,rules) = row
+        evaluated = status == "evaluated"
+        signals.append({
+            "id": f"btc-feedback:{record_id}", "time": _dashboard_time(issued_at or evaluated_at),
+            "contract": ticker or "BTC/USD · revisión", "direction": predicted or "",
+            "basis": "BTC/USD" if source == "bot_forecast" else "Reporte manual",
+            "priceUnit": "BTC/USD", "precision": 2,
+            "start": start_price or "", "target": target_price or "",
+            "observed": actual_price or "",
+            "actual": actual_direction if evaluated and actual_direction in ("UP","DOWN","FLAT") else "",
+            "reportedActual": actual_direction if status == "reported" else "",
+            "official": "", "version": version or "No registrada en el historial",
+            "rules": rules or (f"Fuente: {source}" if source else "Reglas no registradas"),
+            "tag": " · ".join(part for part in [
+                note or "",
+                f"Máx. {high} / mín. {low}" if high or low else "",
+                "Objetivo tocado" if reached == 1 else "Objetivo no observado" if reached == 0 else "",
+            ] if part),
+            "status": status, "phase": phase or "", "origin": "bot",
+        })
+
+    versions = [{
+        "id": f"runtime:{BOT_VERSION}", "name": BOT_VERSION,
+        "date": _dashboard_time(now), "rules": RULES_SNAPSHOT,
+        "note": "Versión y reglas observadas por el proceso de Rafa al sincronizar.",
+        "origin": "bot",
+    }]
+    model = db.execute("SELECT trained_at,samples,validation_score FROM adaptive_models WHERE name='btc_direction'").fetchone()
+    if model:
+        versions.append({
+            "id": "adaptive-model:btc_direction", "name": "Modelo adaptativo BTC",
+            "date": _dashboard_time(model[0]),
+            "rules": f"Muestras: {model[1]} · validación balanceada: {float(model[2]):.3f}",
+            "note": "Metadatos del modelo entrenado en el bot.", "origin": "bot",
+        })
+    signals.sort(key=lambda item: item.get("time") or "", reverse=True)
+    return {"source": "rafa-bot", "generated_at": _dashboard_time(now),
+            "signals": signals, "versions": versions}
+
+def sync_dashboard(db, now, force=False):
+    if not PANEL_URL or not PANEL_SECRET or not PANEL_SITES_AUTH:
+        return
+    previous = db.execute("SELECT value FROM telegram_state WHERE key='dashboard_sync_attempt'").fetchone()
+    if not force and previous and now - float(previous[0]) < 60:
+        return
+    db.execute("""INSERT INTO telegram_state(key,value) VALUES ('dashboard_sync_attempt',?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (str(now),))
+    db.commit()
+    try:
+        payload = dashboard_snapshot(db, now)
+        response = http.post(
+            PANEL_URL + "/api/sync", json=payload,
+            headers={
+                "Authorization": "Bearer " + PANEL_SECRET,
+                "OAI-Sites-Authorization": PANEL_SITES_AUTH,
+            },
+            timeout=15,
+        )
+        if response.status_code < 200 or response.status_code >= 300:
+            log.warning("Prediction panel sync returned HTTP %s", response.status_code)
+            return
+        log.info("Prediction panel sync completed: %d records", len(payload["signals"]))
+    except (requests.RequestException, ValueError, sqlite3.Error):
+        log.exception("Prediction panel sync failed")
+
 def scan():
     payload = get_json("/markets", {"series_ticker": SERIES, "status": "open", "limit": 100})
     now = time.time()
     if payload is None:
         with db_open() as db:
             record_kalshi_15m_chart(db, now)
+            sync_dashboard(db, now)
         return
     with db_open() as db:
         record_kalshi_15m_chart(db, now)
@@ -754,6 +903,7 @@ def scan():
         maybe_train_adaptive_model(db, now)
         db.execute("DELETE FROM kalshi_only_samples WHERE observed_at < ?", (now - 48 * 3600,))
         db.commit()
+        sync_dashboard(db, now)
 
 def telegram_test_once():
     """Send one diagnostic message, without fabricating a market signal."""
