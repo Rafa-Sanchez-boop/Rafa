@@ -217,6 +217,10 @@ def db_open():
     db = sqlite3.connect(DB_PATH, timeout=30)
     db.execute("""CREATE TABLE IF NOT EXISTS telegram_state
                (key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
+    # Telegram permits outbound messages only to chats that have opened the bot.
+    # Store private chat IDs only; never store names, usernames, or question text.
+    db.execute("""CREATE TABLE IF NOT EXISTS telegram_subscribers
+               (chat_id TEXT PRIMARY KEY)""")
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_only_samples
                (ticker TEXT, observed_at REAL, yes_mid TEXT,
                 PRIMARY KEY(ticker, observed_at))""")
@@ -302,18 +306,37 @@ def get_json(path, params=None):
             time.sleep(2 ** attempt)
     return None
 
-def notify(msg):
-    if not TOKEN or not CHAT_ID:
-        log.warning("Telegram not configured: %s", msg)
+def notify(msg, db=None, broadcast=False):
+    if not TOKEN:
+        log.warning("Telegram not configured")
         return False
-    try:
-        r = http.post("https://api.telegram.org/bot" + TOKEN + "/sendMessage",
-                      json={"chat_id": CHAT_ID, "text": msg}, timeout=15)
-        r.raise_for_status()
-        return bool(r.json().get("ok"))
-    except (requests.RequestException, ValueError):
-        log.exception("Telegram send failed")
+    recipients = {CHAT_ID} if CHAT_ID else set()
+    if broadcast and db is not None:
+        recipients.update(row[0] for row in db.execute(
+            "SELECT chat_id FROM telegram_subscribers").fetchall())
+    recipients.discard("")
+    if not recipients:
+        log.warning("Telegram has no subscribed recipients")
         return False
+
+    delivered = False
+    for recipient in recipients:
+        try:
+            response = http.post(
+                "https://api.telegram.org/bot" + TOKEN + "/sendMessage",
+                json={"chat_id": recipient, "text": msg[:4000]}, timeout=15)
+            if response.ok and response.json().get("ok"):
+                delivered = True
+            elif broadcast and db is not None and response.status_code in (400, 403):
+                # A user may have blocked the bot or deleted their Telegram account.
+                db.execute("DELETE FROM telegram_subscribers WHERE chat_id=?",
+                           (recipient,))
+                log.info("Removed an unreachable Telegram subscriber")
+            else:
+                log.warning("Telegram delivery failed with HTTP %s", response.status_code)
+        except (requests.RequestException, ValueError):
+            log.exception("Telegram send failed")
+    return delivered
 
 def quote(m):
     bid, ask = dec(m.get("yes_bid_dollars")), dec(m.get("yes_ask_dollars"))
@@ -384,7 +407,7 @@ def record_kalshi_15m_chart(db, now):
         f"Racha actual: {arrow} × {streak}\n"
         f"Último cierre {close_label}: {result.upper()} · {ticker}"
     )
-    if notify(message):
+    if notify(message, db=db, broadcast=True):
         db.execute("INSERT OR IGNORE INTO kalshi_15m_chart_sent VALUES (?)",
                    (close_time,))
 
@@ -613,7 +636,7 @@ def signal(db, m, now, phase):
         + f"hacia ${projected:.3f}.\n"
         + "🔄 Después la cotización puede cambiar de rumbo."
     )
-    if notify(message):
+    if notify(message, db=db, broadcast=True):
         alerted_phases.add(alert_key)
         db.execute("""INSERT OR IGNORE INTO kalshi_only_alerts
             (ticker,phase,sent_at,direction,bot_version,rules_snapshot)
@@ -700,7 +723,8 @@ def evaluate_btc_forecasts(db, now):
                    f"📍 Cierre aproximado: {actual} en USD {actual_price:,.2f}\n"
                    + reversal_line
                    + ("✅ Dirección al cierre coincidió." if correct else
-                      "❌ Dirección al cierre falló; datos guardados."))
+                      "❌ Dirección al cierre falló; datos guardados."),
+                   db=db, broadcast=True)
         except (requests.RequestException, ValueError, KeyError, IndexError,
                 TypeError, StopIteration):
             log.exception("Could not evaluate BTC forecast for %s", ticker)
@@ -728,7 +752,8 @@ def check_results(db, now):
             notify(f"🧠 BTC — REVISIÓN DE PREDICCIÓN\n🧾 {ticker}\n"
                    f"🔮 Pronóstico Kalshi: {direction}\n"
                    f"🏁 Resultado oficial: {result.upper()}\n"
-                   f"{'✅ Coincidió' if correct else '❌ No coincidió'} con el resultado oficial.")
+                   f"{'✅ Coincidió' if correct else '❌ No coincidió'} con el resultado oficial.",
+                   db=db, broadcast=True)
 
     # Label every journaled opening quote with Kalshi's official settlement.
     # The market midpoint is a benchmark probability, not a bot forecast.
