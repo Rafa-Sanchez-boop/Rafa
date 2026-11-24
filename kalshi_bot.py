@@ -820,7 +820,6 @@ def closing_confidence(db, ticker, phase, direction, now, remaining, start, proj
 def forecast_display(ticker, phase_label, direction, confidence, start, target, projected,
                      bias_direction, bias_evidence):
     confidence_high = confidence is not None and confidence >= 90
-    signal_color = "🟢" if direction == "UP" else "🔴"
     confidence_marker = "🟢" if confidence_high else "🟡"
     projection = "cierre alcista" if direction == "UP" else "cierre bajista"
     if bias_direction == "UP":
@@ -838,7 +837,7 @@ def forecast_display(ticker, phase_label, direction, confidence, start, target, 
         evidence_line = "Momentum reciente: datos insuficientes."
     message = (
         "📊 BTC KALSHI | 15 MIN\n\n"
-        f"{signal_color} {direction_label(direction)}\n"
+        f"{direction_label(direction)}\n"
         + (f"📊 Confianza estimada: {confidence}%\n" if confidence is not None
            else "📊 Confianza estimada: reuniendo datos\n")
         + f"📈 Proyección: {projection} desde el precio de señal.\n"
