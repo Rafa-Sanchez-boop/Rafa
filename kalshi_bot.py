@@ -608,9 +608,9 @@ def signal(db, m, now, phase):
     movement = "subida" if direction == "UP" else "bajada"
     phase_label = "PRIMEROS 5 MIN" if phase == "EARLY_5M" else "ÚLTIMOS 5 MIN"
     message = (
-        ("🔺 UP" if direction == "UP" else "🔻 DOWN") + f" · {phase_label}\\n"
+        ("🔺 UP" if direction == "UP" else "🔻 DOWN") + f" · {phase_label}\n"
         + f"📈 Posible {movement} de Kalshi YES desde ${mid:.3f} "
-        + f"hacia ${projected:.3f}.\\n"
+        + f"hacia ${projected:.3f}.\n"
         + "🔄 Después la cotización puede cambiar de rumbo."
     )
     if notify(message):
