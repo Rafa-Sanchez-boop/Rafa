@@ -21,6 +21,7 @@ SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
 OBSERVE_SECONDS = max(60, int(os.getenv("OBSERVE_SECONDS", "60")))
 EARLY_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("EARLY_WINDOW_SECONDS", "300")))
 LATE_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("LATE_WINDOW_SECONDS", "300")))
+COMBO_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("COMBO_WINDOW_SECONDS", "360")))
 MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
 BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-v4.6-close-guards")
 PANEL_URL = os.getenv("RAFA_PANEL_URL", "").rstrip("/")
@@ -31,8 +32,9 @@ RULES_SNAPSHOT = json.dumps({
     "observe_seconds": OBSERVE_SECONDS,
     "early_window_seconds": EARLY_WINDOW_SECONDS,
     "late_window_seconds": LATE_WINDOW_SECONDS,
+    "combo_window_seconds": COMBO_WINDOW_SECONDS,
     "minimum_volume_24h": str(MIN_VOLUME),
-    "signal_rule": "Kalshi YES midpoint direction after the observation period; first and last contract windows; Kraken BTC/USD confirmation informational only",
+    "signal_rule": "Kalshi YES midpoint direction after the observation period; first and last contract windows plus a separate combo alert; Kraken BTC/USD confirmation informational only",
     "automatic_orders": False,
 }, separators=(",", ":"), sort_keys=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -466,7 +468,7 @@ def make_model_features(phase, mid, kalshi_change, remaining):
         return None
     btc_return = float((snapshot[2] - snapshot[1]) / snapshot[1])
     return [
-        1.0 if phase == "LAST_5M" else 0.0,
+        1.0 if phase in ("LAST_5M", "COMBO_6M") else 0.0,
         float(mid),
         float(kalshi_change) * 10.0,
         btc_return * 1000.0,
@@ -908,7 +910,9 @@ def signal(db, m, now, phase, kraken_direction=None):
     db.execute("""CREATE TABLE IF NOT EXISTS rafa_close_estimates
         (id TEXT PRIMARY KEY, estimated TEXT, absolute_error TEXT)""")
     confirmation = "Kraken BTC/USD"
-    phase_label = "PRIMEROS 5 MIN" if phase == "EARLY_5M" else "ÚLTIMOS 5 MIN"
+    phase_label = ("PRIMEROS 5 MIN" if phase == "EARLY_5M" else
+                   "COMBO · 6 MIN RESTANTES" if phase == "COMBO_6M" else
+                   "ÚLTIMOS 5 MIN")
     confidence = closing_confidence(db, ticker, phase, direction, now, close_at-now, start, projected)
     message, photo = forecast_display(ticker, phase_label, direction, confidence,
                                       start, first_target, projected, bias, bias_evidence)
@@ -1240,6 +1244,9 @@ def scan():
                 phase = "LAST_5M"
             if phase:
                 signal(db, m, now, phase, kraken_direction)
+            # Extra combo alert during the minute before the unchanged final-five-minute signal.
+            if LATE_WINDOW_SECONDS < remaining <= COMBO_WINDOW_SECONDS:
+                signal(db, m, now, "COMBO_6M", kraken_direction)
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
