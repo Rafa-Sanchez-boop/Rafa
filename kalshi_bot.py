@@ -320,7 +320,7 @@ def get_json(path, params=None):
             time.sleep(2 ** attempt)
     return None
 
-def notify(msg, db=None, broadcast=False):
+def notify(msg, db=None, broadcast=False, photo=None):
     if not TOKEN:
         log.warning("Telegram not configured")
         return False
@@ -338,9 +338,18 @@ def notify(msg, db=None, broadcast=False):
     delivered = False
     for recipient in recipients:
         try:
-            response = http.post(
-                "https://api.telegram.org/bot" + TOKEN + "/sendMessage",
-                json={"chat_id": recipient, "text": msg[:4000]}, timeout=15)
+            response = None
+            if photo is not None:
+                response = http.post(
+                    "https://api.telegram.org/bot" + TOKEN + "/sendPhoto",
+                    data={"chat_id": recipient, "caption": msg[:1024]},
+                    files={"photo": ("rafa_signal.png", photo, "image/png")}, timeout=20)
+                if response.status_code in (400, 413, 415):
+                    response = None
+            if response is None:
+                response = http.post(
+                    "https://api.telegram.org/bot" + TOKEN + "/sendMessage",
+                    json={"chat_id": recipient, "text": msg[:4000]}, timeout=15)
             if response.ok and response.json().get("ok"):
                 delivered = True
             elif broadcast and db is not None and response.status_code in (400, 403):
@@ -764,6 +773,109 @@ def forecast_history_line(db, phase, direction):
     return f"📊 Acierto histórico: {correct / count:.0%} (n={count})"
 
 
+def closing_confidence(db, ticker, phase, direction, now, remaining, start, projected):
+    """Per-forecast confidence estimate from comparable settled projection errors.
+    Display only; not a calibrated probability or an additional prediction gate."""
+    try:
+        if start <= 0 or projected <= 0 or projected == start:
+            return None
+        rows = db.execute("""SELECT f.ticker, f.start_price, f.actual_price, e.estimated
+            FROM kalshi_prediction_feedback f JOIN rafa_close_estimates e ON e.id=f.id
+            WHERE f.status='evaluated' AND f.source='bot_forecast'
+              AND f.phase=? AND f.predicted_direction=?
+              AND f.evaluated_at<? AND f.close_at<=? AND f.ticker<>?
+              AND f.bot_version=? AND f.rules_snapshot=?
+              AND ABS((f.close_at-f.issued_at)-?)<=120
+            ORDER BY f.evaluated_at DESC LIMIT 300""",
+            (phase, direction, now, now, ticker, BOT_VERSION,
+             "Kraken BTC/USD separate first target and close estimate", remaining)).fetchall()
+        move = float((projected-start)/start)
+        seen = set()
+        successes = total = 0
+        for prior_ticker, old_start, actual, estimate in rows:
+            if not prior_ticker or prior_ticker in seen:
+                continue
+            base, observed, expected = dec(old_start), dec(actual), dec(estimate)
+            if any(v is None or not v.is_finite() or v <= 0 for v in (base, observed, expected)):
+                continue
+            error = float((observed-expected)/base)
+            if not math.isfinite(error):
+                continue
+            seen.add(prior_ticker)
+            total += 1
+            successes += int(move+error > 0 if direction == "UP" else move+error < 0)
+        if total < 30:
+            return None
+        return min(99, int(100*(successes+1)/(total+2)))
+    except (sqlite3.Error, ArithmeticError, ValueError, TypeError):
+        log.exception("Rafa display confidence unavailable")
+        return None
+
+
+def forecast_display(ticker, phase_label, direction, confidence, start, target, projected):
+    high = confidence is not None and confidence >= 80
+    marker = ("🟢" if direction == "UP" else "🔴") if high else "🟡"
+    projection = ("cierre alcista" if direction == "UP" else "cierre bajista") if high else "Dirección de cierre incierta"
+    message = "📊 BTC KALSHI | 15 MIN\n\n"
+    if high:
+        message += (
+            f"{direction_label(direction)}\n{confidence}%\nConfianza estimada del modelo\n"
+            + "■"*(confidence//10) + "□"*(10-confidence//10) + "\n\n"
+            + f"📈 Proyección: {projection} desde el precio de señal.\n"
+            + f"BTC/USD: USD {start:,.2f} → USD {target:,.2f} (primer objetivo)\n"
+            + f"Cierre estimado: USD {projected:,.2f}\n"
+        )
+    else:
+        message += "🟡 WAIT\nDirección de cierre incierta.\n"
+    message += (
+        "⏱️ Temporalidad: 15 minutos.\n"
+        f"🎯 Nivel de confianza: {marker} {'ALTO' if high else 'INCIERTO'}\n"
+        f"{phase_label} · {ticker}\n\n"
+        "⚠️ Predicción estimada; no garantiza el resultado."
+    )
+    photo = None
+    try:
+        from io import BytesIO
+        from PIL import Image, ImageDraw, ImageFont
+        bg, fg, muted = "#101827", "#f8fafc", "#cbd5e1"
+        accent = ("#22c55e" if direction == "UP" else "#f87171") if high else "#facc15"
+        canvas = Image.new("RGB", (900, 920), bg)
+        draw = ImageDraw.Draw(canvas)
+        def text(x, y, value, size, color=fg):
+            draw.text((x, y), value, font=ImageFont.load_default(size=size), fill=color, anchor="mt")
+        draw.rounded_rectangle((20, 20, 880, 900), radius=30, outline="#334155", width=3)
+        text(450, 60, "BTC KALSHI | 15 MIN", 47)
+        draw.line((65, 135, 835, 135), fill="#334155", width=3)
+        label = direction if high else "WAIT"
+        draw.ellipse((235, 191, 275, 231), fill=accent)
+        text(450, 160, label, 92, accent)
+        if high:
+            x, y = 650, 211
+            dy = -1 if direction == "UP" else 1
+            draw.line((x, y-30, x, y+30), fill=accent, width=9)
+            tip = y+dy*30
+            draw.line((x-21, tip-dy*21, x, tip, x+21, tip-dy*21), fill=accent, width=9)
+            text(450, 260, f"{confidence}%", 132, accent)
+            text(450, 414, "Confianza estimada del modelo", 35, muted)
+            draw.rounded_rectangle((85, 475, 815, 507), radius=16, fill="#334155")
+            draw.rounded_rectangle((85, 475, 85+int(730*confidence/100), 507), radius=16, fill=accent)
+            text(450, 555, f"Proyección: {projection}", 42)
+        else:
+            text(450, 315, projection, 46, accent)
+        text(450, 625, "Temporalidad: 15 minutos", 38)
+        draw.ellipse((122, 700, 150, 728), fill=accent)
+        text(485, 689, "Nivel de confianza: " + ("ALTO" if high else "INCIERTO"), 36, accent)
+        text(450, 758, phase_label, 29, muted)
+        draw.line((65, 805, 835, 805), fill="#334155", width=2)
+        text(450, 832, "Predicción estimada; no garantiza el resultado.", 29, muted)
+        buffer = BytesIO()
+        canvas.save(buffer, format="PNG")
+        photo = buffer.getvalue()
+    except Exception:
+        log.exception("Rafa signal card unavailable; using text")
+    return message, photo
+
+
 def signal(db, m, now, phase, kraken_direction=None):
     """Send a Kraken BTC/USD forecast; keep Kalshi settlement separate."""
     ticker = m["ticker"]
@@ -806,15 +918,10 @@ def signal(db, m, now, phase, kraken_direction=None):
     change = Decimal("0")
     confirmation = "Kraken BTC/USD"
     phase_label = "PRIMEROS 5 MIN" if phase == "EARLY_5M" else "ÚLTIMOS 5 MIN"
-    history_line = forecast_history_line(db, phase, direction)
-    message = (
-        direction_label(direction) + f" · {phase_label}\\n"
-        + f"{history_line}\\n"
-        + f"📈 USD {start:,.2f} → USD {first_target:,.2f}\\n"
-        + "🔮 Proyección experimental · no garantiza el resultado.\\n"
-        + f"🧾 {ticker}"
-    )
-    if notify(message, db=db, broadcast=True):
+    confidence = closing_confidence(db, ticker, phase, direction, now, close_at-now, start, projected)
+    message, photo = forecast_display(ticker, phase_label, direction, confidence,
+                                      start, first_target, projected)
+    if notify(message, db=db, broadcast=True, photo=photo):
         alerted_phases.add(alert_key)
         db.execute("""INSERT OR IGNORE INTO kalshi_only_alerts
             (ticker,phase,sent_at,direction,bot_version,rules_snapshot)
