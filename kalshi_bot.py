@@ -604,6 +604,37 @@ def adaptive_direction_gate(db, phase, direction):
         return False
     return True
 
+def rafa_candle_context(db, ticker, phase, now):
+    # Closed Kraken OHLC candles only; never use the unfinished candle.
+    db.execute("""CREATE TABLE IF NOT EXISTS rafa_candle_context
+        (ticker TEXT, phase TEXT, issued REAL, features TEXT,
+         PRIMARY KEY(ticker,phase))""")
+    features = {}
+    for interval in (1, 5, 15):
+        try:
+            payload = requests.get("https://api.kraken.com/0/public/OHLC",
+                params={"pair":"XBTUSD","interval":interval}, timeout=4).json()
+            result = payload.get("result", {})
+            candles = next((v for k,v in result.items() if k != "last"), [])
+            closed = [x for x in candles if float(x[0])+interval*60 <= now]
+            if len(closed) < 6:
+                continue
+            recent = closed[-6:]
+            first, last = float(recent[0][4]), float(recent[-1][4])
+            if first <= 0 or last <= 0:
+                continue
+            features[str(interval)] = {
+                "return": last/first-1,
+                "last_body": (last-float(recent[-1][1]))/last,
+                "range": (max(float(x[2]) for x in recent)-min(float(x[3]) for x in recent))/last,
+                "volume": float(recent[-1][6]),
+                "closed_at": float(recent[-1][0])+interval*60}
+        except Exception:
+            log.warning("Rafa candle data unavailable for %s minutes", interval)
+    db.execute("INSERT OR IGNORE INTO rafa_candle_context VALUES (?,?,?,?)",
+               (ticker,phase,now,json.dumps(features)))
+    log.info("Rafa candle context %s %s intervals=%s",ticker,phase,list(features))
+
 def shadow_record(db, ticker, phase, now, direction, q, change, volume, kraken_direction):
     hour = time.gmtime(now).tm_hour
     session = "Asia" if hour < 7 else "Europe" if hour < 13 else "US" if hour < 22 else "Asia"
@@ -625,6 +656,7 @@ def shadow_record(db, ticker, phase, now, direction, q, change, volume, kraken_d
         (ticker,phase,now,session,direction,float(q[2]),float(change),float(q[1]-q[0]),
          float(volume),kraken_direction,btc,volatility,candidate))
     log.info("Rafa shadow recorded %s %s session=%s candidate=%s",ticker,phase,session,candidate)
+    rafa_candle_context(db, ticker, phase, now)
 
 def shadow_milestones(db, now):
     db.execute("""CREATE TABLE IF NOT EXISTS rafa_shadow_milestones
@@ -632,9 +664,9 @@ def shadow_milestones(db, now):
     for phase in ("EARLY_5M", "LAST_5M"):
         rows=db.execute("""SELECT s.direction,s.candidate,r.result FROM rafa_shadow s
             JOIN kalshi_only_results r ON r.ticker=s.ticker
-            WHERE s.phase=? AND r.observed_at<? AND r.observed_at>=s.issued
+            WHERE (s.phase=? OR (s.phase='LATE_5M' AND ?='LAST_5M')) AND r.observed_at<? AND r.observed_at>=s.issued
             AND r.result IN ('yes','no') ORDER BY r.observed_at,s.ticker""",
-            (phase,now)).fetchall()
+            (phase,phase,now)).fetchall()
         for batch in range(len(rows)//50):
             if db.execute("SELECT 1 FROM rafa_shadow_milestones WHERE phase=? AND batch=?",
                           (phase,batch)).fetchone():
@@ -1037,7 +1069,7 @@ def scan():
             if OBSERVE_SECONDS <= elapsed <= EARLY_WINDOW_SECONDS:
                 phase = "EARLY_5M"
             elif 0 < remaining <= LATE_WINDOW_SECONDS:
-                phase = "LATE_5M"
+                phase = "LAST_5M"
             if phase:
                 signal(db, m, now, phase, kraken_direction)
         # Check completed markets infrequently to reduce requests.
