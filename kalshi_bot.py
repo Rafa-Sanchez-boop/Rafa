@@ -749,6 +749,22 @@ def direction_label(direction):
     return {"UP": "🟢 UP ↑", "DOWN": "🔴 DOWN ↓"}.get(direction, direction)
 
 
+def forecast_history_line(db, phase, direction):
+    """Show comparable settled forecast performance without presenting it as probability."""
+    rows = db.execute("""SELECT predicted_direction=actual_direction
+        FROM kalshi_prediction_feedback
+        WHERE status='evaluated' AND source='bot_forecast'
+          AND phase=? AND predicted_direction=?
+          AND actual_direction IN ('UP','DOWN')
+        ORDER BY evaluated_at DESC LIMIT 100""", (phase, direction)).fetchall()
+    count = len(rows)
+    if count < 30:
+        return f"📊 Confianza del modelo: aún sin base suficiente ({count}/30 evaluaciones comparables)."
+    correct = sum(bool(row[0]) for row in rows)
+    return (f"📊 Acierto histórico comparable: {correct}/{count} "
+            f"({correct / count:.0%}); no es garantía para esta señal.")
+
+
 def signal(db, m, now, phase, kraken_direction=None):
     """Send a Kraken BTC/USD forecast; keep Kalshi settlement separate."""
     ticker = m["ticker"]
@@ -791,15 +807,18 @@ def signal(db, m, now, phase, kraken_direction=None):
     change = Decimal("0")
     confirmation = "Kraken BTC/USD"
     phase_label = "PRIMEROS 5 MIN" if phase == "EARLY_5M" else "ÚLTIMOS 5 MIN"
+    history_line = forecast_history_line(db, phase, direction)
     message = (
-        direction_label(direction) + f" · {phase_label}\n"
+        "🧠 PROYECCIÓN EXPERIMENTAL\n"
+        + direction_label(direction) + f" · {phase_label}\n"
+        + f"{history_line}\n"
         + f"🧾 {ticker}\n"
         + f"🌐 Kraken BTC/USD inicial: USD {start:,.2f}\n"
         + f"🎯 Primer objetivo: USD {first_target:,.2f}\n"
         + f"🔄 Posible giro en el objetivo: {bias_text}.\n"
         + f"📍 Cierre estimado por momentum: USD {projected:,.2f}\n"
         + "Kalshi: resultado oficial se evalúa por separado.\n"
-        + "Proyección experimental, no garantía."
+        + "⚠️ No garantiza el resultado."
     )
     if notify(message, db=db, broadcast=True):
         alerted_phases.add(alert_key)
