@@ -817,6 +817,65 @@ def closing_confidence(db, ticker, phase, direction, now, remaining, start, proj
         return None
 
 
+
+def calibrate_close_estimate(db, ticker, phase, now, remaining, start, projected):
+    """Apply a cautious, robust correction from comparable settled close forecasts."""
+    try:
+        if start <= 0 or projected <= 0 or projected == start or remaining <= 0:
+            return projected
+        rows = db.execute("""SELECT f.ticker, f.start_price, f.actual_price, e.estimated
+            FROM kalshi_prediction_feedback f
+            JOIN rafa_close_estimates e ON e.id=f.id
+            WHERE f.status='evaluated' AND f.source='bot_forecast'
+              AND f.phase=? AND f.predicted_direction=?
+              AND f.evaluated_at<? AND f.close_at<=? AND f.ticker<>?
+              AND f.bot_version=? AND f.rules_snapshot=?
+              AND ABS((f.close_at-f.issued_at)-?)<=120
+            ORDER BY f.evaluated_at DESC LIMIT 100""",
+            (phase, "UP" if projected > start else "DOWN", now, now, ticker,
+             BOT_VERSION,
+             "Kraken BTC/USD separate first target and close estimate",
+             remaining)).fetchall()
+        residuals = []
+        seen = set()
+        for old_ticker, old_start, actual, estimate in rows:
+            if not old_ticker or old_ticker in seen:
+                continue
+            base, observed, expected = dec(old_start), dec(actual), dec(estimate)
+            if any(value is None or value <= 0 for value in (base, observed, expected)):
+                continue
+            residual = (observed - expected) / base
+            if not residual.is_finite():
+                continue
+            seen.add(old_ticker)
+            residuals.append(residual)
+        if len(residuals) < 30:
+            log.info("Close calibration waiting for 30 comparable settled forecasts; currently %d",
+                     len(residuals))
+            return projected
+        residuals.sort()
+        middle = len(residuals) // 2
+        median_error = (residuals[middle] if len(residuals) % 2
+                        else (residuals[middle - 1] + residuals[middle]) / Decimal(2))
+        # Shrink the historical correction and cap it so old errors cannot reverse
+        # the live momentum direction or overwhelm the current forecast.
+        raw_move = projected - start
+        adjustment = median_error * start * Decimal(len(residuals)) / Decimal(len(residuals) + 30)
+        cap = min(abs(raw_move) * Decimal("0.75"), start * Decimal("0.001"))
+        adjustment = max(-cap, min(cap, adjustment))
+        calibrated = projected + adjustment
+        if raw_move > 0:
+            calibrated = max(start, calibrated)
+        else:
+            calibrated = min(start, calibrated)
+        log.info("Historical close calibration: n=%d median_error=%s adjustment=%s",
+                 len(residuals), median_error, adjustment)
+        return calibrated
+    except (sqlite3.Error, ArithmeticError, ValueError, TypeError):
+        log.exception("Historical close calibration unavailable; using live projection")
+        return projected
+
+
 def forecast_display(ticker, phase_label, direction, confidence, start, target, projected,
                      bias_direction, bias_evidence):
     confidence_high = confidence is not None and confidence >= 90
@@ -950,6 +1009,8 @@ def signal(db, m, now, phase, kraken_direction=None):
     if projection is None:
         return
     start, projected = projection
+    projected = calibrate_close_estimate(db, ticker, phase, now, close_at-now,
+                                         start, projected)
     direction = "UP" if projected > start else "DOWN"
     first_projection = kraken_nearest_level_projection(now, direction, projection)
     if first_projection is None or first_projection[1] == start:
