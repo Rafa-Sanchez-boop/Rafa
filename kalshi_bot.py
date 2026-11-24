@@ -713,7 +713,7 @@ def rafa_context(db, ticker, phase, now, direction, q, volume, kraken_direction)
     return f"📊 {confidence}; rango BTC 5m {volatility}; spread YES {q[1]-q[0]:.3f}; volumen 24h {volume}."
 
 def signal(db, m, now, phase, kraken_direction=None):
-    """Send one Kalshi-only forecast per contract window after real quote history."""
+    """Send a Kraken BTC/USD forecast; keep Kalshi settlement separate."""
     ticker = m["ticker"]
     alert_key = (ticker, phase)
     if alert_key in alerted_phases:
@@ -731,35 +731,26 @@ def signal(db, m, now, phase, kraken_direction=None):
         volume = dec(m.get("volume_24h"))
     if volume is None or volume < MIN_VOLUME:
         return
-    # Use a real Kalshi quote at least one observation window earlier.
-    # The early window uses its first sample; the close window uses the latest prior sample.
-    ordering = "ASC" if phase == "EARLY_5M" else "DESC"
-    row = db.execute(f"""SELECT yes_mid FROM kalshi_only_samples
-        WHERE ticker=? AND observed_at<=?
-        ORDER BY observed_at {ordering} LIMIT 1""",
-        (ticker, now - OBSERVE_SECONDS)).fetchone()
-    if not row:
-        log.info("Waiting for %ss of observed Kalshi quotes for %s (%s)",
-                 OBSERVE_SECONDS, ticker, phase)
+    close_at = ts(m.get("close_time"))
+    if close_at is None or close_at <= now:
         return
-    prior = dec(row[0])
-    if prior is None:
+    if not kraken_trend_5m(now):
         return
-    change = mid - prior
-    if change == 0:
+    projection = kraken_close_projection(now, close_at-now)
+    if projection is None:
         return
-    direction = "UP" if change > 0 else "DOWN"
-    projected = min(Decimal("0.99"), max(Decimal("0.01"), mid + change))
-    confirmation = ("coincide" if kraken_direction == direction else "diverge") if kraken_direction else "sin confirmación"
-    movement = "subida" if direction == "UP" else "bajada"
+    start, projected = projection
+    direction = "UP" if projected > start else "DOWN"
+    change = Decimal("0")
+    confirmation = "Kraken BTC/USD"
     phase_label = "PRIMEROS 5 MIN" if phase == "EARLY_5M" else "ÚLTIMOS 5 MIN"
     message = (
         ("🔺 UP" if direction == "UP" else "🔻 DOWN") + f" · {phase_label}\n"
-        + f"📈 Posible {movement} de Kalshi YES desde ${mid:.3f} "
-        + f"hacia ${projected:.3f}.\n"
-        + f"🌐 Kraken BTC/USD: {kraken_direction or 'N/D'} ({confirmation})\n"
-        + rafa_context(db, ticker, phase, now, direction, q, volume, kraken_direction) + "\n"
-        + "🔄 Después la cotización puede cambiar de rumbo."
+        + f"🧾 {ticker}\n"
+        + f"🌐 Kraken BTC/USD inicial: USD {start:,.2f}\n"
+        + f"🎯 Cierre estimado: USD {projected:,.2f}\n"
+        + "Kalshi: resultado oficial se evalúa por separado.\n"
+        + "Proyección experimental, no garantía."
     )
     if notify(message, db=db, broadcast=True):
         alerted_phases.add(alert_key)
@@ -767,6 +758,10 @@ def signal(db, m, now, phase, kraken_direction=None):
             (ticker,phase,sent_at,direction,bot_version,rules_snapshot)
             VALUES (?,?,?,?,?,?)""",
             (ticker, phase, now, direction, BOT_VERSION, RULES_SNAPSHOT))
+        db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
+            (id,ticker,phase,predicted_direction,issued_at,close_at,start_price,target_price,status,source,bot_version,rules_snapshot)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (f"kraken-primary:{ticker}:{phase}",ticker,phase,direction,now,close_at,str(start),str(projected),"pending","bot_forecast",BOT_VERSION,"Kraken BTC/USD five-minute momentum projection"))
         try:
             shadow_record(db, ticker, phase, now, direction, q, change, volume, kraken_direction)
         except Exception:
@@ -799,12 +794,12 @@ def evaluate_btc_forecasts(db, now):
                 continue
             candles = series.get(key, [])
             window = [c for c in candles if len(c) > 6
-                      and float(c[0]) <= close_at + 1
-                      and float(c[0]) + 60 >= issued_at]
+                      and float(c[0]) + 60 <= close_at + 1
+                      and float(c[0]) >= issued_at]
             if not window:
                 continue
-            close_candle = min(window, key=lambda c: abs(float(c[0]) - close_at))
-            if abs(float(close_candle[0]) - close_at) > 60:
+            close_candle = min(window, key=lambda c: abs(float(c[0]) + 60 - close_at))
+            if abs(float(close_candle[0]) + 60 - close_at) > 1:
                 continue
             actual_price = dec(close_candle[4])
             start_price = dec(start_text)
