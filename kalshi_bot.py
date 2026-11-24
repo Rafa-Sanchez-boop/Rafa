@@ -857,7 +857,7 @@ def sync_dashboard(db, now, force=False):
             PANEL_URL + "/api/sync", json=payload,
             headers={
                 "Authorization": "Bearer " + PANEL_SECRET,
-                "OAI-Sites-Authorization": PANEL_SITES_AUTH,
+                "OAI-Sites-Authorization": "Bearer " + PANEL_SITES_AUTH,
             },
             timeout=15,
         )
