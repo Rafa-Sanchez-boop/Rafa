@@ -817,22 +817,21 @@ def forecast_display(ticker, phase_label, direction, confidence, start, target, 
     high = confidence is not None and confidence >= 90
     marker = ("🟢" if direction == "UP" else "🔴") if high else "🟡"
     projection = ("cierre alcista" if direction == "UP" else "cierre bajista") if high else "Dirección de cierre incierta"
-    message = "📊 BTC KALSHI | 15 MIN\\n\\n"
+    message = "📊 BTC KALSHI | 15 MIN\n\n"
     if high:
-        arrow = "↑" if direction == "UP" else "↓"
         message += (
-            f"{direction_label(direction)}\\n{confidence}%\\nConfianza estimada del modelo\\n"
-            + "■"*(confidence//10) + "□"*(10-confidence//10) + "\\n\\n"
-            + f"📈 Proyección: {projection} desde el precio de señal.\\n"
-            + f"BTC/USD: USD {start:,.2f} → USD {target:,.2f} (primer objetivo)\\n"
-            + f"📍 Cierre estimado: USD {projected:,.2f}\\n"
+            f"{direction_label(direction)}\n{confidence}%\nConfianza estimada del modelo\n"
+            + "■"*(confidence//10) + "□"*(10-confidence//10) + "\n\n"
+            + f"📈 Proyección: {projection} desde el precio de señal.\n"
+            + f"BTC/USD: USD {start:,.2f} → USD {target:,.2f} (primer objetivo)\n"
+            + f"📍 Cierre estimado: USD {projected:,.2f}\n"
         )
     else:
-        message += "🟡 WAIT\\nDirección de cierre incierta.\\n"
+        message += "🟡 WAIT\nDirección de cierre incierta.\n"
     message += (
-        "⏱️ Temporalidad: 15 minutos.\\n"
-        f"🎯 Nivel de confianza: {marker} {'ALTO' if high else 'INCIERTO'}\\n"
-        f"{phase_label} · {ticker}\\n\\n"
+        "⏱️ Temporalidad: 15 minutos.\n"
+        f"🎯 Nivel de confianza: {marker} {'ALTO' if high else 'INCIERTO'}\n"
+        f"{phase_label} · {ticker}\n\n"
         "⚠️ Predicción estimada; no garantiza el resultado."
     )
     photo = None
@@ -1038,7 +1037,7 @@ def evaluate_btc_forecasts(db, now):
             if estimate is not None:
                 error = abs(actual_price-estimate)
                 db.execute("UPDATE rafa_close_estimates SET absolute_error=? WHERE id=?", (str(error),forecast_id))
-                estimate_line = f"📐 Cierre estimado: USD {estimate:,.2f}; error: USD {error:,.2f}\\n".replace("\\n", "\n")
+                estimate_line = f"📐 Cierre estimado: USD {estimate:,.2f}; error: USD {error:,.2f}\n".replace("\n", "\n")
             target_line = ("Primer objetivo: tocado" if reached else
                            "Primer objetivo: no observado" if reached is False else
                            "Primer objetivo: sin dato")
