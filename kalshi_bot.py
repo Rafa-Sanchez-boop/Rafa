@@ -221,6 +221,13 @@ def db_open():
     # Store private chat IDs only; never store names, usernames, or question text.
     db.execute("""CREATE TABLE IF NOT EXISTS telegram_subscribers
                (chat_id TEXT PRIMARY KEY)""")
+    subscriber_seed = db.execute(
+        "SELECT value FROM telegram_state WHERE key='subscriber_seeded'").fetchone()
+    if CHAT_ID and not subscriber_seed:
+        db.execute("INSERT OR IGNORE INTO telegram_subscribers(chat_id) VALUES (?)",
+                   (CHAT_ID,))
+        db.execute("""INSERT INTO telegram_state(key,value)
+                      VALUES ('subscriber_seeded','1')""")
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_only_samples
                (ticker TEXT, observed_at REAL, yes_mid TEXT,
                 PRIMARY KEY(ticker, observed_at))""")
@@ -310,10 +317,11 @@ def notify(msg, db=None, broadcast=False):
     if not TOKEN:
         log.warning("Telegram not configured")
         return False
-    recipients = {CHAT_ID} if CHAT_ID else set()
     if broadcast and db is not None:
-        recipients.update(row[0] for row in db.execute(
-            "SELECT chat_id FROM telegram_subscribers").fetchall())
+        recipients = {row[0] for row in db.execute(
+            "SELECT chat_id FROM telegram_subscribers").fetchall()}
+    else:
+        recipients = {CHAT_ID} if CHAT_ID else set()
     recipients.discard("")
     if not recipients:
         log.warning("Telegram has no subscribed recipients")
