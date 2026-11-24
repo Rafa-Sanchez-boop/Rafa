@@ -1245,7 +1245,7 @@ def scan():
             if phase:
                 signal(db, m, now, phase, kraken_direction)
             # Extra combo alert during the minute before the unchanged final-five-minute signal.
-            if LATE_WINDOW_SECONDS < remaining <= COMBO_WINDOW_SECONDS:
+            if 0 < remaining <= COMBO_WINDOW_SECONDS:
                 signal(db, m, now, "COMBO_6M", kraken_direction)
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
