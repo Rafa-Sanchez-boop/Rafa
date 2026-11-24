@@ -4,6 +4,9 @@ import logging
 import math
 import os
 import re
+import secrets
+import hashlib
+import time
 import unicodedata
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -38,6 +41,11 @@ COMMANDS = [
 ]
 OWNER_COMMANDS = COMMANDS + [
     {"command": "errores", "description": "Ver historial privado de resultados"},
+    {"command": "invitar", "description": "Crear invitación de un solo uso"},
+    {"command": "autorizar", "description": "Autorizar ID de usuario"},
+    {"command": "expulsar", "description": "Revocar acceso por ID"},
+    {"command": "invitados", "description": "Listar usuarios autorizados"},
+    {"command": "cancelarinvitaciones", "description": "Anular invitaciones pendientes"},
 ]
 
 def _ema(values, period):
@@ -410,6 +418,74 @@ def ai_answer(question, snap, feedback_context="", is_owner=False):
         log.exception("OpenAI market assistant request failed")
         return "No pude obtener respuesta de la IA ahora. Revisa la clave de API y vuelve a intentar."
 
+def valid_private_id(value):
+    return bool(re.fullmatch(r"[1-9][0-9]{0,15}", value or ""))
+
+
+def init_access(db):
+    db.execute("CREATE TABLE IF NOT EXISTS telegram_allowed (chat_id TEXT PRIMARY KEY)")
+    db.execute("""CREATE TABLE IF NOT EXISTS telegram_invites
+                  (digest TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)""")
+    # One-time migration preserves all existing private subscribers. Never repeat
+    # it, otherwise a revoked user could regain access after a restart.
+    if not db.execute("SELECT 1 FROM telegram_state WHERE key='private_access_v1'").fetchone():
+        old = db.execute("SELECT chat_id FROM telegram_subscribers").fetchall()
+        db.executemany("INSERT OR IGNORE INTO telegram_allowed(chat_id) VALUES (?)",
+                       [(str(row[0]),) for row in old if valid_private_id(str(row[0]))])
+        db.execute("INSERT INTO telegram_state(key,value) VALUES ('private_access_v1','1')")
+    db.execute("DELETE FROM telegram_invites WHERE expires_at <= ?", (int(time.time()),))
+
+
+def allowed(db, chat_id):
+    return valid_private_id(chat_id) and (
+        chat_id == OWNER_ID or db.execute(
+            "SELECT 1 FROM telegram_allowed WHERE chat_id=?", (chat_id,)).fetchone() is not None)
+
+
+def redeem_invite(db, chat_id, token):
+    if not valid_private_id(chat_id) or not re.fullmatch(r"[A-Za-z0-9_-]{32}", token):
+        return False
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    deleted = db.execute("DELETE FROM telegram_invites WHERE digest=? AND expires_at>?",
+                         (digest, int(time.time()))).rowcount
+    if deleted != 1:
+        return False
+    db.execute("INSERT OR IGNORE INTO telegram_allowed VALUES (?)", (chat_id,))
+    db.execute("INSERT OR IGNORE INTO telegram_subscribers VALUES (?)", (chat_id,))
+    return True
+
+
+def access_admin(db, command, question):
+    if command == "/invitar":
+        response = session.get(TELEGRAM_BASE + TOKEN + "/getMe", timeout=10)
+        response.raise_for_status()
+        username = response.json().get("result", {}).get("username", "")
+        if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+            return "No pude obtener el nombre del bot. Intenta de nuevo."
+        token = secrets.token_urlsafe(24)
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        db.execute("INSERT INTO telegram_invites VALUES (?,?)",
+                   (digest, int(time.time()) + 86400))
+        return "Invitación de un solo uso, válida 24 horas:\nhttps://t.me/" + username + "?start=" + token
+    if command == "/cancelarinvitaciones":
+        db.execute("DELETE FROM telegram_invites")
+        return "Invitaciones pendientes anuladas."
+    if command == "/invitados":
+        rows = db.execute("SELECT chat_id FROM telegram_allowed ORDER BY chat_id").fetchall()
+        return "Usuarios autorizados: " + str(len(rows)) + "\n" + ("\n".join(row[0] for row in rows[:150]) or "Ninguno adicional.") + ("\nLista limitada a 150 IDs." if len(rows)>150 else "")
+    target = question.strip()
+    if not valid_private_id(target):
+        return "Usa " + command + " seguido del ID numérico de Telegram."
+    if target == OWNER_ID:
+        return "El administrador principal no puede ser expulsado ni necesita autorización."
+    if command == "/autorizar":
+        db.execute("INSERT OR IGNORE INTO telegram_allowed VALUES (?)", (target,))
+        return "Usuario autorizado. Puede abrir el bot y usar /play para recibir señales."
+    db.execute("DELETE FROM telegram_allowed WHERE chat_id=?", (target,))
+    db.execute("DELETE FROM telegram_subscribers WHERE chat_id=?", (target,))
+    return "Acceso revocado; ese usuario ya no recibe señales ni puede consultar el bot."
+
+
 def help_text(is_owner=False):
     lines = [
         "🤖 RAFA — COMANDOS",
@@ -422,7 +498,12 @@ def help_text(is_owner=False):
         "/parar — dejar de recibir avisos",
     ]
     if is_owner:
-        lines.append("/errores — ver historial privado de resultados")
+        lines.extend(["/errores — ver historial privado de resultados",
+                      "/invitar — generar enlace de un solo uso (24 horas)",
+                      "/autorizar ID — autorizar un usuario",
+                      "/expulsar ID — quitar acceso",
+                      "/invitados — ver IDs autorizados",
+                      "/cancelarinvitaciones — anular enlaces pendientes"])
     lines.extend([
         "/pregunta tu pregunta — consultar la IA con datos actuales",
         "También puedes escribir una pregunta normal en el chat.",
@@ -435,7 +516,7 @@ def register_commands():
         return
     try:
         response = session.post(TELEGRAM_BASE + TOKEN + "/setMyCommands",
-                                json={"commands": COMMANDS}, timeout=10)
+                                json={"commands": [{"command": "start", "description": "Abrir bot privado"}]}, timeout=10)
         response.raise_for_status()
         if OWNER_ID.lstrip("-").isdigit() and int(OWNER_ID) > 0:
             owner_response = session.post(
@@ -451,8 +532,9 @@ def register_commands():
 
 def process_updates(db):
     """Receive Telegram text from the configured chat and answer market questions."""
-    if not TOKEN or not CHAT_ID:
+    if not TOKEN or not valid_private_id(OWNER_ID):
         return
+    init_access(db)
     row = db.execute("SELECT value FROM telegram_state WHERE key='update_offset'").fetchone()
     offset = int(row[0]) if row else None
     params = {"timeout": 0, "allowed_updates": json.dumps(["message"])}
@@ -483,7 +565,8 @@ def process_updates(db):
         try:
             is_owner = _is_owner_private_message(message)
             is_private_chat = (message.get("chat") or {}).get("type") == "private"
-            if is_private_chat and chat_id and isinstance(text, str) and text.strip():
+            sender_id = str((message.get("from") or {}).get("id", ""))
+            if is_private_chat and valid_private_id(chat_id) and sender_id == chat_id and isinstance(text, str) and text.strip():
                 command = text.strip().split(None, 1)[0].split("@", 1)[0].lower()
                 question = text.strip().split(None, 1)[1] if len(text.strip().split(None, 1)) > 1 else ""
                 sensitive_request = (
@@ -491,7 +574,16 @@ def process_updates(db):
                     or _asks_about_bot_internals(text)
                     or _asks_for_personal_information(text)
                 )
-                if _asks_for_credentials(text):
+                if command == "/start" and question and not allowed(db, chat_id):
+                    if redeem_invite(db, chat_id, question):
+                        reply = "✅ Invitación aceptada. Recibirás las señales. Usa /ayuda para ver los comandos."
+                    else:
+                        reply = "Invitación inválida, usada o vencida. Pide una nueva al administrador."
+                elif not allowed(db, chat_id):
+                    reply = "🔒 Rafa es privado. Solicita una invitación al administrador."
+                elif command in ("/invitar", "/autorizar", "/expulsar", "/invitados", "/cancelarinvitaciones"):
+                    reply = access_admin(db, command, question) if is_owner else "Solo el administrador puede gestionar el acceso."
+                elif _asks_for_credentials(text):
                     reply = "No comparto contraseñas, claves API ni tokens por Telegram. Usa la configuración segura del servicio para gestionarlos."
                 elif not is_owner and sensitive_request:
                     reply = "No puedo compartir detalles internos ni información personal del bot o del propietario."
@@ -531,7 +623,8 @@ def process_updates(db):
                 send_message(chat_id, reply)
         except Exception:
             log.exception("Could not answer Telegram update %s", update_id)
-            send_message(chat_id, "No pude procesar esa consulta. Prueba /btc o /ayuda.")
+            if (message.get("chat") or {}).get("type") == "private" and valid_private_id(chat_id):
+                send_message(chat_id, "No pude procesar la solicitud. Intenta de nuevo.")
         db.execute("""INSERT INTO telegram_state(key,value) VALUES ('update_offset',?)
                       ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
                    (str(int(update_id) + 1),))

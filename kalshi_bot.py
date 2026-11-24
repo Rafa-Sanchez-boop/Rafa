@@ -228,6 +228,7 @@ def db_open():
                    (CHAT_ID,))
         db.execute("""INSERT INTO telegram_state(key,value)
                       VALUES ('subscriber_seeded','1')""")
+    btc_assistant.init_access(db)
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_only_samples
                (ticker TEXT, observed_at REAL, yes_mid TEXT,
                 PRIMARY KEY(ticker, observed_at))""")
@@ -324,10 +325,11 @@ def notify(msg, db=None, broadcast=False):
         log.warning("Telegram not configured")
         return False
     if broadcast and db is not None:
-        recipients = {row[0] for row in db.execute(
-            "SELECT chat_id FROM telegram_subscribers").fetchall()}
+        recipients = {str(row[0]) for row in db.execute(
+            "SELECT chat_id FROM telegram_subscribers").fetchall()
+            if btc_assistant.allowed(db, str(row[0]))}
     else:
-        recipients = {CHAT_ID} if CHAT_ID else set()
+        recipients = {btc_assistant.OWNER_ID} if btc_assistant.valid_private_id(btc_assistant.OWNER_ID) else set()
     recipients.discard("")
     if not recipients:
         log.warning("Telegram has no subscribed recipients")
