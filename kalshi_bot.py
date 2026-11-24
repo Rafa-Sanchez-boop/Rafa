@@ -759,10 +759,9 @@ def forecast_history_line(db, phase, direction):
         ORDER BY evaluated_at DESC LIMIT 100""", (phase, direction)).fetchall()
     count = len(rows)
     if count < 30:
-        return f"📊 Confianza del modelo: aún sin base suficiente ({count}/30 evaluaciones comparables)."
+        return f"📊 Confianza: reuniendo datos ({count}/30)"
     correct = sum(bool(row[0]) for row in rows)
-    return (f"📊 Acierto histórico comparable: {correct}/{count} "
-            f"({correct / count:.0%}); no es garantía para esta señal.")
+    return f"📊 Acierto histórico: {correct / count:.0%} (n={count})"
 
 
 def signal(db, m, now, phase, kraken_direction=None):
@@ -809,16 +808,11 @@ def signal(db, m, now, phase, kraken_direction=None):
     phase_label = "PRIMEROS 5 MIN" if phase == "EARLY_5M" else "ÚLTIMOS 5 MIN"
     history_line = forecast_history_line(db, phase, direction)
     message = (
-        "🧠 PROYECCIÓN EXPERIMENTAL\n"
-        + direction_label(direction) + f" · {phase_label}\n"
-        + f"{history_line}\n"
-        + f"🧾 {ticker}\n"
-        + f"🌐 Kraken BTC/USD inicial: USD {start:,.2f}\n"
-        + f"🎯 Primer objetivo: USD {first_target:,.2f}\n"
-        + f"🔄 Posible giro en el objetivo: {bias_text}.\n"
-        + f"📍 Cierre estimado por momentum: USD {projected:,.2f}\n"
-        + "Kalshi: resultado oficial se evalúa por separado.\n"
-        + "⚠️ No garantiza el resultado."
+        direction_label(direction) + f" · {phase_label}\\n"
+        + f"{history_line}\\n"
+        + f"📈 USD {start:,.2f} → USD {first_target:,.2f}\\n"
+        + "🔮 Proyección experimental · no garantiza el resultado.\\n"
+        + f"🧾 {ticker}"
     )
     if notify(message, db=db, broadcast=True):
         alerted_phases.add(alert_key)
