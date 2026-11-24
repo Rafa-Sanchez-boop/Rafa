@@ -294,6 +294,12 @@ def db_open():
                 close_at REAL NOT NULL, yes_bid TEXT NOT NULL,
                 yes_ask TEXT NOT NULL, yes_mid TEXT NOT NULL,
                 kraken_usd TEXT, outcome TEXT, settled_at REAL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS rafa_shadow
+        (ticker TEXT, phase TEXT, issued REAL, session TEXT, direction TEXT,
+         mid REAL, change REAL, spread REAL, volume REAL, kraken TEXT,
+         btc REAL, volatility REAL, candidate TEXT, PRIMARY KEY(ticker,phase))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS rafa_shadow_daily
+        (day TEXT PRIMARY KEY, report TEXT NOT NULL)""")
     db.commit()
     return db
 
@@ -598,6 +604,40 @@ def adaptive_direction_gate(db, phase, direction):
         return False
     return True
 
+def shadow_record(db, ticker, phase, now, direction, q, change, volume, kraken_direction):
+    hour = time.gmtime(now).tm_hour
+    session = "Asia" if hour < 7 else "Europe" if hour < 13 else "US" if hour < 22 else "Asia"
+    btc = float(kraken_last_quote[1]) if kraken_last_quote and now-kraken_last_quote[0] < 60 else None
+    prices = [float(p) for t,p in kraken_samples if now-t <= 300]
+    volatility = (max(prices)-min(prices))/prices[0] if len(prices)>1 and prices[0]>0 else None
+    # Learn only from outcomes already known at prediction time.
+    rows = db.execute("""SELECT s.direction,s.kraken,r.result FROM rafa_shadow s
+        JOIN kalshi_only_results r ON r.ticker=s.ticker
+        WHERE s.session=? AND s.phase=? AND r.observed_at<? AND s.issued<?
+        ORDER BY s.issued DESC LIMIT 300""",(session,phase,now,now)).fetchall()
+    comparable = [(d,k,y) for d,k,y in rows if k in ("UP","DOWN") and d!=k]
+    candidate = direction
+    if len(comparable)>=50 and kraken_direction in ("UP","DOWN"):
+        wins = sum((k=="UP")== (y=="yes") for d,k,y in comparable)
+        if wins/len(comparable)>=0.60:
+            candidate=kraken_direction
+    db.execute("""INSERT OR IGNORE INTO rafa_shadow VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (ticker,phase,now,session,direction,float(q[2]),float(change),float(q[1]-q[0]),
+         float(volume),kraken_direction,btc,volatility,candidate))
+    log.info("Rafa shadow recorded %s %s session=%s candidate=%s",ticker,phase,session,candidate)
+
+def shadow_daily(db, now):
+    day=time.strftime("%Y-%m-%d",time.gmtime(now))
+    if db.execute("SELECT 1 FROM rafa_shadow_daily WHERE day=?",(day,)).fetchone():
+        return
+    rows=db.execute("""SELECT s.session,s.phase,COUNT(*),
+        SUM((s.direction='UP')=(r.result='yes')),
+        SUM((s.candidate='UP')=(r.result='yes'))
+        FROM rafa_shadow s JOIN kalshi_only_results r ON r.ticker=s.ticker
+        WHERE r.observed_at<? GROUP BY s.session,s.phase""",(now,)).fetchall()
+    db.execute("INSERT INTO rafa_shadow_daily VALUES (?,?)",(day,json.dumps(rows)))
+    log.info("Rafa shadow daily evaluation %s: %s",day,rows)
+
 def signal(db, m, now, phase, kraken_direction=None):
     """Send one Kalshi-only forecast per contract window after real quote history."""
     ticker = m["ticker"]
@@ -652,6 +692,10 @@ def signal(db, m, now, phase, kraken_direction=None):
             (ticker,phase,sent_at,direction,bot_version,rules_snapshot)
             VALUES (?,?,?,?,?,?)""",
             (ticker, phase, now, direction, BOT_VERSION, RULES_SNAPSHOT))
+        try:
+            shadow_record(db, ticker, phase, now, direction, q, change, volume, kraken_direction)
+        except Exception:
+            log.exception("Rafa shadow recording failed")
         log.info("Kalshi %s forecast: %s %s; Kraken=%s (%s)", phase, ticker, direction, kraken_direction, confirmation)
 
 def evaluate_btc_forecasts(db, now):
@@ -954,6 +998,10 @@ def scan():
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
         maybe_train_adaptive_model(db, now)
+        try:
+            shadow_daily(db, now)
+        except Exception:
+            log.exception('Rafa shadow daily evaluation failed')
         db.execute("DELETE FROM kalshi_only_samples WHERE observed_at < ?", (now - 48 * 3600,))
         db.commit()
         sync_dashboard(db, now)
