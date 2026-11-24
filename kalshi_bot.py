@@ -626,7 +626,35 @@ def shadow_record(db, ticker, phase, now, direction, q, change, volume, kraken_d
          float(volume),kraken_direction,btc,volatility,candidate))
     log.info("Rafa shadow recorded %s %s session=%s candidate=%s",ticker,phase,session,candidate)
 
+def shadow_milestones(db, now):
+    db.execute("""CREATE TABLE IF NOT EXISTS rafa_shadow_milestones
+        (phase TEXT, batch INTEGER, report TEXT, PRIMARY KEY(phase,batch))""")
+    for phase in ("EARLY_5M", "LAST_5M"):
+        rows=db.execute("""SELECT s.direction,s.candidate,r.result FROM rafa_shadow s
+            JOIN kalshi_only_results r ON r.ticker=s.ticker
+            WHERE s.phase=? AND r.observed_at<? AND r.observed_at>=s.issued
+            AND r.result IN ('yes','no') ORDER BY r.observed_at,s.ticker""",
+            (phase,now)).fetchall()
+        for batch in range(len(rows)//50):
+            if db.execute("SELECT 1 FROM rafa_shadow_milestones WHERE phase=? AND batch=?",
+                          (phase,batch)).fetchone():
+                continue
+            block=rows[batch*50:(batch+1)*50]
+            baseline=sum((d=="UP")== (y=="yes") for d,k,y in block)
+            candidate=sum((k=="UP")== (y=="yes") for d,k,y in block)
+            report={"n":50,"baseline_correct":baseline,"candidate_correct":candidate,
+                    "baseline_pct":baseline*2,"candidate_pct":candidate*2,
+                    "goal_80":candidate>=40,"goal_90":candidate>=45,
+                    "goal_95":candidate>=48,"shadow_only":True}
+            db.execute("INSERT INTO rafa_shadow_milestones VALUES (?,?,?)",
+                       (phase,batch,json.dumps(report)))
+            log.info("Rafa performance milestone %s batch %s: %s",phase,batch+1,report)
+
 def shadow_daily(db, now):
+    try:
+        shadow_milestones(db, now)
+    except Exception:
+        log.exception("Rafa performance milestone failed")
     day=time.strftime("%Y-%m-%d",time.gmtime(now))
     if db.execute("SELECT 1 FROM rafa_shadow_daily WHERE day=?",(day,)).fetchone():
         return
