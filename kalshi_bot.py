@@ -32,7 +32,7 @@ RULES_SNAPSHOT = json.dumps({
     "early_window_seconds": EARLY_WINDOW_SECONDS,
     "late_window_seconds": LATE_WINDOW_SECONDS,
     "minimum_volume_24h": str(MIN_VOLUME),
-    "signal_rule": "Kalshi YES midpoint direction after the observation period; first and last contract windows",
+    "signal_rule": "Kalshi YES midpoint direction after the observation period; first and last contract windows; Kraken BTC/USD confirmation informational only",
     "automatic_orders": False,
 }, separators=(",", ":"), sort_keys=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -598,7 +598,7 @@ def adaptive_direction_gate(db, phase, direction):
         return False
     return True
 
-def signal(db, m, now, phase):
+def signal(db, m, now, phase, kraken_direction=None):
     """Send one Kalshi-only forecast per contract window after real quote history."""
     ticker = m["ticker"]
     alert_key = (ticker, phase)
@@ -636,12 +636,14 @@ def signal(db, m, now, phase):
         return
     direction = "UP" if change > 0 else "DOWN"
     projected = min(Decimal("0.99"), max(Decimal("0.01"), mid + change))
+    confirmation = ("coincide" if kraken_direction == direction else "diverge") if kraken_direction else "sin confirmación"
     movement = "subida" if direction == "UP" else "bajada"
     phase_label = "PRIMEROS 5 MIN" if phase == "EARLY_5M" else "ÚLTIMOS 5 MIN"
     message = (
         ("🔺 UP" if direction == "UP" else "🔻 DOWN") + f" · {phase_label}\n"
         + f"📈 Posible {movement} de Kalshi YES desde ${mid:.3f} "
         + f"hacia ${projected:.3f}.\n"
+        + f"🌐 Kraken BTC/USD: {kraken_direction or 'N/D'} ({confirmation})\n"
         + "🔄 Después la cotización puede cambiar de rumbo."
     )
     if notify(message, db=db, broadcast=True):
@@ -650,7 +652,7 @@ def signal(db, m, now, phase):
             (ticker,phase,sent_at,direction,bot_version,rules_snapshot)
             VALUES (?,?,?,?,?,?)""",
             (ticker, phase, now, direction, BOT_VERSION, RULES_SNAPSHOT))
-        log.info("Kalshi-only %s forecast: %s %s", phase, ticker, direction)
+        log.info("Kalshi %s forecast: %s %s; Kraken=%s (%s)", phase, ticker, direction, kraken_direction, confirmation)
 
 def evaluate_btc_forecasts(db, now):
     """Score forecast direction and whether its first target was touched before expiry."""
@@ -823,7 +825,7 @@ def dashboard_snapshot(db, now):
                 status = "evaluated"
         initial = prior[1] if prior else None
         midpoint = at_signal[1] if at_signal else None
-        target = (midpoint + (midpoint - initial)) if midpoint is not None and initial is not None else None
+        target = min(Decimal("0.99"), max(Decimal("0.01"), midpoint + (midpoint - initial))) if midpoint is not None and initial is not None else None
         try:
             rule_text = json.dumps(json.loads(rules), ensure_ascii=False, sort_keys=True) if rules else ""
         except (TypeError, ValueError):
@@ -923,6 +925,7 @@ def scan():
             record_kalshi_15m_chart(db, now)
             sync_dashboard(db, now)
         return
+    kraken_direction = kraken_trend(now)
     with db_open() as db:
         record_kalshi_15m_chart(db, now)
         for m in payload.get("markets", []):
@@ -946,7 +949,7 @@ def scan():
             elif 0 < remaining <= LATE_WINDOW_SECONDS:
                 phase = "LATE_5M"
             if phase:
-                signal(db, m, now, phase)
+                signal(db, m, now, phase, kraken_direction)
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
