@@ -19,14 +19,19 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
 DELAY = 120
+MAX_SPREAD = Decimal(os.getenv("MAX_SPREAD", "0.04"))
+MIN_MOVE = Decimal(os.getenv("MIN_MOVE", "0.025"))
+MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
 MIN_REMAINING = max(300, int(os.getenv("MIN_REMAINING_SECONDS", "300")))
-BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-sync-1")
+BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-v4.5-restored")
 PANEL_URL = os.getenv("RAFA_PANEL_URL", "").rstrip("/")
 PANEL_SECRET = os.getenv("RAFA_PANEL_SECRET", "")
 PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
 RULES_SNAPSHOT = json.dumps({
     "series": SERIES, "scan_seconds": SCAN_SECONDS, "observe_seconds": 60,
     "minimum_elapsed_seconds": DELAY, "minimum_remaining_seconds": MIN_REMAINING,
+    "minimum_move": str(MIN_MOVE), "maximum_spread": str(MAX_SPREAD),
+    "minimum_volume_24h": str(MIN_VOLUME),
     "signal_rule": "direction of observed Kalshi YES midpoint change after 60 seconds",
     "automatic_orders": False,
 }, separators=(",", ":"), sort_keys=True)
@@ -314,6 +319,8 @@ def quote(m):
     bid, ask = dec(m.get("yes_bid_dollars")), dec(m.get("yes_ask_dollars"))
     if bid is None or ask is None or not (Decimal(0) < bid <= ask < Decimal(1)):
         return None
+    if ask - bid > MAX_SPREAD:
+        return None
     return bid, ask, (bid + ask) / 2
 
 def sample(db, ticker, now, mid):
@@ -575,6 +582,11 @@ def signal(db, m, now, close_at, open_at):
     if q is None:
         return
     _, _, mid = q
+    volume = dec(m.get("volume_24h_fp"))
+    if volume is None:
+        volume = dec(m.get("volume_24h"))
+    if volume is None or volume < MIN_VOLUME:
+        return
     # Compare with the first real quote observed at least 60 seconds earlier.
     # Do not invent a baseline after a worker restart.
     row = db.execute("""SELECT yes_mid FROM kalshi_only_samples
@@ -588,7 +600,7 @@ def signal(db, m, now, close_at, open_at):
     if prior is None:
         return
     change = mid - prior
-    if change == 0:
+    if abs(change) < MIN_MOVE:
         return
     direction = "UP" if change > 0 else "DOWN"
     projected = min(Decimal("0.99"), max(Decimal("0.01"), mid + change))
