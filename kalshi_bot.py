@@ -712,6 +712,65 @@ def rafa_context(db, ticker, phase, now, direction, q, volume, kraken_direction)
     volatility = f"{span:.3f}%" if span is not None else "N/D"
     return f"📊 {confidence}; rango BTC 5m {volatility}; spread YES {q[1]-q[0]:.3f}; volumen 24h {volume}."
 
+# Experimental models: never veto or change Telegram signals.
+_shadow_models = {}
+_shadow_attempt_day = None
+
+def shadow_ml_predict(db, now, forecast_id, features):
+    global _shadow_attempt_day
+    if features is None or os.getenv("RAFA_SHADOW_ML", "0") != "1":
+        return
+    try:
+        db.execute("""CREATE TABLE IF NOT EXISTS ml_shadow_predictions (
+            forecast_id TEXT, model TEXT, probability_up REAL, predicted_direction TEXT,
+            issued_at REAL, PRIMARY KEY(forecast_id, model))""")
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        if _shadow_attempt_day != day:
+            _shadow_attempt_day = day
+            rows = db.execute("""SELECT model_features, actual_direction
+                FROM kalshi_prediction_feedback WHERE status='evaluated'
+                AND source='bot_forecast' AND evaluated_at < ?
+                AND model_features IS NOT NULL AND actual_direction IN ('UP','DOWN')
+                ORDER BY issued_at DESC LIMIT 2000""", (now,)).fetchall()
+            examples = []
+            for raw, label in reversed(rows):
+                try:
+                    x = json.loads(raw)
+                    if len(x) == 5 and all(math.isfinite(float(v)) for v in x):
+                        examples.append(([float(v) for v in x], int(label == 'UP')))
+                except (TypeError, ValueError):
+                    continue
+            if len(examples) >= 200:
+                import numpy as np
+                x = np.asarray([v for v, y in examples], dtype=np.float32)
+                y = np.asarray([y for v, y in examples])
+                if min(int(y.sum()), len(y)-int(y.sum())) >= 40:
+                    for name in ("xgboost", "lightgbm"):
+                        try:
+                            if name == "xgboost":
+                                from xgboost import XGBClassifier
+                                model = XGBClassifier(n_estimators=40, max_depth=3,
+                                    n_jobs=1, tree_method="hist", max_bin=32, random_state=42)
+                            else:
+                                from lightgbm import LGBMClassifier
+                                model = LGBMClassifier(n_estimators=40, max_depth=3,
+                                    num_leaves=7, n_jobs=1, max_bin=32, verbosity=-1, random_state=42)
+                            model.fit(x, y)
+                            _shadow_models[name] = model
+                        except Exception:
+                            log.exception("Shadow model training failed: %s", name)
+        if _shadow_models:
+            import numpy as np
+            for name, model in _shadow_models.items():
+                try:
+                    p = float(model.predict_proba(np.asarray([features], dtype=np.float32))[0, 1])
+                    db.execute("INSERT OR IGNORE INTO ml_shadow_predictions VALUES (?,?,?,?,?)",
+                        (forecast_id, name, p, "UP" if p >= 0.5 else "DOWN", now))
+                except Exception:
+                    log.exception("Shadow prediction failed: %s", name)
+    except Exception:
+        log.exception("Shadow ML unavailable; primary signal unchanged")
+
 def signal(db, m, now, phase, kraken_direction=None):
     """Send a Kraken BTC/USD forecast; keep Kalshi settlement separate."""
     ticker = m["ticker"]
@@ -774,6 +833,7 @@ def signal(db, m, now, phase, kraken_direction=None):
         if features is not None:
             db.execute("UPDATE kalshi_prediction_feedback SET model_features=? WHERE id=?",
                        (json.dumps(features), f"kraken-primary:{ticker}:{phase}"))
+        shadow_ml_predict(db, now, f"kraken-primary:{ticker}:{phase}", features)
         db.execute("INSERT OR IGNORE INTO rafa_close_estimates (id,estimated) VALUES (?,?)",
                    (f"kraken-primary:{ticker}:{phase}",str(projected)))
         try:
