@@ -339,7 +339,10 @@ def _asks_for_personal_information(text):
     terms = (
         "datos personales", "informacion personal", "personal information",
         "personal details", "nombre del propietario", "nombre del dueno",
-        "quien es el propietario", "quien es el dueno", "owner id",
+        "quien es el propietario", "quien es el dueno", "owner id", "owner name",
+        "who is the owner", "who owns you", "informacion del propietario",
+        "informacion del dueno", "datos del propietario", "datos del dueno",
+        "sobre el propietario", "sobre tu dueno", "rafael sanchez",
         "telegram id", "chat id", "numero de telefono", "telefono del propietario",
         "correo del propietario", "email del owner", "direccion del propietario",
     )
@@ -355,9 +358,8 @@ def _is_owner_private_message(message):
 
 def ai_answer(question, snap, feedback_context="", is_owner=False):
     if not OPENAI_API_KEY:
-        return ("La conexión con la IA conversacional aún no está activada. "
-                "Puedo mostrar el análisis técnico en /btc y el contrato actual en /mercado. "
-                "Para responder preguntas libres, falta guardar OPENAI_API_KEY como secreto en Render.")
+        return ("La función de preguntas no está disponible ahora. "
+                "Mientras tanto puedes usar /btc, /ciclo, /mercado y /senales.")
     system = (
         "Eres Rafa, un asistente de análisis de Bitcoin y del mercado BTC de Kalshi. "
         "Responde en español sencillo y breve. Usa el bloque JSON de datos actuales para precios, "
