@@ -413,7 +413,7 @@ def record_kalshi_15m_chart(db, now):
         if row[1] != direction:
             break
         streak += 1
-    arrow = "🔺 UP" if direction == "UP" else "🔻 DOWN"
+    arrow = direction_label(direction)
     close_label = datetime.fromtimestamp(close_time, timezone.utc).strftime("%H:%M UTC")
     message = (
         "📊 KALSHI BTC 15M · resultados oficiales\n"
@@ -714,6 +714,41 @@ def rafa_context(db, ticker, phase, now, direction, q, volume, kraken_direction)
     volatility = f"{span:.3f}%" if span is not None else "N/D"
     return f"📊 {confidence}; rango BTC 5m {volatility}; spread YES {q[1]-q[0]:.3f}; volumen 24h {volume}."
 
+def target_close_bias(now, remaining, start, target, projected, samples):
+    """Experimental closing bias relative to the first target; not a reversal confirmation."""
+    recent = sorted((t, p) for t, p in samples if now-120 <= t <= now)
+    if len(recent) < 4 or remaining <= 0 or start <= 0:
+        return None
+    duration = recent[-1][0] - recent[0][0]
+    if duration < 60 or now-recent[-1][0] > 30 or recent[-1][1] != start:
+        return None
+    if any(b[0]-a[0] > 60 for a, b in zip(recent, recent[1:])):
+        return None
+    prices = [p for _, p in recent]
+    move = prices[-1] - prices[0]
+    if not move:
+        return None
+    changes = [b-a for a, b in zip(prices, prices[1:]) if a != b]
+    if len(changes) < 3 or 4*sum(c*move > 0 for c in changes) < 3*len(changes):
+        return None
+    noise = max(start*Decimal('0.0001'), (max(prices)-min(prices))/Decimal(2))
+    if abs(move) < noise:
+        return None
+    short = start + move*Decimal(str(remaining))/Decimal(str(duration))
+    blended = (short + projected)/Decimal(2)
+    if short <= 0 or blended <= 0:
+        return None
+    if move > 0 and min(short, blended) > target+noise:
+        return 'UP'
+    if move < 0 and max(short, blended) < target-noise:
+        return 'DOWN'
+    return None
+
+
+def direction_label(direction):
+    return {"UP": "🟢 UP ↑", "DOWN": "🔴 DOWN ↓"}.get(direction, direction)
+
+
 def signal(db, m, now, phase, kraken_direction=None):
     """Send a Kraken BTC/USD forecast; keep Kalshi settlement separate."""
     ticker = m["ticker"]
@@ -747,17 +782,21 @@ def signal(db, m, now, phase, kraken_direction=None):
     if first_projection is None or first_projection[1] == start:
         return
     first_target = first_projection[1]
+    bias = target_close_bias(now, close_at-now, start, first_target, projected, kraken_samples)
+    bias_text = {"UP": "🟢 UP · sesgo de cierre por encima del objetivo",
+                 "DOWN": "🔴 DOWN · sesgo de cierre por debajo del objetivo"}.get(
+                     bias, "🟡 No confirmado · evidencia insuficiente")
     db.execute("""CREATE TABLE IF NOT EXISTS rafa_close_estimates
         (id TEXT PRIMARY KEY, estimated TEXT, absolute_error TEXT)""")
     change = Decimal("0")
     confirmation = "Kraken BTC/USD"
     phase_label = "PRIMEROS 5 MIN" if phase == "EARLY_5M" else "ÚLTIMOS 5 MIN"
     message = (
-        ("🔺 UP" if direction == "UP" else "🔻 DOWN") + f" · {phase_label}\n"
+        direction_label(direction) + f" · {phase_label}\n"
         + f"🧾 {ticker}\n"
         + f"🌐 Kraken BTC/USD inicial: USD {start:,.2f}\n"
         + f"🎯 Primer objetivo: USD {first_target:,.2f}\n"
-        + "🔄 Posible giro en el objetivo; no confirmado.\n"
+        + f"🔄 Posible giro en el objetivo: {bias_text}.\n"
         + f"📍 Cierre estimado por momentum: USD {projected:,.2f}\n"
         + "Kalshi: resultado oficial se evalúa por separado.\n"
         + "Proyección experimental, no garantía."
@@ -862,10 +901,10 @@ def evaluate_btc_forecasts(db, now):
                              if reached and actual != predicted else "")
             notify("🧠 BTC — REVISIÓN DE PREDICCIÓN\n"
                    f"🧾 {ticker} ({phase})\n"
-                   f"🔮 Pronóstico: {predicted} desde USD {start_price:,.2f}\n"
+                   f"🔮 Pronóstico: {direction_label(predicted)} desde USD {start_price:,.2f}\n"
                    f"📈 Máximo/mínimo después de la señal: USD {peak:,.2f} / USD {trough:,.2f}\n"
                    f"🎯 {target_line} ({'USD ' + format(target_price, ',.2f') if target_price is not None else 'sin dato'})\n"
-                   f"📍 Cierre aproximado: {actual} en USD {actual_price:,.2f}\n"
+                   f"📍 Cierre aproximado: {direction_label(actual)} en USD {actual_price:,.2f}\n"
                    + estimate_line
                    + reversal_line
                    + ("✅ Dirección al cierre coincidió." if correct else
@@ -896,7 +935,7 @@ def check_results(db, now):
             correct = (direction == "UP" and result == "yes") or (
                 direction == "DOWN" and result == "no")
             notify(f"🧠 BTC — REVISIÓN DE PREDICCIÓN\n🧾 {ticker}\n"
-                   f"🔮 Pronóstico Kalshi: {direction}\n"
+                   f"🔮 Pronóstico Kalshi: {direction_label(direction)}\n"
                    f"🏁 Resultado oficial: {result.upper()}\n"
                    f"{'✅ Coincidió' if correct else '❌ No coincidió'} con el resultado oficial.",
                    db=db, broadcast=True)
