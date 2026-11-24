@@ -14,6 +14,7 @@ import btc_assistant
 
 BASE = "https://external-api.kalshi.com/trade-api/v2"
 SERIES = os.getenv("KALSHI_SERIES", "KXBTC15M")
+ETH_SERIES = os.getenv("KALSHI_ETH_SERIES", "KXETH15M")
 DB_PATH = os.getenv("DB_PATH", "/var/data/kalshi_bot.sqlite3")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -21,18 +22,21 @@ SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
 OBSERVE_SECONDS = max(60, int(os.getenv("OBSERVE_SECONDS", "60")))
 EARLY_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("EARLY_WINDOW_SECONDS", "300")))
 LATE_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("LATE_WINDOW_SECONDS", "300")))
+COMBO_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("COMBO_WINDOW_SECONDS", "360")))
 MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
 BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-v4.6-close-guards")
 PANEL_URL = os.getenv("RAFA_PANEL_URL", "").rstrip("/")
 PANEL_SECRET = os.getenv("RAFA_PANEL_SECRET", "")
 PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
 RULES_SNAPSHOT = json.dumps({
-    "series": SERIES, "scan_seconds": SCAN_SECONDS,
+    "series": SERIES, "combo_eth_series": ETH_SERIES,
+    "combo_window_seconds": COMBO_WINDOW_SECONDS, "scan_seconds": SCAN_SECONDS,
     "observe_seconds": OBSERVE_SECONDS,
     "early_window_seconds": EARLY_WINDOW_SECONDS,
     "late_window_seconds": LATE_WINDOW_SECONDS,
     "minimum_volume_24h": str(MIN_VOLUME),
     "signal_rule": "Kalshi YES midpoint direction after the observation period; first and last contract windows; Kraken BTC/USD confirmation informational only",
+    "combo_rule": "Independent BTC + ETH forecasts; send only when both pass their asset checks within the final six minutes",
     "automatic_orders": False,
 }, separators=(",", ":"), sort_keys=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -44,6 +48,9 @@ alerted_phases = set()
 KRAKEN_URL = "https://api.kraken.com/0/public/Ticker"
 kraken_samples = []
 kraken_last_quote = None
+eth_kraken_samples = []
+eth_kraken_last_quote = None
+eth_kraken_5m_snapshot = None
 
 def kraken_trend(now):
     """Compare real Kraken BTC/USD last trades at least 60 seconds apart."""
@@ -71,6 +78,146 @@ def kraken_trend(now):
         return None
 
 kraken_5m_snapshot = None
+
+
+def eth_kraken_trend(now):
+    """Compare Kraken ETH/USD trades at least 60 seconds apart."""
+    global eth_kraken_last_quote
+    try:
+        response = http.get(KRAKEN_URL, params={"pair": "XETHZUSD"}, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("error") or not payload.get("result"):
+            return None
+        item = next(iter(payload["result"].values()))
+        price = dec(item["c"][0])
+        if price is None or price <= 0:
+            return None
+        eth_kraken_last_quote = (now, price)
+        eth_kraken_samples.append((now, price))
+        eth_kraken_samples[:] = [(t, p) for t, p in eth_kraken_samples if now-t <= 600]
+        prior = next((p for t, p in eth_kraken_samples if t <= now-60), None)
+        if prior is None or price == prior:
+            return None
+        return "UP" if price > prior else "DOWN"
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError, StopIteration):
+        log.exception("Kraken ETH/USD quote failed")
+        return None
+
+
+def eth_kraken_trend_5m(now):
+    """Compare live ETH with a completed one-minute candle near five minutes ago."""
+    global eth_kraken_5m_snapshot
+    if eth_kraken_last_quote is None or now-eth_kraken_last_quote[0] > 30:
+        return None
+    try:
+        response = http.get(KRAKEN_URL.replace("/Ticker", "/OHLC"),
+                            params={"pair": "XETHZUSD", "interval": 1}, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("error") or not payload.get("result"):
+            raise ValueError("Kraken ETH OHLC returned no data")
+        result = payload["result"]
+        key = next((name for name in result if name != "last"), None)
+        candles = [c for c in result.get(key, []) if len(c) > 4] if key else []
+        if not candles:
+            raise ValueError("Kraken ETH OHLC contains no candles")
+        target_time = now-300
+        prior = min(candles, key=lambda c: abs(float(c[0])+60-target_time))
+        prior_time = float(prior[0])+60
+        current = eth_kraken_last_quote[1]
+        prior_price = dec(prior[4])
+        if abs(prior_time-target_time) > 45 or prior_price is None:
+            raise ValueError("No ETH candle near the five-minute reference")
+        eth_kraken_5m_snapshot = (now, prior_price, current)
+        if prior_price == current:
+            return None
+        return "UP" if current > prior_price else "DOWN"
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError, StopIteration):
+        log.warning("Kraken ETH five-minute OHLC unavailable; using recent samples")
+        if not eth_kraken_samples:
+            return None
+        target_time = now-300
+        prior_time, prior_price = min(eth_kraken_samples, key=lambda x: abs(x[0]-target_time))
+        current_time, current = eth_kraken_samples[-1]
+        if abs(prior_time-target_time) > 45 or current_time < now-30 or prior_price == current:
+            return None
+        eth_kraken_5m_snapshot = (now, prior_price, current)
+        return "UP" if current > prior_price else "DOWN"
+
+
+def eth_close_projection(now, remaining):
+    """Project ETH from its fresh five-minute reference, capped at five minutes."""
+    global eth_kraken_5m_snapshot
+    if eth_kraken_last_quote is None or remaining < 0:
+        return None
+    quote_time, current = eth_kraken_last_quote
+    if now-quote_time > 30:
+        return None
+    if eth_kraken_5m_snapshot and now-eth_kraken_5m_snapshot[0] <= 30:
+        _, prior, _ = eth_kraken_5m_snapshot
+    elif eth_kraken_samples:
+        target_time = now-300
+        prior_time, prior = min(eth_kraken_samples, key=lambda x: abs(x[0]-target_time))
+        if abs(prior_time-target_time) > 45:
+            return None
+    else:
+        return None
+    if current == prior:
+        return None
+    change = current-prior
+    if abs(change) < current*Decimal("0.0001"):
+        return None
+    horizon = min(max(Decimal("0"), Decimal(str(remaining))), Decimal("300"))
+    projected = current + change*horizon/Decimal("300")
+    return (current, projected) if projected > 0 else None
+
+
+def eth_nearest_level_projection(now, direction, projection):
+    """Use the same swing cap as the BTC forecast for the ETH combo leg."""
+    if projection is None or eth_kraken_last_quote is None:
+        return projection
+    quote_time, current = eth_kraken_last_quote
+    if now-quote_time > 30:
+        return None
+    try:
+        response = http.get(KRAKEN_URL.replace("/Ticker", "/OHLC"),
+                            params={"pair": "XETHZUSD", "interval": 1}, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        result = payload.get("result") or {}
+        key = next((name for name in result if name != "last"), None)
+        candles = result.get(key, [])[-20:] if key else []
+        highs = [dec(c[2]) for c in candles if len(c) > 4]
+        lows = [dec(c[3]) for c in candles if len(c) > 4]
+        highs = [p for p in highs if p is not None]
+        lows = [p for p in lows if p is not None]
+        if direction == "UP":
+            levels = [p for p in highs if p > current]
+            level = min(levels) if levels else None
+            ceiling = max(highs) if highs else None
+            if ceiling is not None and ceiling-current <= current*Decimal("0.0001"):
+                return current, current
+        else:
+            levels = [p for p in lows if p < current]
+            level = max(levels) if levels else None
+            floor = min(lows) if lows else None
+            if floor is not None and current-floor <= current*Decimal("0.0001"):
+                return current, current
+        if level is not None and abs(level-current) >= current*Decimal("0.0002"):
+            target = min(projection[1], level) if direction == "UP" else max(projection[1], level)
+            return current, target
+        cap = current*Decimal("0.0025")
+        move = projection[1]-current
+        target = current + min(max(move, Decimal(0)), cap) if direction == "UP" else current-min(max(-move, Decimal(0)), cap)
+        return current, target
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError, StopIteration):
+        log.exception("Could not get nearby ETH swing levels; using conservative fallback")
+        cap = current*Decimal("0.0025")
+        move = projection[1]-current
+        target = current + min(max(move, Decimal(0)), cap) if direction == "UP" else current-min(max(-move, Decimal(0)), cap)
+        return current, target
+
 
 def kraken_trend_5m(now):
     """Compare the live BTC quote with Kraken's completed one-minute candle near five minutes ago."""
@@ -1207,8 +1354,132 @@ def sync_dashboard(db, now, force=False):
     except (requests.RequestException, ValueError, sqlite3.Error):
         log.exception("Prediction panel sync failed")
 
+
+def combo_history_summary(db, now):
+    rows = db.execute("""SELECT c.btc_direction,c.eth_direction,b.result,e.result
+        FROM kalshi_combo_forecasts c
+        JOIN kalshi_only_results b ON b.ticker=c.btc_ticker
+        JOIN kalshi_only_results e ON e.ticker=c.eth_ticker
+        WHERE c.issued_at<? AND b.result IN ('yes','no') AND e.result IN ('yes','no')
+        ORDER BY c.issued_at DESC LIMIT 100""", (now,)).fetchall()
+    count = len(rows)
+    if count < 30:
+        return f"📊 Acierto histórico BTC+ETH: reuniendo datos ({count}/30); sin porcentaje todavía."
+    btc_hits = sum((bd == "UP") == (br == "yes") for bd, ed, br, er in rows)
+    eth_hits = sum((ed == "UP") == (er == "yes") for bd, ed, br, er in rows)
+    combo_hits = sum((bd == "UP") == (br == "yes") and
+                     (ed == "UP") == (er == "yes")
+                     for bd, ed, br, er in rows)
+    return (f"📊 Histórico (n={count}): BTC {btc_hits/count:.0%} · "
+            f"ETH {eth_hits/count:.0%} · combo completo {combo_hits/count:.0%}.")
+
+
+def combo_leg(db, market, now, asset, one_minute_direction):
+    """Apply the existing forecast checks independently to one combo leg."""
+    q = quote(market)
+    if q is None:
+        return None
+    volume = dec(market.get("volume_24h_fp"))
+    if volume is None:
+        volume = dec(market.get("volume_24h"))
+    if volume is None or volume < MIN_VOLUME:
+        return None
+    close_at = ts(market.get("close_time"))
+    opened = ts(market.get("open_time"))
+    if close_at is None or opened is None or close_at <= now or abs((close_at-opened)-900) > 60:
+        return None
+    if asset == "BTC":
+        five_minute_direction = kraken_trend_5m(now)
+        projection = kraken_close_projection(now, close_at-now)
+        first_projection_fn = kraken_nearest_level_projection
+        symbol = "BTC/USD"
+    else:
+        five_minute_direction = eth_kraken_trend_5m(now)
+        projection = eth_close_projection(now, close_at-now)
+        first_projection_fn = eth_nearest_level_projection
+        symbol = "ETH/USD"
+    if (one_minute_direction not in ("UP", "DOWN")
+            or five_minute_direction not in ("UP", "DOWN")
+            or one_minute_direction != five_minute_direction
+            or projection is None):
+        return None
+    start, projected = projection
+    direction = "UP" if projected > start else "DOWN"
+    if direction != five_minute_direction:
+        return None
+    if not adaptive_direction_gate(db, "COMBO_6M", direction):
+        return None
+    first_projection = first_projection_fn(now, direction, projection)
+    if first_projection is None or first_projection[1] == start:
+        return None
+    if asset == "BTC":
+        prior = db.execute("""SELECT yes_mid FROM kalshi_only_samples
+            WHERE ticker=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 1""",
+            (market["ticker"], now-60)).fetchone()
+        prior_mid = dec(prior[0]) if prior else None
+        change = float(q[2]-prior_mid) if prior_mid is not None else 0.0
+        features = make_model_features("LAST_5M", q[2], change, close_at-now)
+        if not adaptive_model_allows(db, features, direction):
+            return None
+    return {
+        "asset": asset, "ticker": market["ticker"], "direction": direction,
+        "start": start, "target": first_projection[1], "projected": projected,
+        "volume": volume, "symbol": symbol,
+    }
+
+
+def send_btc_eth_combo(db, btc_market, eth_market, now,
+                       btc_one_minute_direction, eth_one_minute_direction):
+    btc_close, eth_close = ts(btc_market.get("close_time")), ts(eth_market.get("close_time"))
+    if btc_close is None or eth_close is None or abs(btc_close-eth_close) > 2:
+        return
+    remaining = btc_close-now
+    if not (0 < remaining <= COMBO_WINDOW_SECONDS):
+        return
+    btc_leg = combo_leg(db, btc_market, now, "BTC", btc_one_minute_direction)
+    eth_leg = combo_leg(db, eth_market, now, "ETH", eth_one_minute_direction)
+    if btc_leg is None or eth_leg is None:
+        return
+    combo_key = btc_leg["ticker"] + "|" + eth_leg["ticker"]
+    db.execute("""CREATE TABLE IF NOT EXISTS kalshi_combo_forecasts
+        (combo_key TEXT PRIMARY KEY, btc_ticker TEXT NOT NULL, eth_ticker TEXT NOT NULL,
+         issued_at REAL NOT NULL, close_at REAL NOT NULL,
+         btc_direction TEXT NOT NULL, eth_direction TEXT NOT NULL)""")
+    if db.execute("SELECT 1 FROM kalshi_combo_forecasts WHERE combo_key=?",
+                  (combo_key,)).fetchone():
+        return
+    history = combo_history_summary(db, now)
+    minutes, seconds = divmod(max(0, int(remaining)), 60)
+    message = (
+        "🧩 COMBO BTC + ETH · ÚLTIMOS 6 MIN\n"
+        f"⏳ Tiempo restante: {minutes:02d}:{seconds:02d}\n"
+        f"🧾 BTC: {btc_leg['ticker']}\n"
+        f"{direction_label(btc_leg['direction'])} · inicio USD {btc_leg['start']:,.2f} "
+        f"→ objetivo USD {btc_leg['target']:,.2f} · cierre estimado USD {btc_leg['projected']:,.2f}\n"
+        f"🧾 ETH: {eth_leg['ticker']}\n"
+        f"{direction_label(eth_leg['direction'])} · inicio USD {eth_leg['start']:,.2f} "
+        f"→ objetivo USD {eth_leg['target']:,.2f} · cierre estimado USD {eth_leg['projected']:,.2f}\n"
+        f"{history}\n"
+        "Combo experimental: ambas patas deben acertar; no garantiza resultado."
+    )
+    if not notify(message, db=db, broadcast=True):
+        return
+    db.execute("""INSERT OR IGNORE INTO kalshi_combo_forecasts
+        (combo_key,btc_ticker,eth_ticker,issued_at,close_at,btc_direction,eth_direction)
+        VALUES (?,?,?,?,?,?,?)""",
+        (combo_key, btc_leg["ticker"], eth_leg["ticker"], now, btc_close,
+         btc_leg["direction"], eth_leg["direction"]))
+    for leg in (btc_leg, eth_leg):
+        db.execute("""INSERT OR IGNORE INTO kalshi_only_alerts
+            (ticker,phase,sent_at,direction,bot_version,rules_snapshot)
+            VALUES (?,?,?,?,?,?)""",
+            (leg["ticker"], "COMBO_6M", now, leg["direction"], BOT_VERSION, RULES_SNAPSHOT))
+    log.info("BTC+ETH combo sent: %s / %s", btc_leg["direction"], eth_leg["direction"])
+
+
 def scan():
     payload = get_json("/markets", {"series_ticker": SERIES, "status": "open", "limit": 100})
+    eth_payload = get_json("/markets", {"series_ticker": ETH_SERIES, "status": "open", "limit": 100})
     now = time.time()
     if payload is None:
         with db_open() as db:
@@ -1216,6 +1487,7 @@ def scan():
             sync_dashboard(db, now)
         return
     kraken_direction = kraken_trend(now)
+    eth_kraken_direction = eth_kraken_trend(now) if eth_payload is not None else None
     with db_open() as db:
         record_kalshi_15m_chart(db, now)
         for m in payload.get("markets", []):
@@ -1240,6 +1512,22 @@ def scan():
                 phase = "LAST_5M"
             if phase:
                 signal(db, m, now, phase, kraken_direction)
+            if eth_payload is not None:
+                for eth_market in eth_payload.get("markets", []):
+                    eth_ticker = eth_market.get("ticker", "")
+                    if not isinstance(eth_ticker, str) or not eth_ticker.startswith(ETH_SERIES + "-"):
+                        continue
+                    eth_opened, eth_closes = ts(eth_market.get("open_time")), ts(eth_market.get("close_time"))
+                    if (eth_opened is None or eth_closes is None
+                            or not (eth_opened <= now < eth_closes)
+                            or abs((eth_closes-eth_opened)-900) > 60):
+                        continue
+                    eth_quote = quote(eth_market)
+                    if eth_quote:
+                        sample(db, eth_ticker, now, eth_quote[2])
+                        journal_opening_quote(db, eth_market, now, eth_opened, eth_closes)
+                    send_btc_eth_combo(db, m, eth_market, now,
+                                       kraken_direction, eth_kraken_direction)
         # Check completed markets infrequently to reduce requests.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
