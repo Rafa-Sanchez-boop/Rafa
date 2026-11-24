@@ -813,68 +813,93 @@ def closing_confidence(db, ticker, phase, direction, now, remaining, start, proj
 
 
 def forecast_display(ticker, phase_label, direction, confidence, start, target, projected):
-    high = confidence is not None and confidence >= 80
+    # The green/red directional signal is reserved for stronger displayed confidence.
+    high = confidence is not None and confidence >= 90
     marker = ("🟢" if direction == "UP" else "🔴") if high else "🟡"
     projection = ("cierre alcista" if direction == "UP" else "cierre bajista") if high else "Dirección de cierre incierta"
-    message = "📊 BTC KALSHI | 15 MIN\n\n"
+    message = "📊 BTC KALSHI | 15 MIN\\n\\n"
     if high:
+        arrow = "↑" if direction == "UP" else "↓"
         message += (
-            f"{direction_label(direction)}\n{confidence}%\nConfianza estimada del modelo\n"
-            + "■"*(confidence//10) + "□"*(10-confidence//10) + "\n\n"
-            + f"📈 Proyección: {projection} desde el precio de señal.\n"
-            + f"BTC/USD: USD {start:,.2f} → USD {target:,.2f} (primer objetivo)\n"
-            + f"Cierre estimado: USD {projected:,.2f}\n"
+            f"{direction_label(direction)}\\n{confidence}%\\nConfianza estimada del modelo\\n"
+            + "■"*(confidence//10) + "□"*(10-confidence//10) + "\\n\\n"
+            + f"📈 Proyección: {projection} desde el precio de señal.\\n"
+            + f"BTC/USD: USD {start:,.2f} → USD {target:,.2f} (primer objetivo)\\n"
+            + f"📍 Cierre estimado: USD {projected:,.2f}\\n"
         )
     else:
-        message += "🟡 WAIT\nDirección de cierre incierta.\n"
+        message += "🟡 WAIT\\nDirección de cierre incierta.\\n"
     message += (
-        "⏱️ Temporalidad: 15 minutos.\n"
-        f"🎯 Nivel de confianza: {marker} {'ALTO' if high else 'INCIERTO'}\n"
-        f"{phase_label} · {ticker}\n\n"
+        "⏱️ Temporalidad: 15 minutos.\\n"
+        f"🎯 Nivel de confianza: {marker} {'ALTO' if high else 'INCIERTO'}\\n"
+        f"{phase_label} · {ticker}\\n\\n"
         "⚠️ Predicción estimada; no garantiza el resultado."
     )
     photo = None
     try:
         from io import BytesIO
         from PIL import Image, ImageDraw, ImageFont
-        bg, fg, muted = "#101827", "#f8fafc", "#cbd5e1"
-        accent = ("#22c55e" if direction == "UP" else "#f87171") if high else "#facc15"
-        canvas = Image.new("RGB", (900, 920), bg)
+
+        bg = "#08111f"
+        panel = "#111d2e"
+        muted = "#a9b8cc"
+        fg = "#f5f8fc"
+        accent = ("#21d07a" if direction == "UP" else "#ff5f68") if high else "#f6c945"
+        canvas = Image.new("RGB", (900, 1000), bg)
         draw = ImageDraw.Draw(canvas)
-        def text(x, y, value, size, color=fg):
-            draw.text((x, y), value, font=ImageFont.load_default(size=size), fill=color, anchor="mt")
-        draw.rounded_rectangle((20, 20, 880, 900), radius=30, outline="#334155", width=3)
-        text(450, 60, "BTC KALSHI | 15 MIN", 47)
-        draw.line((65, 135, 835, 135), fill="#334155", width=3)
-        label = direction if high else "WAIT"
-        draw.ellipse((235, 191, 275, 231), fill=accent)
-        text(450, 160, label, 92, accent)
-        if high:
-            x, y = 650, 211
-            dy = -1 if direction == "UP" else 1
-            draw.line((x, y-30, x, y+30), fill=accent, width=9)
-            tip = y+dy*30
-            draw.line((x-21, tip-dy*21, x, tip, x+21, tip-dy*21), fill=accent, width=9)
-            text(450, 260, f"{confidence}%", 132, accent)
-            text(450, 414, "Confianza estimada del modelo", 35, muted)
-            draw.rounded_rectangle((85, 475, 815, 507), radius=16, fill="#334155")
-            draw.rounded_rectangle((85, 475, 85+int(730*confidence/100), 507), radius=16, fill=accent)
-            text(450, 555, f"Proyección: {projection}", 42)
-        else:
-            text(450, 315, projection, 46, accent)
-        text(450, 625, "Temporalidad: 15 minutos", 38)
-        draw.ellipse((122, 700, 150, 728), fill=accent)
-        text(485, 689, "Nivel de confianza: " + ("ALTO" if high else "INCIERTO"), 36, accent)
-        text(450, 758, phase_label, 29, muted)
-        draw.line((65, 805, 835, 805), fill="#334155", width=2)
-        text(450, 832, "Predicción estimada; no garantiza el resultado.", 29, muted)
+
+        def font(size):
+            return ImageFont.load_default(size=size)
+
+        def centered(y, value, size, color=fg):
+            draw.text((450, y), value, font=font(size), fill=color, anchor="mt")
+
+        def fit(value, max_width, size):
+            f = font(size)
+            while size > 18 and draw.textbbox((0, 0), value, font=f)[2] > max_width:
+                size -= 2
+                f = font(size)
+            return f
+
+        draw.rounded_rectangle((20, 20, 880, 980), radius=34, fill=panel, outline="#26374d", width=3)
+        centered(58, "BTC KALSHI  ·  15 MIN", 48)
+        draw.rounded_rectangle((290, 112, 610, 164), radius=22, fill="#1b2b40")
+        phase_font = fit(phase_label, 290, 25)
+        draw.text((450, 138), phase_label, font=phase_font, fill=muted, anchor="mm")
+        draw.line((70, 190, 830, 190), fill="#26374d", width=2)
+
+        label = f"{direction} {'↑' if direction == 'UP' else '↓'}" if high else "WAIT"
+        draw.rounded_rectangle((250, 220, 650, 355), radius=34, fill="#0b1625", outline=accent, width=3)
+        centered(251, label, 88, accent)
+
+        centered(385, f"{confidence}%" if confidence is not None else "—", 125, accent)
+        centered(515, "CONFIANZA ESTIMADA", 30, muted)
+        draw.rounded_rectangle((100, 562, 800, 596), radius=17, fill="#26374d")
+        if confidence is not None:
+            fill_width = int(700 * max(0, min(100, confidence)) / 100)
+            if fill_width > 0:
+                draw.rounded_rectangle((100, 562, 100 + fill_width, 596), radius=17, fill=accent)
+
+        centered(635, "PROYECCIÓN", 27, muted)
+        centered(674, projection.upper(), 37, accent if high else muted)
+
+        draw.rounded_rectangle((68, 728, 832, 850), radius=24, fill="#0b1625")
+        centered(744, "BTC/USD  ·  PRIMER OBJETIVO", 23, muted)
+        price_line = f"USD {start:,.2f}  →  USD {target:,.2f}"
+        draw.text((450, 800), price_line, font=fit(price_line, 700, 35), fill=fg, anchor="mm")
+
+        centered(872, f"CIERRE ESTIMADO  ·  USD {projected:,.2f}", 31, fg)
+        draw.ellipse((82, 925, 108, 951), fill=accent)
+        status = "NIVEL DE CONFIANZA: ALTO" if high else "NIVEL DE CONFIANZA: INCIERTO"
+        draw.text((450, 938), status, font=fit(status, 650, 28), fill=accent, anchor="mm")
+        centered(963, "Proyección experimental; no garantiza el resultado.", 22, muted)
+
         buffer = BytesIO()
         canvas.save(buffer, format="PNG")
         photo = buffer.getvalue()
     except Exception:
         log.exception("Rafa signal card unavailable; using text")
     return message, photo
-
 
 def signal(db, m, now, phase, kraken_direction=None):
     """Send a Kraken BTC/USD forecast; keep Kalshi settlement separate."""
