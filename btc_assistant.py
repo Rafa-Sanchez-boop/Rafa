@@ -31,6 +31,7 @@ COMMANDS = [
     {"command": "ciclo", "description": "Ver fase del ciclo corto de BTC"},
     {"command": "mercado", "description": "Ver mercado BTC de Kalshi"},
     {"command": "senales", "description": "Ver las últimas señales de Rafa"},
+    {"command": "parar", "description": "Dejar de recibir avisos"},
     {"command": "pregunta", "description": "Preguntar a la IA sobre BTC y el mercado"},
 ]
 OWNER_COMMANDS = COMMANDS + [
@@ -414,6 +415,8 @@ def help_text(is_owner=False):
         "/ciclo — fase observada del ciclo corto y niveles",
         "/mercado — contrato BTC15M activo de Kalshi",
         "/senales — ver las últimas señales de Rafa",
+        "/start — activar las señales y resultados en este chat",
+        "/parar — dejar de recibir avisos",
     ]
     if is_owner:
         lines.append("/errores — ver historial privado de resultados")
@@ -490,7 +493,17 @@ def process_updates(db):
                 elif not is_owner and sensitive_request:
                     reply = "No puedo compartir detalles internos ni información personal del bot o del propietario."
                 elif command in ("/start", "/ayuda", "/help"):
-                    reply = help_text(is_owner)
+                    if command == "/start":
+                        db.execute("INSERT OR IGNORE INTO telegram_subscribers(chat_id) VALUES (?)",
+                                   (chat_id,))
+                        reply = (help_text(is_owner)
+                                 + "\\n\\n✅ Este chat recibirá señales, revisiones y resultados oficiales. "
+                                 "Usa /parar para dejar de recibirlos.")
+                    else:
+                        reply = help_text(is_owner)
+                elif command in ("/parar", "/stop"):
+                    db.execute("DELETE FROM telegram_subscribers WHERE chat_id=?", (chat_id,))
+                    reply = "Listo. Este chat ya no recibirá avisos. Puedes volver con /start."
                 elif command == "/btc":
                     reply = btc_report(get_snapshot())
                 elif command == "/ciclo":
