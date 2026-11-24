@@ -26,6 +26,7 @@ session = requests.Session()
 session.headers["User-Agent"] = "Rafa-BTC-Market-Assistant/1.0"
 
 COMMANDS = [
+    {"command": "start", "description": "Activar señales y resultados"},
     {"command": "ayuda", "description": "Ver comandos del asistente"},
     {"command": "btc", "description": "Precio e indicadores de Bitcoin"},
     {"command": "ciclo", "description": "Ver fase del ciclo corto de BTC"},
@@ -497,7 +498,7 @@ def process_updates(db):
                         db.execute("INSERT OR IGNORE INTO telegram_subscribers(chat_id) VALUES (?)",
                                    (chat_id,))
                         reply = (help_text(is_owner)
-                                 + "\\n\\n✅ Este chat recibirá señales, revisiones y resultados oficiales. "
+                                 + "\n\n✅ Este chat recibirá señales, revisiones y resultados oficiales. "
                                  "Usa /parar para dejar de recibirlos.")
                     else:
                         reply = help_text(is_owner)
