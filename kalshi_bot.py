@@ -564,7 +564,7 @@ def train_adaptive_model(db, now):
 
 
 def adaptive_model_allows(db, features, direction):
-    """Use a validated model as a veto when it strongly disagrees with the signal."""
+    """Keep the trained model advisory; it may log disagreement but never block signals."""
     if features is None:
         return True
     row = db.execute("SELECT model_json FROM adaptive_models WHERE name='btc_direction'").fetchone()
@@ -583,13 +583,11 @@ def adaptive_model_allows(db, features, direction):
         model_direction = "UP" if probability_up >= 0.5 else "DOWN"
         confidence = max(probability_up, 1.0 - probability_up)
         if model_direction != direction and confidence >= 0.58:
-            log.info("Adaptive model vetoed %s signal: model favors %s (%.1f%%)",
+            log.info("Adaptive model advisory disagrees with %s: favors %s (%.1f%%); allowing signal",
                      direction, model_direction, confidence * 100)
-            return False
     except (KeyError, TypeError, ValueError, IndexError, ZeroDivisionError):
         log.exception("Adaptive model could not read its saved parameters")
     return True
-
 
 def maybe_train_adaptive_model(db, now):
     """Train daily, retrying after five more scored examples when data/model checks fail."""
@@ -609,7 +607,7 @@ def maybe_train_adaptive_model(db, now):
 
 
 def adaptive_direction_gate(db, phase, direction):
-    """Pause weak recent phase or direction buckets; never auto-reverse."""
+    """Report weak recent accuracy without pausing forecast alerts."""
     phase_rows = db.execute("""SELECT predicted_direction, actual_direction
         FROM kalshi_prediction_feedback
         WHERE status='evaluated' AND source='bot_forecast' AND phase=?
@@ -618,18 +616,16 @@ def adaptive_direction_gate(db, phase, direction):
         phase_hits = sum(predicted == actual for predicted, actual in phase_rows)
         phase_accuracy = phase_hits / len(phase_rows)
         if phase_accuracy < 0.55:
-            log.info("Adaptive filter paused %s: %d/%d recent forecasts matched",
-                     phase, phase_hits, len(phase_rows))
-            return False
+            log.info("Adaptive advisory: %s accuracy %.0f%% (%d/%d); allowing signal",
+                     phase, phase_accuracy * 100, phase_hits, len(phase_rows))
     direction_rows = [(predicted, actual) for predicted, actual in phase_rows
                       if predicted == direction][:8]
     if len(direction_rows) >= 4:
         hits = sum(actual == direction for _, actual in direction_rows)
         accuracy = hits / len(direction_rows)
         if accuracy < 0.55:
-            log.info("Adaptive filter paused %s %s: %d/%d recent forecasts matched",
-                     phase, direction, hits, len(direction_rows))
-            return False
+            log.info("Adaptive advisory: %s %s accuracy %.0f%% (%d/%d); allowing signal",
+                     phase, direction, accuracy * 100, hits, len(direction_rows))
     return True
 
 def rafa_candle_context(db, ticker, phase, now):
