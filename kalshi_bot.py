@@ -24,7 +24,7 @@ EARLY_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("EARLY_WINDOW_SECONDS"
 LATE_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("LATE_WINDOW_SECONDS", "300")))
 COMBO_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("COMBO_WINDOW_SECONDS", "360")))
 MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
-BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-v4.10-learning-cooldown")
+BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-v4.11-no-auto-pauses")
 PANEL_URL = os.getenv("RAFA_PANEL_URL", "").rstrip("/")
 PANEL_SECRET = os.getenv("RAFA_PANEL_SECRET", "")
 PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
@@ -37,7 +37,7 @@ RULES_SNAPSHOT = json.dumps({
     "minimum_volume_24h": str(MIN_VOLUME),
     "signal_rule": "Kraken BTC/USD close projection confirmed by 1m and 5m trends; Kalshi official settlement scored separately",
     "btc_cycle_context": "Latest three official BTC 15m outcomes and historical next-outcome frequencies; only a validated pattern can veto a weak conflicting projection",
-    "accuracy_pause_cooldown_seconds": 900,
+    "automatic_accuracy_pauses": False,
     "combo_rule": "Independent BTC + ETH forecasts; send only when both pass their asset checks within the final six minutes",
     "automatic_orders": False,
 }, separators=(",", ":"), sort_keys=True)
@@ -797,7 +797,7 @@ def train_adaptive_model(db, now):
 
 
 def adaptive_model_allows(db, features, direction):
-    """Use a sufficiently validated model to veto strong directional disagreement."""
+    """Log model disagreements for learning without suppressing requested alerts."""
     if features is None:
         return True
     row = db.execute("SELECT model_json FROM adaptive_models WHERE name='btc_direction'").fetchone()
@@ -819,9 +819,8 @@ def adaptive_model_allows(db, features, direction):
         model_direction = "UP" if probability_up >= 0.5 else "DOWN"
         confidence = max(probability_up, 1.0 - probability_up)
         if model_direction != direction and confidence >= 0.65:
-            log.info("Skipping signal: validated adaptive model favors %s over %s (%.1f%%)",
-                     model_direction, direction, confidence * 100)
-            return False
+            log.info("Adaptive model disagrees: leans %s vs signal %s (%.1f%%); alert remains enabled",
+                     model_direction, direction, confidence*100)
     except (KeyError, TypeError, ValueError, IndexError, ZeroDivisionError):
         log.exception("Adaptive model could not read its saved parameters")
     return True
@@ -844,7 +843,7 @@ def maybe_train_adaptive_model(db, now):
 
 
 def adaptive_direction_gate(db, phase, direction, asset="BTC"):
-    """Pause only temporarily after poor accuracy, then allow a measured re-entry signal."""
+    """Measure recent accuracy for learning, but never pause an alert automatically."""
     if phase == "COMBO_6M":
         table = db.execute("""SELECT 1 FROM sqlite_master
             WHERE type='table' AND name='kalshi_combo_forecasts'""").fetchone()
@@ -854,44 +853,28 @@ def adaptive_direction_gate(db, phase, direction, asset="BTC"):
         ticker_column = prefix + "_ticker"
         direction_column = prefix + "_direction"
         rows = db.execute(f"""SELECT c.{direction_column},
-                CASE WHEN r.result='yes' THEN 'UP' ELSE 'DOWN' END,
-                r.observed_at
+                CASE WHEN r.result='yes' THEN 'UP' ELSE 'DOWN' END
             FROM kalshi_combo_forecasts c
             JOIN kalshi_only_results r ON r.ticker=c.{ticker_column}
             WHERE r.result IN ('yes','no')
             ORDER BY r.observed_at DESC LIMIT 12""").fetchall()
     else:
-        rows = db.execute("""SELECT predicted_direction, actual_direction, evaluated_at
+        rows = db.execute("""SELECT predicted_direction, actual_direction
             FROM kalshi_prediction_feedback
             WHERE status='evaluated' AND source='bot_forecast' AND phase=?
               AND predicted_direction IN ('UP','DOWN') AND actual_direction IN ('UP','DOWN')
             ORDER BY evaluated_at DESC LIMIT 12""", (phase,)).fetchall()
-
-    direction_rows = [(predicted, actual) for predicted, actual, _ in rows
+    direction_rows = [(predicted, actual) for predicted, actual in rows
                       if predicted == direction][:8]
-    last_scored_at = float(rows[0][2]) if rows and rows[0][2] is not None else 0.0
-    cooldown_expired = not last_scored_at or time.time()-last_scored_at >= 900
-
-    if len(direction_rows) >= 6:
+    if len(direction_rows) >= 4:
         hits = sum(actual == direction for _, actual in direction_rows)
         accuracy = hits / len(direction_rows)
-        if accuracy < 0.40:
-            if not cooldown_expired:
-                log.warning("Pausing %s %s %s after poor recent accuracy: %.0f%% (%d/%d)",
-                            phase, asset, direction, accuracy * 100, hits, len(direction_rows))
-                return False
-            log.info("Reopening %s %s %s for one measured signal after cooldown",
-                     phase, asset, direction)
-
-    if len(rows) >= 10:
-        hits = sum(predicted == actual for predicted, actual, _ in rows)
-        accuracy = hits / len(rows)
-        if accuracy < 0.35:
-            if not cooldown_expired:
-                log.warning("Pausing %s signals after poor recent accuracy: %.0f%% (%d/%d)",
-                            phase, accuracy * 100, hits, len(rows))
-                return False
-            log.info("Reopening %s for one measured signal after cooldown", phase)
+        log.info("Learning context %s %s %s accuracy %.0f%% (%d/%d); alert remains enabled",
+                 phase, asset, direction, accuracy * 100, hits, len(direction_rows))
+    if len(rows) >= 4:
+        hits = sum(predicted == actual for predicted, actual in rows)
+        log.info("Learning context %s overall accuracy %.0f%% (%d/%d); alert remains enabled",
+                 phase, 100*hits/len(rows), hits, len(rows))
     return True
 
 def rafa_candle_context(db, ticker, phase, now):
@@ -1156,9 +1139,8 @@ def signal(db, m, now, phase, kraken_direction=None):
     cycle_bias, cycle_summary = btc_cycle_context(db, now)
     if (cycle_bias and cycle_bias != direction
             and weak_projection_vs_recent_range(start, projected, now)):
-        log.info("Skipping %s %s: weak price projection conflicts with BTC 15m cycle context (%s)",
+        log.info("%s %s: weak projection conflicts with BTC 15m cycle context (%s); alert remains enabled",
                  ticker, phase, cycle_bias)
-        return
     if direction != five_min_direction:
         log.info("Skipping %s %s: close projection conflicts with five-minute direction", ticker, phase)
         return
@@ -1588,9 +1570,8 @@ def combo_leg(db, market, now, asset, one_minute_direction):
         cycle_bias, cycle_summary = btc_cycle_context(db, now)
         if (cycle_bias and cycle_bias != direction
                 and weak_projection_vs_recent_range(start, projected, now)):
-            log.info("Skipping BTC combo leg: weak price projection conflicts with 15m cycle context (%s)",
+            log.info("BTC combo leg: weak projection conflicts with 15m cycle context (%s); alert remains enabled",
                      cycle_bias)
-            return None
     if direction != five_minute_direction:
         return None
     if not adaptive_direction_gate(db, "COMBO_6M", direction, asset):
