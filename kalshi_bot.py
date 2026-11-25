@@ -18,7 +18,7 @@ DB_PATH = os.getenv("DB_PATH", "/var/data/kalshi_bot.sqlite3")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
-COMBO_WINDOW_SECONDS = max(60, int(os.getenv("COMBO_WINDOW_SECONDS", "360")))
+COMBO_WINDOW_SECONDS = max(60, int(os.getenv("COMBO_WINDOW_SECONDS", "300")))
 MIN_VOLUME = Decimal("0")
 BOT_VERSION = os.getenv("BOT_VERSION", "rafa-learning-history-btc-eth")
 PANEL_URL = os.getenv("RAFA_PANEL_URL", "").rstrip("/")
@@ -27,8 +27,8 @@ PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
 RULES_SNAPSHOT = json.dumps({
     "series": SERIES, "eth_series": ETH_SERIES,
     "scan_seconds": SCAN_SECONDS, "combo_window_seconds": COMBO_WINDOW_SECONDS,
-    "signal_rule": "EARLY_5M direction from validated BTC model and official outcomes/close history; Kraken provides BTC/USD price reference and move size, not a direction gate",
-    "combo_rule": "BTC + ETH during final six minutes; each leg requires matching one-minute and five-minute Kraken direction and matching projected direction, with prior adaptive model check",
+    "signal_rule": "Opening and final-five-minute direction from Kalshi official close cycles plus live Kalshi YES movement; Kraken is used only as BTC/USD price reference",
+    "combo_rule": "Sample BTC and ETH Kalshi markets from open; send a combo during the final five minutes using settled cycles and live Kalshi YES movement; Kraken supplies BTC/USD price only",
     "learning": "Score new BTC and combo legs against Kalshi official settlement and retain feedback history",
     "automatic_orders": False,
 }, separators=(",", ":"), sort_keys=True)
@@ -901,66 +901,97 @@ def adaptive_model_prediction(db, features):
         return None
 
 
+def cycle_pattern_summary(db, asset):
+    """Summarize completed Kalshi cycles and sampled time above/below 50 cents."""
+    if asset == "BTC":
+        markets = db.execute("""SELECT ticker,direction FROM kalshi_15m_outcomes
+            WHERE direction IN ('UP','DOWN') ORDER BY close_time DESC LIMIT 20""").fetchall()
+    else:
+        markets = db.execute("""SELECT ticker,CASE WHEN result='yes' THEN 'UP' ELSE 'DOWN' END
+            FROM kalshi_only_results WHERE ticker LIKE ? AND result IN ('yes','no')
+            ORDER BY observed_at DESC LIMIT 20""", (ETH_SERIES + "-%",)).fetchall()
+    completed = len(markets)
+    up_closes = sum(direction == "UP" for _, direction in markets)
+    down_closes = completed - up_closes
+    above_seconds = below_seconds = flips = observed_cycles = 0.0
+    if markets:
+        tickers = [ticker for ticker, _ in markets]
+        placeholders = ",".join("?" for _ in tickers)
+        samples = db.execute(
+            f"SELECT ticker,observed_at,yes_mid FROM kalshi_only_samples "
+            f"WHERE ticker IN ({placeholders}) ORDER BY ticker,observed_at",
+            tickers).fetchall()
+        by_ticker = {}
+        for ticker, observed, raw_mid in samples:
+            mid = dec(raw_mid)
+            if mid is not None:
+                by_ticker.setdefault(ticker, []).append((float(observed), mid))
+        for ticker in tickers:
+            points = by_ticker.get(ticker, [])
+            if len(points) < 2:
+                continue
+            observed_cycles += 1
+            for (time_a, mid_a), (time_b, mid_b) in zip(points, points[1:]):
+                elapsed = max(0.0, time_b-time_a)
+                if mid_a >= Decimal("0.50"):
+                    above_seconds += elapsed
+                    if mid_b < Decimal("0.50"):
+                        flips += 1
+                else:
+                    below_seconds += elapsed
+                    if mid_b >= Decimal("0.50"):
+                        flips += 1
+    if observed_cycles:
+        above_avg = above_seconds/60/observed_cycles
+        below_avg = below_seconds/60/observed_cycles
+        flip_avg = flips/observed_cycles
+        quote_text = (f"Kalshi YES >50¢ {above_avg:.1f} min/ciclo · "
+                      f"<50¢ {below_avg:.1f} min/ciclo · {flip_avg:.1f} giros/ciclo")
+    else:
+        quote_text = "duración y giros intracontrato: reuniendo muestras"
+    return {
+        "markets": markets, "completed": completed, "up": up_closes,
+        "down": down_closes,
+        "summary": (f"Ciclos cerrados n={completed}: UP {up_closes}/DOWN {down_closes}; "
+                    f"{quote_text}."),
+    }
+
+
 def learned_direction(db, market, asset, now, phase):
-    """Combine validated learning, official results, and collected quote movement."""
-    ticker = market.get("ticker", "")
+    """Combine completed Kalshi cycles with this contract's live Kalshi quote movement."""
     q = quote(market)
     if q is None:
         return None
     _, _, mid = q
     close_at = ts(market.get("close_time")) or now+900
     prior_quote = db.execute("""SELECT yes_mid FROM kalshi_only_samples
-        WHERE ticker=? AND observed_at<? ORDER BY observed_at DESC LIMIT 1""",
-        (ticker, now)).fetchone()
+        WHERE ticker=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 1""",
+        (market.get("ticker", ""), now-60)).fetchone()
     prior_mid = dec(prior_quote[0]) if prior_quote else None
     quote_change = float(mid-prior_mid) if prior_mid is not None else 0.0
-    btc_streak, _, cycle_bias, cycle_summary = prepare_btc_opening_context(db, now)
-    feature_phase = "LAST_5M" if phase == "COMBO_6M" else "EARLY_5M"
+    cycle = cycle_pattern_summary(db, asset)
+    outcomes = [direction for _, direction in cycle["markets"]]
+    history_score = ((cycle["up"]-cycle["down"])/cycle["completed"]
+                     if cycle["completed"] else 0.0)
+    live_score = max(-1.0, min(1.0, quote_change/0.05))
+    # Give the current contract's live Kalshi chart a slight edge over older cycles.
+    combined_score = 0.60*live_score + 0.40*history_score
+    if combined_score > 0:
+        direction = "UP"
+    elif combined_score < 0:
+        direction = "DOWN"
+    elif outcomes:
+        direction = outcomes[0]
+    else:
+        direction = "UP" if mid >= Decimal("0.50") else "DOWN"
+    btc_streak, _, _, cycle_summary = prepare_btc_opening_context(db, now)
+    feature_phase = "LAST_5M" if phase in ("LAST_5M", "COMBO_5M") else "EARLY_5M"
     features = make_model_features(feature_phase, mid, quote_change,
                                    close_at-now, btc_streak)
-    if asset == "BTC":
-        model_vote = adaptive_model_prediction(db, features)
-        if model_vote:
-            direction, probability_up, samples, score = model_vote
-            return (direction, features,
-                    f"modelo adaptativo validado · n={samples} · validación {score:.0%}",
-                    quote_change, cycle_summary)
-        if cycle_bias in ("UP", "DOWN"):
-            return (cycle_bias, features, "patrón de cierres BTC validado",
-                    quote_change, cycle_summary)
-
-    if asset == "BTC":
-        rows = db.execute("""SELECT direction FROM kalshi_15m_outcomes
-            WHERE close_time<=? AND direction IN ('UP','DOWN')
-            ORDER BY close_time DESC LIMIT 20""", (int(now),)).fetchall()
-        outcomes = [row[0] for row in rows]
-    else:
-        prefix = "KXETH15M-%"
-        rows = db.execute("""SELECT CASE WHEN result='yes' THEN 'UP' ELSE 'DOWN' END
-            FROM kalshi_only_results WHERE ticker LIKE ? AND result IN ('yes','no')
-            ORDER BY observed_at DESC LIMIT 20""", (prefix,)).fetchall()
-        outcomes = [row[0] for row in rows]
-    if outcomes:
-        up_count = outcomes.count("UP")
-        down_count = outcomes.count("DOWN")
-        if up_count > down_count:
-            direction = "UP"
-        elif down_count > up_count:
-            direction = "DOWN"
-        elif quote_change:
-            direction = "UP" if quote_change > 0 else "DOWN"
-        else:
-            direction = outcomes[0]
-        return (direction, features,
-                f"cierres oficiales recientes · n={len(outcomes)} · UP {up_count} / DOWN {down_count}",
-                quote_change, cycle_summary)
-    if quote_change:
-        direction = "UP" if quote_change > 0 else "DOWN"
-        return (direction, features, "movimiento reciente de la cotización Kalshi",
-                quote_change, cycle_summary)
-    direction = "UP" if mid >= Decimal("0.50") else "DOWN"
-    return (direction, features, "cotización Kalshi disponible; historial aún reuniéndose",
-            quote_change, cycle_summary)
+    basis = (f"Kalshi actual + histórico n={cycle['completed']} "
+             f"(UP {cycle['up']}/DOWN {cycle['down']}) + movimiento YES {quote_change:+.3f}")
+    return (direction, features, basis, quote_change,
+            f"{cycle['summary']} {cycle_summary}")
 
 
 def maybe_train_adaptive_model(db, now):
@@ -1324,7 +1355,7 @@ def learned_signal(db, market, now):
 
 
 def signal(db, m, now, phase, kraken_direction=None):
-    """Send a Kraken BTC/USD forecast; keep Kalshi settlement separate."""
+    """Issue opening or final-five-minute BTC forecasts; Kalshi sets direction."""
     ticker = m["ticker"]
     alert_key = (ticker, phase)
     if alert_key in alerted_phases:
@@ -1340,89 +1371,71 @@ def signal(db, m, now, phase, kraken_direction=None):
     volume = dec(m.get("volume_24h_fp"))
     if volume is None:
         volume = dec(m.get("volume_24h"))
-    if volume is None or volume < MIN_VOLUME:
-        return
+    volume = volume or Decimal(0)
     close_at = ts(m.get("close_time"))
-    if close_at is None or close_at <= now:
-        return
     opened_at = ts(m.get("open_time"))
+    if close_at is None or opened_at is None or close_at <= now:
+        return
+    remaining = close_at-now
+    elapsed = now-opened_at
     if phase == "EARLY_5M":
-        elapsed = now - opened_at if opened_at is not None else None
-        if elapsed is None or elapsed < 60 or elapsed > 300:
+        if not (60 <= elapsed <= 300):
             return
-        history_direction, _, history_basis, _, _ = learned_direction(
-            db, m, "BTC", now, "EARLY_5M")
-        if history_direction not in ("UP", "DOWN"):
-            log.info("Skipping %s %s: prior official-close context has no direction", ticker, phase)
+    elif phase == "LAST_5M":
+        if not (0 < remaining <= 300):
             return
-        projection = kraken_first_minute_projection(now, close_at-now, opened_at)
+    else:
+        return
+    forecast = learned_direction(db, m, "BTC", now, phase)
+    if forecast is None:
+        return
+    direction, _, history_basis, quote_change, cycle_summary = forecast
+    if phase == "EARLY_5M":
+        projection = kraken_first_minute_projection(now, remaining, opened_at)
         if projection is None:
-            log.info("Skipping %s %s: opening price reference is unavailable", ticker, phase)
+            log.info("Skipping %s opening forecast: BTC price reference unavailable",
+                     ticker)
             return
         start, raw_projected = projection
         move = abs(raw_projected-start)
         if move <= 0:
-            log.info("Skipping %s %s: opening price range is unavailable", ticker, phase)
             return
-        # Kraken supplies the price reference and move size; historical learning sets the direction.
-        projected = start + move if history_direction == "UP" else start - move
-        direction = history_direction
-        log.info("Early direction from prior official-close context: %s (%s)",
-                 direction, history_basis)
+        projected = start + move if direction == "UP" else start-move
+        phase_label = "APERTURA · PRIMEROS 5 MIN"
     else:
-        five_min_direction = kraken_trend_5m(now)
-        if five_min_direction not in ("UP", "DOWN") or kraken_direction not in ("UP", "DOWN"):
-            log.info("Skipping %s %s: Kraken trend is unavailable", ticker, phase)
-            return
-        if five_min_direction != kraken_direction:
-            log.info("Skipping %s %s: one-minute and five-minute Kraken trends disagree", ticker, phase)
-            return
-        projection = kraken_close_projection(now, close_at-now)
+        projection = kraken_close_projection(now, remaining)
         if projection is None:
+            log.info("Skipping %s final-five forecast: BTC price reference unavailable",
+                     ticker)
             return
-        start, projected = projection
-        direction = "UP" if projected > start else "DOWN"
-        if (phase == "LAST_5M"
-                and market_already_prices_direction_at_99(mid, direction, close_at-now)):
-            log.info("Skipping %s %s: Kalshi already prices %s near 99%% within four minutes",
-                     ticker, phase, direction)
+        start, raw_projected = projection
+        move = abs(raw_projected-start)
+        if move <= 0:
             return
-        if direction != five_min_direction:
-            log.info("Skipping %s %s: close projection conflicts with five-minute direction", ticker, phase)
-            return
-    btc_streak, streak_text, cycle_bias, cycle_summary = prepare_btc_opening_context(db, now)
-    if (cycle_bias and cycle_bias != direction
-            and weak_projection_vs_recent_range(start, projected, now)):
-        log.info("%s %s: weak projection conflicts with BTC 15m cycle context (%s); alert remains enabled",
-                 ticker, phase, cycle_bias)
-    if not adaptive_direction_gate(db, phase, direction):
-        log.info("Skipping %s %s: recent outcomes paused this phase/direction", ticker, phase)
-        return
+        projected = start + move if direction == "UP" else start-move
+        phase_label = "ÚLTIMOS 5 MIN"
+    first_projection = kraken_nearest_level_projection(now, direction, (start, projected))
+    if first_projection is None or first_projection[1] == start:
+        first_projection = (start, projected)
+    first_target = first_projection[1]
+    btc_streak, streak_text, _, _ = prepare_btc_opening_context(db, now)
     prior_quote = db.execute("""SELECT yes_mid FROM kalshi_only_samples
         WHERE ticker=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 1""",
         (ticker, now-60)).fetchone()
     prior_mid = dec(prior_quote[0]) if prior_quote else None
     kalshi_change = float(mid-prior_mid) if prior_mid is not None else 0.0
-    cycle_text = f"{streak_text}\n{cycle_summary}"
-    model_features = make_model_features(phase, mid, kalshi_change, close_at-now, btc_streak)
-    if not adaptive_model_allows(db, model_features, direction):
-        log.info("Skipping %s %s: validated BTC model disagrees", ticker, phase)
-        return
-    if phase == "EARLY_5M":
-        first_projection = projection
-    else:
-        first_projection = kraken_nearest_level_projection(now, direction, projection)
-        if first_projection is None or first_projection[1] == start:
-            return
-    first_target = first_projection[1]
-    bias, bias_evidence = target_close_bias(now, close_at-now, start, first_target, projected, kraken_samples)
+    model_features = make_model_features(phase, mid, kalshi_change,
+                                         remaining, btc_streak)
+    cycle_text = f"{streak_text}\n{cycle_summary}\nBase: {history_basis}"
+    bias, bias_evidence = target_close_bias(
+        now, remaining, start, first_target, projected, kraken_samples)
     db.execute("""CREATE TABLE IF NOT EXISTS rafa_close_estimates
         (id TEXT PRIMARY KEY, estimated TEXT, absolute_error TEXT)""")
-    confirmation = "Kraken BTC/USD"
-    phase_label = "PRIMEROS 5 MIN" if phase == "EARLY_5M" else "ÚLTIMOS 5 MIN"
-    confidence = closing_confidence(db, ticker, phase, direction, now, close_at-now, start, projected)
-    message, photo = forecast_display(ticker, phase_label, direction, confidence,
-                                      start, first_target, projected, bias, bias_evidence, cycle_text)
+    confidence = closing_confidence(
+        db, ticker, phase, direction, now, remaining, start, projected)
+    message, photo = forecast_display(
+        ticker, phase_label, direction, confidence, start, first_target,
+        projected, bias, bias_evidence, cycle_text)
     if notify(message, db=db, broadcast=True, photo=photo):
         alerted_phases.add(alert_key)
         db.execute("""INSERT OR IGNORE INTO kalshi_only_alerts
@@ -1430,17 +1443,23 @@ def signal(db, m, now, phase, kraken_direction=None):
             VALUES (?,?,?,?,?,?)""",
             (ticker, phase, now, direction, BOT_VERSION, RULES_SNAPSHOT))
         db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
-            (id,ticker,phase,predicted_direction,issued_at,close_at,start_price,target_price,status,source,bot_version,rules_snapshot,model_features)
+            (id,ticker,phase,predicted_direction,issued_at,close_at,start_price,
+             target_price,status,source,bot_version,rules_snapshot,model_features)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (f"kraken-primary:{ticker}:{phase}",ticker,phase,direction,now,close_at,str(start),str(first_target),"pending","bot_forecast",BOT_VERSION,"Kraken BTC/USD separate first target and close estimate",
-             json.dumps(model_features, separators=(",", ":")) if model_features is not None else None))
+            (f"kalshi-cycle:{ticker}:{phase}",ticker,phase,direction,now,close_at,
+             str(start),str(first_target),"pending","bot_forecast",BOT_VERSION,
+             RULES_SNAPSHOT,
+             json.dumps(model_features, separators=(",", ":"))
+             if model_features is not None else None))
         db.execute("INSERT OR IGNORE INTO rafa_close_estimates (id,estimated) VALUES (?,?)",
-                   (f"kraken-primary:{ticker}:{phase}",str(projected)))
+                   (f"kalshi-cycle:{ticker}:{phase}",str(projected)))
         try:
-            shadow_record(db, ticker, phase, now, direction, q, Decimal(str(kalshi_change)), volume, kraken_direction)
+            shadow_record(db, ticker, phase, now, direction, q, Decimal(str(kalshi_change)),
+                          volume, None)
         except Exception:
             log.exception("Rafa shadow recording failed")
-        log.info("Kalshi %s forecast: %s %s; Kraken=%s (%s)", phase, ticker, direction, kraken_direction, confirmation)
+        log.info("Kalshi %s forecast: %s %s; BTC price reference from Kraken only",
+                 phase, ticker, direction)
 
 def evaluate_btc_forecasts(db, now):
     """Score forecast direction and whether its first target was touched before expiry."""
@@ -1811,61 +1830,63 @@ def market_already_prices_direction_at_99(yes_mid, direction, remaining):
     return False
 
 
-def combo_leg(db, market, now, asset, one_minute_direction):
-    """Use the prior BTC/ETH combo confirmation filters from November 24."""
+def combo_leg(db, market, now, asset, one_minute_direction=None):
+    """Choose direction from Kalshi history and current chart; Kraken never votes."""
     q = quote(market)
     if q is None:
-        return None
-    volume = dec(market.get("volume_24h_fp"))
-    if volume is None:
-        volume = dec(market.get("volume_24h"))
-    if volume is None or volume < MIN_VOLUME:
         return None
     close_at = ts(market.get("close_time"))
     opened = ts(market.get("open_time"))
     if close_at is None or opened is None or close_at <= now or abs((close_at-opened)-900) > 60:
         return None
+    forecast = learned_direction(db, market, asset, now, "COMBO_5M")
+    if forecast is None:
+        return None
+    direction, features, basis, quote_change, pattern_summary = forecast
     if asset == "BTC":
-        five_minute_direction = kraken_trend_5m(now)
         projection = kraken_close_projection(now, close_at-now)
-        first_projection_fn = kraken_nearest_level_projection
+        if projection is None:
+            return None
+        start, raw_projected = projection
+        move = abs(raw_projected-start)
+        if move <= 0:
+            return None
+        projected = start+move if direction == "UP" else start-move
+        first_projection = kraken_nearest_level_projection(
+            now, direction, (start, projected))
+        if first_projection is None or first_projection[1] == start:
+            first_projection = (start, projected)
         symbol = "BTC/USD"
+        price_unit = "USD"
+        volume = dec(market.get("volume_24h_fp")) or dec(market.get("volume_24h")) or Decimal(0)
     else:
-        five_minute_direction = eth_kraken_trend_5m(now)
-        projection = eth_close_projection(now, close_at-now)
-        first_projection_fn = eth_nearest_level_projection
-        symbol = "ETH/USD"
-    if (one_minute_direction not in ("UP", "DOWN")
-            or five_minute_direction not in ("UP", "DOWN")
-            or one_minute_direction != five_minute_direction
-            or projection is None):
-        return None
-    start, projected = projection
-    direction = "UP" if projected > start else "DOWN"
-    if direction != five_minute_direction:
-        return None
-    if not adaptive_direction_gate(db, "COMBO_6M", direction, asset):
-        return None
-    first_projection = first_projection_fn(now, direction, projection)
-    if first_projection is None or first_projection[1] == start:
-        return None
-    features = None
-    if asset == "BTC":
-        prior = db.execute("""SELECT yes_mid FROM kalshi_only_samples
+        # No Kraken ETH feed is used. The ETH leg shows Kalshi YES price movement.
+        mid = q[2]
+        start = mid
+        previous = db.execute("""SELECT yes_mid FROM kalshi_only_samples
             WHERE ticker=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 1""",
             (market["ticker"], now-60)).fetchone()
-        prior_mid = dec(prior[0]) if prior else None
-        change = float(q[2]-prior_mid) if prior_mid is not None else 0.0
-        btc_streak, _, _, cycle_summary = prepare_btc_opening_context(db, now)
-        features = make_model_features("LAST_5M", q[2], change, close_at-now, btc_streak)
-        if not adaptive_model_allows(db, features, direction):
-            return None
+        previous_mid = dec(previous[0]) if previous else None
+        move = abs(mid-previous_mid) if previous_mid is not None else Decimal("0")
+        move = max(move, Decimal("0.01"))
+        horizon = min(Decimal("1"), max(Decimal("0"), Decimal(str(close_at-now))/Decimal("300")))
+        projected = mid + (move*horizon if direction == "UP" else -move*horizon)
+        projected = min(Decimal("0.99"), max(Decimal("0.01"), projected))
+        first_projection = (start, projected)
+        symbol = "ETH · Kalshi YES"
+        price_unit = "YES"
+        volume = dec(market.get("volume_24h_fp")) or dec(market.get("volume_24h")) or Decimal(0)
+    if first_projection[1] == start:
+        first_projection = (start, projected)
+    btc_streak, _, _, _ = prepare_btc_opening_context(db, now)
     return {
         "asset": asset, "ticker": market["ticker"], "direction": direction,
         "start": start, "target": first_projection[1], "projected": projected,
-        "volume": volume, "symbol": symbol, "model_features": features,
-        "cycle_summary": cycle_summary if asset == "BTC" else "",
+        "volume": volume, "symbol": symbol, "price_unit": price_unit,
+        "model_features": features, "learning_basis": basis,
+        "cycle_summary": pattern_summary,
     }
+
 
 def send_btc_eth_combo(db, btc_market, eth_market, now,
                        btc_one_minute_direction, eth_one_minute_direction):
@@ -1873,7 +1894,7 @@ def send_btc_eth_combo(db, btc_market, eth_market, now,
     if btc_close is None or eth_close is None or abs(btc_close-eth_close) > 2:
         return
     remaining = btc_close-now
-    if not (0 < remaining <= COMBO_WINDOW_SECONDS):
+    if not (0 < remaining <= min(COMBO_WINDOW_SECONDS, 300)):
         return
     btc_leg = combo_leg(db, btc_market, now, "BTC", btc_one_minute_direction)
     eth_leg = combo_leg(db, eth_market, now, "ETH", eth_one_minute_direction)
@@ -1892,15 +1913,15 @@ def send_btc_eth_combo(db, btc_market, eth_market, now,
     _, streak_text = recent_btc_streak(db, now)
     cycle_text = f"{streak_text}\n{btc_leg['cycle_summary']}"
     message = (
-        "🧩 COMBO BTC + ETH · ÚLTIMOS 6 MIN\n"
+        "🧩 COMBO BTC + ETH · ÚLTIMOS 5 MIN\n"
         f"⏳ Tiempo restante: {minutes:02d}:{seconds:02d}\n"
         f"🧾 BTC: {btc_leg['ticker']}\n"
-        f"{direction_label(btc_leg['direction'])} · inicio USD {btc_leg['start']:,.2f} "
-        f"→ objetivo USD {btc_leg['target']:,.2f} · cierre estimado USD {btc_leg['projected']:,.2f}\n"
+        f"{direction_label(btc_leg['direction'])} · inicio BTC/USD ${btc_leg['start']:,.2f} "
+        f"→ objetivo ${btc_leg['target']:,.2f} · cierre estimado ${btc_leg['projected']:,.2f}\n"
         f"🧠 Base BTC: {btc_leg['learning_basis']}\n"
         f"🧾 ETH: {eth_leg['ticker']}\n"
-        f"{direction_label(eth_leg['direction'])} · inicio USD {eth_leg['start']:,.2f} "
-        f"→ objetivo USD {eth_leg['target']:,.2f} · cierre estimado USD {eth_leg['projected']:,.2f}\n"
+        f"{direction_label(eth_leg['direction'])} · Kalshi YES inicia ${eth_leg['start']:.3f} "
+        f"→ objetivo ${eth_leg['target']:.3f} · cierre estimado ${eth_leg['projected']:.3f}\n"
         f"🧠 Base ETH: {eth_leg['learning_basis']}\n"
         f"{history}\n"
         f"{cycle_text}\n"
@@ -1965,6 +1986,8 @@ def scan():
                 journal_opening_quote(db, market, now, opened, closes)
             open_btc.append(market)
             signal(db, market, now, "EARLY_5M", kraken_direction)
+            if closes-now <= 300:
+                signal(db, market, now, "LAST_5M", kraken_direction)
             send_early_wait_notice(db, market, now)
         if eth_payload is not None:
             for market in eth_payload.get("markets", []):
