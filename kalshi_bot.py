@@ -1164,6 +1164,11 @@ def signal(db, m, now, phase, kraken_direction=None):
         return
     start, projected = projection
     direction = "UP" if projected > start else "DOWN"
+    if (phase == "LAST_5M"
+            and market_already_prices_direction_at_99(mid, direction, close_at-now)):
+        log.info("Skipping %s %s: Kalshi already prices %s near 99%% within four minutes",
+                 ticker, phase, direction)
+        return
     if direction != five_min_direction:
         log.info("Skipping %s %s: close projection conflicts with five-minute direction", ticker, phase)
         return
@@ -1562,6 +1567,17 @@ def combo_history_summary(db, now):
             f"ETH {eth_hits/count:.0%} · combo completo {combo_hits/count:.0%}.")
 
 
+def market_already_prices_direction_at_99(yes_mid, direction, remaining):
+    """Only suppress a late forecast when Kalshi already prices its direction near 99%."""
+    if remaining > 240:
+        return False
+    if direction == "UP":
+        return yes_mid >= Decimal("0.99")
+    if direction == "DOWN":
+        return yes_mid <= Decimal("0.01")
+    return False
+
+
 def combo_leg(db, market, now, asset, one_minute_direction):
     """Apply the existing forecast checks independently to one combo leg."""
     q = quote(market)
@@ -1593,6 +1609,10 @@ def combo_leg(db, market, now, asset, one_minute_direction):
         return None
     start, projected = projection
     direction = "UP" if projected > start else "DOWN"
+    if market_already_prices_direction_at_99(q[2], direction, close_at-now):
+        log.info("Skipping %s combo leg: Kalshi already prices %s near 99%% within four minutes",
+                 market["ticker"], direction)
+        return None
     cycle_summary = None
     if asset == "BTC":
         cycle_bias, cycle_summary = btc_cycle_context(db, now)
