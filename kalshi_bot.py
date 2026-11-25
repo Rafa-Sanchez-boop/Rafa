@@ -24,7 +24,7 @@ EARLY_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("EARLY_WINDOW_SECONDS"
 LATE_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("LATE_WINDOW_SECONDS", "300")))
 COMBO_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("COMBO_WINDOW_SECONDS", "360")))
 MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
-BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-v4.9-cycle-cache")
+BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-v4.10-learning-cooldown")
 PANEL_URL = os.getenv("RAFA_PANEL_URL", "").rstrip("/")
 PANEL_SECRET = os.getenv("RAFA_PANEL_SECRET", "")
 PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
@@ -37,6 +37,7 @@ RULES_SNAPSHOT = json.dumps({
     "minimum_volume_24h": str(MIN_VOLUME),
     "signal_rule": "Kraken BTC/USD close projection confirmed by 1m and 5m trends; Kalshi official settlement scored separately",
     "btc_cycle_context": "Latest three official BTC 15m outcomes and historical next-outcome frequencies; only a validated pattern can veto a weak conflicting projection",
+    "accuracy_pause_cooldown_seconds": 900,
     "combo_rule": "Independent BTC + ETH forecasts; send only when both pass their asset checks within the final six minutes",
     "automatic_orders": False,
 }, separators=(",", ":"), sort_keys=True)
@@ -843,7 +844,7 @@ def maybe_train_adaptive_model(db, now):
 
 
 def adaptive_direction_gate(db, phase, direction, asset="BTC"):
-    """Pause a direction only after enough recent scored forecasts show poor accuracy."""
+    """Pause only temporarily after poor accuracy, then allow a measured re-entry signal."""
     if phase == "COMBO_6M":
         table = db.execute("""SELECT 1 FROM sqlite_master
             WHERE type='table' AND name='kalshi_combo_forecasts'""").fetchone()
@@ -853,33 +854,44 @@ def adaptive_direction_gate(db, phase, direction, asset="BTC"):
         ticker_column = prefix + "_ticker"
         direction_column = prefix + "_direction"
         rows = db.execute(f"""SELECT c.{direction_column},
-                CASE WHEN r.result='yes' THEN 'UP' ELSE 'DOWN' END
+                CASE WHEN r.result='yes' THEN 'UP' ELSE 'DOWN' END,
+                r.observed_at
             FROM kalshi_combo_forecasts c
             JOIN kalshi_only_results r ON r.ticker=c.{ticker_column}
             WHERE r.result IN ('yes','no')
-            ORDER BY c.issued_at DESC LIMIT 12""").fetchall()
+            ORDER BY r.observed_at DESC LIMIT 12""").fetchall()
     else:
-        rows = db.execute("""SELECT predicted_direction, actual_direction
+        rows = db.execute("""SELECT predicted_direction, actual_direction, evaluated_at
             FROM kalshi_prediction_feedback
             WHERE status='evaluated' AND source='bot_forecast' AND phase=?
               AND predicted_direction IN ('UP','DOWN') AND actual_direction IN ('UP','DOWN')
             ORDER BY evaluated_at DESC LIMIT 12""", (phase,)).fetchall()
-    direction_rows = [(predicted, actual) for predicted, actual in rows
+
+    direction_rows = [(predicted, actual) for predicted, actual, _ in rows
                       if predicted == direction][:8]
+    last_scored_at = float(rows[0][2]) if rows and rows[0][2] is not None else 0.0
+    cooldown_expired = not last_scored_at or time.time()-last_scored_at >= 900
+
     if len(direction_rows) >= 6:
         hits = sum(actual == direction for _, actual in direction_rows)
         accuracy = hits / len(direction_rows)
         if accuracy < 0.40:
-            log.warning("Pausing %s %s %s after poor recent accuracy: %.0f%% (%d/%d)",
-                        phase, asset, direction, accuracy * 100, hits, len(direction_rows))
-            return False
+            if not cooldown_expired:
+                log.warning("Pausing %s %s %s after poor recent accuracy: %.0f%% (%d/%d)",
+                            phase, asset, direction, accuracy * 100, hits, len(direction_rows))
+                return False
+            log.info("Reopening %s %s %s for one measured signal after cooldown",
+                     phase, asset, direction)
+
     if len(rows) >= 10:
-        hits = sum(predicted == actual for predicted, actual in rows)
+        hits = sum(predicted == actual for predicted, actual, _ in rows)
         accuracy = hits / len(rows)
         if accuracy < 0.35:
-            log.warning("Pausing %s signals after poor recent accuracy: %.0f%% (%d/%d)",
-                        phase, accuracy * 100, hits, len(rows))
-            return False
+            if not cooldown_expired:
+                log.warning("Pausing %s signals after poor recent accuracy: %.0f%% (%d/%d)",
+                            phase, accuracy * 100, hits, len(rows))
+                return False
+            log.info("Reopening %s for one measured signal after cooldown", phase)
     return True
 
 def rafa_candle_context(db, ticker, phase, now):
