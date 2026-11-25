@@ -26,7 +26,7 @@ PANEL_SECRET = os.getenv("RAFA_PANEL_SECRET", "")
 PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
 RULES_SNAPSHOT = json.dumps({
     "series": SERIES, "eth_series": ETH_SERIES,
-    "scan_seconds": SCAN_SECONDS, "combo_window_seconds": COMBO_WINDOW_SECONDS,
+    "scan_seconds": SCAN_SECONDS, "combo_window_seconds": min(COMBO_WINDOW_SECONDS, 300),
     "signal_rule": "Opening and final-five-minute direction from Kalshi official close cycles plus live Kalshi YES movement; Kraken is used only as BTC/USD price reference",
     "combo_rule": "Sample BTC and ETH Kalshi markets from open; send a combo during the final five minutes using settled cycles and live Kalshi YES movement; Kraken supplies BTC/USD price only",
     "learning": "Score new BTC and combo legs against Kalshi official settlement and retain feedback history",
@@ -48,14 +48,14 @@ btc_cycle_context_cache = None
 btc_opening_context_cache = None
 
 def kraken_trend(now):
-    """Compare real Kraken BTC/USD last trades at least 60 seconds apart."""
+    """Refresh the BTC/USD reference price and retain price samples only."""
     global kraken_last_quote
     try:
         response = http.get(KRAKEN_URL, params={"pair": "XBTUSD"}, timeout=10)
         response.raise_for_status()
         payload = response.json()
         if payload.get("error") or not payload.get("result"):
-            log.warning("Kraken returned no valid ticker")
+            log.warning("Kraken returned no valid BTC/USD ticker")
             return None
         item = next(iter(payload["result"].values()))
         price = dec(item["c"][0])
@@ -63,13 +63,11 @@ def kraken_trend(now):
             return None
         kraken_last_quote = (now, price)
         kraken_samples.append((now, price))
-        kraken_samples[:] = [(t, p) for t, p in kraken_samples if now - t <= 600]
-        prior = next((p for t, p in reversed(kraken_samples) if t <= now - 60), None)
-        if prior is None or price == prior:
-            return None
-        return "UP" if price > prior else "DOWN"
-    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError, StopIteration):
-        log.exception("Kraken BTC/USD quote failed")
+        kraken_samples[:] = [(t, p) for t, p in kraken_samples if now-t <= 600]
+        return None
+    except (requests.RequestException, ValueError, KeyError, IndexError,
+            TypeError, StopIteration):
+        log.exception("Kraken BTC/USD price reference failed")
         return None
 
 kraken_5m_snapshot = None
@@ -1854,7 +1852,7 @@ def market_already_prices_direction_at_99(yes_mid, direction, remaining):
     return False
 
 
-def combo_leg(db, market, now, asset, one_minute_direction=None):
+def combo_leg(db, market, now, asset):
     """Choose direction from Kalshi history and current chart; Kraken never votes."""
     q = quote(market)
     if q is None:
@@ -1912,16 +1910,15 @@ def combo_leg(db, market, now, asset, one_minute_direction=None):
     }
 
 
-def send_btc_eth_combo(db, btc_market, eth_market, now,
-                       btc_one_minute_direction, eth_one_minute_direction):
+def send_btc_eth_combo(db, btc_market, eth_market, now):
     btc_close, eth_close = ts(btc_market.get("close_time")), ts(eth_market.get("close_time"))
     if btc_close is None or eth_close is None or abs(btc_close-eth_close) > 2:
         return
     remaining = btc_close-now
     if not (0 < remaining <= min(COMBO_WINDOW_SECONDS, 300)):
         return
-    btc_leg = combo_leg(db, btc_market, now, "BTC", btc_one_minute_direction)
-    eth_leg = combo_leg(db, eth_market, now, "ETH", eth_one_minute_direction)
+    btc_leg = combo_leg(db, btc_market, now, "BTC")
+    eth_leg = combo_leg(db, eth_market, now, "ETH")
     if btc_leg is None or eth_leg is None:
         return
     combo_key = btc_leg["ticker"] + "|" + eth_leg["ticker"]
@@ -1988,8 +1985,7 @@ def scan():
             sync_dashboard(db, now)
         return
     # Keep spot histories fresh for learned feature vectors and combo price projections.
-    kraken_direction = kraken_trend(now)
-    eth_kraken_direction = eth_kraken_trend(now) if eth_payload is not None else None
+    kraken_trend(now)  # BTC/USD reference only; it does not choose UP or DOWN.
     with db_open() as db:
         record_kalshi_15m_chart(db, now)
         record_settled_eth_results(db, now)
@@ -2010,9 +2006,9 @@ def scan():
                 sample(db, ticker, now, q[2])
                 journal_opening_quote(db, market, now, opened, closes)
             open_btc.append(market)
-            signal(db, market, now, "EARLY_5M", kraken_direction)
+            signal(db, market, now, "EARLY_5M")
             if closes-now <= 300:
-                signal(db, market, now, "LAST_5M", kraken_direction)
+                signal(db, market, now, "LAST_5M")
             send_early_wait_notice(db, market, now)
         if eth_payload is not None:
             for market in eth_payload.get("markets", []):
@@ -2034,8 +2030,7 @@ def scan():
             for eth_market in open_eth:
                 eth_close = ts(eth_market.get("close_time"))
                 if btc_close is not None and eth_close is not None and abs(btc_close-eth_close) <= 2:
-                    send_btc_eth_combo(db, btc_market, eth_market, now,
-                                       kraken_direction, eth_kraken_direction)
+                    send_btc_eth_combo(db, btc_market, eth_market, now)
         if int(now // 300) != int((now-SCAN_SECONDS) // 300):
             check_results(db, now)
         maybe_train_adaptive_model(db, now)
