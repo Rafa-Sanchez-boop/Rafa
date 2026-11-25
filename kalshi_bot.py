@@ -457,38 +457,33 @@ def db_open():
          btc REAL, volatility REAL, candidate TEXT, PRIMARY KEY(ticker,phase))""")
     db.execute("""CREATE TABLE IF NOT EXISTS rafa_shadow_daily
         (day TEXT PRIMARY KEY, report TEXT NOT NULL)""")
-    reset_version = "learning-reset-2026-11-25-v1"
+    reset_version = "learning-reset-2026-11-25-v2"
     reset_row = db.execute(
         "SELECT value FROM telegram_state WHERE key='learning_reset_version'").fetchone()
     if not reset_row or reset_row[0] != reset_version:
-        learning_tables = (
+        reset_tables = (
             "kalshi_only_samples", "kalshi_15m_outcomes",
+            "kalshi_15m_chart_sent", "kalshi_only_alerts",
             "kalshi_only_results", "kalshi_prediction_feedback",
             "adaptive_models", "kalshi_opening_journal", "rafa_shadow",
             "rafa_shadow_daily", "rafa_candle_context",
             "rafa_shadow_milestones", "rafa_close_estimates",
+            "kalshi_wait_notices", "kalshi_combo_forecasts",
+            "kalshi_combo_reviews",
         )
-        for table in learning_tables:
+        for table in reset_tables:
             exists = db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
                 (table,)).fetchone()
             if exists:
                 db.execute(f"DELETE FROM {table}")
-        # Retain only currently open combo rows so a deploy cannot repeat a combo.
-        combo_table = db.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kalshi_combo_forecasts'"
-        ).fetchone()
-        if combo_table:
-            db.execute("DELETE FROM kalshi_combo_forecasts WHERE close_at <= ?", (time.time(),))
-            db.execute("""DELETE FROM kalshi_combo_reviews
-                          WHERE combo_key NOT IN
-                          (SELECT combo_key FROM kalshi_combo_forecasts)""")
-        db.execute("DELETE FROM telegram_state WHERE key='adaptive_training_state'")
+        db.execute("DELETE FROM telegram_state WHERE key IN "
+                   "('adaptive_training_state','dashboard_sync_attempt')")
         db.execute("""INSERT INTO telegram_state(key,value)
                       VALUES ('learning_reset_version',?)
                       ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
                    (reset_version,))
-        log.warning("Prior learning and model history cleared; Telegram access and alert deduplication preserved")
+        log.warning("Learning, model, and signal history cleared; Telegram access preserved")
     db.commit()
     return db
 
