@@ -285,6 +285,9 @@ def kraken_close_projection(now, remaining):
     if current == prior:
         return None
     change_5m = current - prior
+    # Match the 3 PM filter: do not project insignificant five-minute movement.
+    if abs(change_5m) < current * Decimal("0.0001"):
+        return None
     # Keep the forecast horizon aligned with a five-minute window.
     horizon = min(max(Decimal("0"), Decimal(str(remaining))), Decimal("300"))
     projected = current + change_5m * horizon / Decimal("300")
@@ -1122,14 +1125,20 @@ def signal(db, m, now, phase, kraken_direction=None):
     if close_at is None or close_at <= now:
         return
     five_min_direction = kraken_trend_5m(now)
-    if five_min_direction not in ("UP", "DOWN"):
-        log.info("Skipping %s %s: five-minute Kraken trend is unavailable", ticker, phase)
+    if five_min_direction not in ("UP", "DOWN") or kraken_direction not in ("UP", "DOWN"):
+        log.info("Skipping %s %s: Kraken trend is unavailable", ticker, phase)
+        return
+    if five_min_direction != kraken_direction:
+        log.info("Skipping %s %s: one-minute and five-minute Kraken trends disagree", ticker, phase)
         return
     projection = kraken_close_projection(now, close_at-now)
     if projection is None:
         return
     start, projected = projection
     direction = "UP" if projected > start else "DOWN"
+    if direction != five_min_direction:
+        log.info("Skipping %s %s: close projection conflicts with five-minute direction", ticker, phase)
+        return
     cycle_bias, cycle_summary = btc_cycle_context(db, now)
     if (cycle_bias and cycle_bias != direction
             and weak_projection_vs_recent_range(start, projected, now)):
