@@ -303,9 +303,6 @@ def kraken_close_projection(now, remaining):
     if current == prior:
         return None
     change_5m = current - prior
-    # Match the 3 PM filter: do not project insignificant five-minute movement.
-    if abs(change_5m) < current * Decimal("0.0001"):
-        return None
     # Keep the forecast horizon aligned with a five-minute window.
     horizon = min(max(Decimal("0"), Decimal(str(remaining))), Decimal("300"))
     projected = current + change_5m * horizon / Decimal("300")
@@ -718,6 +715,27 @@ def record_kalshi_15m_chart(db, now):
         db.execute("INSERT OR IGNORE INTO kalshi_15m_chart_sent VALUES (?)",
                    (close_time,))
 
+def record_settled_eth_results(db, now):
+    """Keep recent official ETH 15-minute settlements for Kalshi-only cycle learning."""
+    payload = get_json("/markets", {
+        "series_ticker": ETH_SERIES, "status": "settled", "limit": 100
+    })
+    if payload is None:
+        return
+    for market in payload.get("markets", []):
+        ticker = market.get("ticker", "")
+        if not isinstance(ticker, str) or not ticker.startswith(ETH_SERIES + "-"):
+            continue
+        opened, closes = ts(market.get("open_time")), ts(market.get("close_time"))
+        result = str(market.get("result") or "").lower()
+        if (opened is None or closes is None or closes > now
+                or abs((closes-opened)-900) > 60 or result not in ("yes","no")):
+            continue
+        db.execute("""INSERT OR IGNORE INTO kalshi_only_results
+            (ticker,result,observed_at) VALUES (?,?,?)""",
+            (ticker,result,closes))
+
+
 def journal_opening_quote(db, market, now, open_at, close_at):
     """Record an opening-minute quote for later out-of-sample evaluation."""
     elapsed = now - open_at
@@ -964,9 +982,15 @@ def learned_direction(db, market, asset, now, phase):
         return None
     _, _, mid = q
     close_at = ts(market.get("close_time")) or now+900
-    prior_quote = db.execute("""SELECT yes_mid FROM kalshi_only_samples
-        WHERE ticker=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 1""",
-        (market.get("ticker", ""), now-60)).fetchone()
+    opened_at = ts(market.get("open_time"))
+    if phase == "EARLY_5M" and opened_at is not None:
+        prior_quote = db.execute("""SELECT yes_mid FROM kalshi_only_samples
+            WHERE ticker=? AND observed_at>=? AND observed_at<? ORDER BY observed_at LIMIT 1""",
+            (market.get("ticker", ""), opened_at, now)).fetchone()
+    else:
+        prior_quote = db.execute("""SELECT yes_mid FROM kalshi_only_samples
+            WHERE ticker=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 1""",
+            (market.get("ticker", ""), now-60)).fetchone()
     prior_mid = dec(prior_quote[0]) if prior_quote else None
     quote_change = float(mid-prior_mid) if prior_mid is not None else 0.0
     cycle = cycle_pattern_summary(db, asset)
@@ -1427,8 +1451,8 @@ def signal(db, m, now, phase, kraken_direction=None):
     model_features = make_model_features(phase, mid, kalshi_change,
                                          remaining, btc_streak)
     cycle_text = f"{streak_text}\n{cycle_summary}\nBase: {history_basis}"
-    bias, bias_evidence = target_close_bias(
-        now, remaining, start, first_target, projected, kraken_samples)
+    # Kraken supplies BTC price levels only; it does not vote on direction or reversal.
+    bias, bias_evidence = None, "La dirección se calcula con cierres y cotización de Kalshi."
     db.execute("""CREATE TABLE IF NOT EXISTS rafa_close_estimates
         (id TEXT PRIMARY KEY, estimated TEXT, absolute_error TEXT)""")
     confidence = closing_confidence(
@@ -1968,6 +1992,7 @@ def scan():
     eth_kraken_direction = eth_kraken_trend(now) if eth_payload is not None else None
     with db_open() as db:
         record_kalshi_15m_chart(db, now)
+        record_settled_eth_results(db, now)
         prepare_btc_opening_context(db, now)
         open_btc = []
         open_eth = []
