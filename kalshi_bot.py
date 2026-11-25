@@ -1102,6 +1102,34 @@ def forecast_display(ticker, phase_label, direction, confidence, start, target, 
     )
     return message, None
 
+def send_early_wait_notice(db, m, now):
+    """Tell subscribers the first-five-minute analysis is waiting for confirmation."""
+    ticker = m.get("ticker", "")
+    if not ticker:
+        return
+    db.execute("""CREATE TABLE IF NOT EXISTS kalshi_wait_notices
+        (ticker TEXT, phase TEXT, sent_at REAL, PRIMARY KEY(ticker,phase))""")
+    if db.execute("""SELECT 1 FROM kalshi_only_alerts
+                     WHERE ticker=? AND phase='EARLY_5M' LIMIT 1""",
+                  (ticker,)).fetchone():
+        return
+    if db.execute("""SELECT 1 FROM kalshi_wait_notices
+                     WHERE ticker=? AND phase='EARLY_5M' LIMIT 1""",
+                  (ticker,)).fetchone():
+        return
+    message = (
+        "🟡 BTC · PRIMEROS 5 MIN\n"
+        f"🧾 {ticker}\n"
+        "⏳ Sin confirmación todavía.\n"
+        "Sigo analizando; aún no se reúnen las condiciones para confirmar UP o DOWN. "
+        "Si los filtros confirman una dirección antes de terminar esta ventana, te enviaré la predicción."
+    )
+    if notify(message, db=db, broadcast=True):
+        db.execute("INSERT OR IGNORE INTO kalshi_wait_notices (ticker,phase,sent_at) VALUES (?,?,?)",
+                   (ticker, "EARLY_5M", now))
+        log.info("Early forecast waiting notice sent: %s", ticker)
+
+
 def signal(db, m, now, phase, kraken_direction=None):
     """Send a Kraken BTC/USD forecast; keep Kalshi settlement separate."""
     ticker = m["ticker"]
@@ -1684,6 +1712,8 @@ def scan():
                 phase = "LAST_5M"
             if phase:
                 signal(db, m, now, phase, kraken_direction)
+                if phase == "EARLY_5M":
+                    send_early_wait_notice(db, m, now)
             if eth_payload is not None:
                 for eth_market in eth_payload.get("markets", []):
                     eth_ticker = eth_market.get("ticker", "")
