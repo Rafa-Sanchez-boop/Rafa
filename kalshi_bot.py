@@ -1231,9 +1231,10 @@ def forecast_display(ticker, phase_label, direction, confidence, start, target, 
     return message, None
 
 def send_early_wait_notice(db, m, now):
-    """Tell subscribers the first-five-minute analysis is waiting for confirmation."""
+    """Tell subscribers after the first 60 seconds if opening/close context has not confirmed a direction."""
     ticker = m.get("ticker", "")
-    if not ticker:
+    opened = ts(m.get("open_time"))
+    if not ticker or opened is None or not (60 <= now-opened <= 300):
         return
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_wait_notices
         (ticker TEXT, phase TEXT, sent_at REAL, PRIMARY KEY(ticker,phase))""")
@@ -1249,8 +1250,8 @@ def send_early_wait_notice(db, m, now):
         "🟡 BTC · PRIMEROS 5 MIN\n"
         f"🧾 {ticker}\n"
         "⏳ Sin confirmación todavía.\n"
-        "Sigo analizando; aún no se reúnen las condiciones para confirmar UP o DOWN. "
-        "Si los filtros confirman una dirección antes de terminar esta ventana, te enviaré la predicción."
+        "Ya revisé los primeros 60 segundos junto con los cierres oficiales anteriores. "
+        "Aún no hay confirmación suficiente de UP o DOWN; sigo evaluando y enviaré la señal si coincide la evidencia dentro de esta ventana."
     )
     if notify(message, db=db, broadcast=True):
         db.execute("INSERT OR IGNORE INTO kalshi_wait_notices (ticker,phase,sent_at) VALUES (?,?,?)",
@@ -1347,6 +1348,15 @@ def signal(db, m, now, phase, kraken_direction=None):
             log.info("Skipping %s %s: opening 60-second price sample is unavailable", ticker, phase)
             return
         start, projected = projection
+        history_direction, _, history_basis, _, _ = learned_direction(
+            db, m, "BTC", now, "EARLY_5M")
+        if history_direction not in ("UP", "DOWN"):
+            log.info("Skipping %s %s: prior official-close context has no direction", ticker, phase)
+            return
+        if history_direction != kraken_direction:
+            log.info("Skipping %s %s: opening 60-second move %s disagrees with prior-close context %s (%s)",
+                     ticker, phase, kraken_direction, history_direction, history_basis)
+            return
         direction = kraken_direction
     else:
         five_min_direction = kraken_trend_5m(now)
@@ -1942,7 +1952,7 @@ def scan():
                 journal_opening_quote(db, market, now, opened, closes)
             open_btc.append(market)
             signal(db, market, now, "EARLY_5M", kraken_direction)
-            learned_signal(db, market, now)
+            send_early_wait_notice(db, market, now)
         if eth_payload is not None:
             for market in eth_payload.get("markets", []):
                 ticker = market.get("ticker", "")
