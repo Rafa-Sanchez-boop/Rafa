@@ -24,7 +24,7 @@ EARLY_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("EARLY_WINDOW_SECONDS"
 LATE_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("LATE_WINDOW_SECONDS", "300")))
 COMBO_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("COMBO_WINDOW_SECONDS", "360")))
 MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
-BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-v4.8-adaptive-feedback")
+BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-v4.9-cycle-cache")
 PANEL_URL = os.getenv("RAFA_PANEL_URL", "").rstrip("/")
 PANEL_SECRET = os.getenv("RAFA_PANEL_SECRET", "")
 PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
@@ -52,6 +52,7 @@ kraken_last_quote = None
 eth_kraken_samples = []
 eth_kraken_last_quote = None
 eth_kraken_5m_snapshot = None
+btc_cycle_context_cache = None
 
 def kraken_trend(now):
     """Compare real Kraken BTC/USD last trades at least 60 seconds apart."""
@@ -527,72 +528,84 @@ def sample(db, ticker, now, mid):
                (ticker, now, str(mid)))
 
 def recent_btc_streak(db, now):
-    """Return the signed streak of the latest officially settled BTC 15m outcomes."""
+    """Return the signed streak of consecutive officially settled BTC 15m outcomes."""
     try:
-        rows = db.execute("""SELECT direction FROM kalshi_15m_outcomes
+        rows = db.execute("""SELECT close_time,direction FROM kalshi_15m_outcomes
             WHERE close_time<=? ORDER BY close_time DESC LIMIT 16""", (int(now),)).fetchall()
     except sqlite3.Error:
         log.exception("Recent BTC 15m streak unavailable")
         return 0.0, "Contexto de racha BTC 15m: datos no disponibles."
     if not rows:
         return 0.0, "Contexto de racha BTC 15m: reuniendo cierres oficiales."
-    direction = rows[0][0]
+    direction = rows[0][1]
     if direction not in ("UP", "DOWN"):
         return 0.0, "Contexto de racha BTC 15m: dato oficial inválido."
-    streak = 0
-    for (item_direction,) in rows:
-        if item_direction != direction:
+    streak = 1
+    previous_close = rows[0][0]
+    for close_time, item_direction in rows[1:]:
+        if item_direction != direction or previous_close-close_time != 900:
             break
         streak += 1
+        previous_close = close_time
     signed_streak = min(streak, 4) / 4.0
     if direction == "DOWN":
         signed_streak = -signed_streak
-    return signed_streak, f"📚 Contexto agregado BTC 15m: {direction_label(direction)} × {streak} cierres oficiales seguidos."
+    return signed_streak, f"📚 Contexto agregado BTC 15m: {direction_label(direction)} × {streak} cierres oficiales consecutivos."
 
 
 def btc_cycle_context(db, now):
-    """Compare the latest three official BTC 15m outcomes with prior matching sequences."""
-    rows = db.execute("""SELECT direction FROM kalshi_15m_outcomes
-        WHERE close_time<=? ORDER BY close_time ASC""", (int(now),)).fetchall()
-    directions = [row[0] for row in rows if row[0] in ("UP", "DOWN")]
-    if len(directions) < 3:
-        return None, "Patrón histórico BTC 15m: reuniendo tres cierres oficiales."
-    pattern = tuple(directions[-3:])
-    pattern_text = " → ".join(pattern)
-    following = [
-        directions[index]
-        for index in range(3, len(directions))
-        if tuple(directions[index-3:index]) == pattern
-    ]
-    count = len(following)
-    ups = sum(direction == "UP" for direction in following)
-    downs = count - ups
-    bias = None
-    if count >= 12:
-        posterior_up = (ups + 1) / (count + 2)
-        if posterior_up >= 0.65:
-            bias = "UP"
-        elif posterior_up <= 0.35:
-            bias = "DOWN"
-    if count:
-        summary = (f"Patrón anterior {pattern_text}: después hubo UP {ups}/{count} "
-                   f"y DOWN {downs}/{count} veces.")
-    else:
-        summary = f"Patrón anterior {pattern_text}: aún no hay casos posteriores comparables."
-    if bias is None:
-        summary += " Muestra insuficiente para inclinar la señal."
-    else:
-        summary += f" Sesgo histórico validado: {direction_label(bias)}."
-    return bias, summary
+    """Cache a bounded comparison of the latest three consecutive outcomes and prior matches."""
+    global btc_cycle_context_cache
+    latest_row = db.execute("""SELECT MAX(close_time) FROM kalshi_15m_outcomes
+        WHERE close_time<=?""", (int(now),)).fetchone()
+    latest_close = latest_row[0] if latest_row else None
+    if (btc_cycle_context_cache is not None
+            and btc_cycle_context_cache[0] == latest_close
+            and now-btc_cycle_context_cache[1] < 60):
+        return btc_cycle_context_cache[2], btc_cycle_context_cache[3]
 
-
-def weak_projection_vs_recent_range(start, projected, now):
-    """Flag a close projection smaller than one quarter of the recent five-minute range."""
-    recent = [price for timestamp, price in kraken_samples if now-300 <= timestamp <= now]
-    if start <= 0 or len(recent) < 2:
-        return False
-    recent_range = max(recent) - min(recent)
-    return recent_range > 0 and abs(projected-start) <= recent_range * Decimal("0.25")
+    rows = db.execute("""SELECT close_time,direction FROM kalshi_15m_outcomes
+        WHERE close_time<=? ORDER BY close_time DESC LIMIT 600""", (int(now),)).fetchall()
+    rows.reverse()
+    if len(rows) < 3:
+        result = (None, "Patrón histórico BTC 15m: reuniendo tres cierres oficiales.")
+    else:
+        times = [row[0] for row in rows]
+        directions = [row[1] for row in rows]
+        pattern = tuple(directions[-3:])
+        pattern_text = " → ".join(pattern)
+        if times[-1]-times[-2] != 900 or times[-2]-times[-3] != 900:
+            result = (None, "Patrón histórico BTC 15m: faltan cierres consecutivos para comparar.")
+        else:
+            following = []
+            for index in range(3, len(directions)):
+                if (times[index]-times[index-1] == 900
+                        and times[index-1]-times[index-2] == 900
+                        and times[index-2]-times[index-3] == 900
+                        and tuple(directions[index-3:index]) == pattern):
+                    following.append(directions[index])
+            count = len(following)
+            ups = sum(direction == "UP" for direction in following)
+            downs = count-ups
+            bias = None
+            if count >= 12:
+                posterior_up = (ups+1)/(count+2)
+                if posterior_up >= 0.65:
+                    bias = "UP"
+                elif posterior_up <= 0.35:
+                    bias = "DOWN"
+            if count:
+                summary = (f"Patrón anterior {pattern_text}: después hubo UP {ups}/{count} "
+                           f"y DOWN {downs}/{count} veces.")
+            else:
+                summary = f"Patrón anterior {pattern_text}: aún no hay casos consecutivos comparables."
+            if bias is None:
+                summary += " Muestra insuficiente para inclinar la señal."
+            else:
+                summary += f" Sesgo histórico validado: {direction_label(bias)}."
+            result = (bias, summary)
+    btc_cycle_context_cache = (latest_close, now, result[0], result[1])
+    return result
 
 
 def record_kalshi_15m_chart(db, now):
@@ -1146,7 +1159,6 @@ def signal(db, m, now, phase, kraken_direction=None):
     prior_mid = dec(prior_quote[0]) if prior_quote else None
     kalshi_change = float(mid-prior_mid) if prior_mid is not None else 0.0
     btc_streak, streak_text = recent_btc_streak(db, now)
-    _, cycle_summary = btc_cycle_context(db, now)
     cycle_text = f"{streak_text}\n{cycle_summary}"
     model_features = make_model_features(phase, mid, kalshi_change, close_at-now, btc_streak)
     if not adaptive_model_allows(db, model_features, direction):
@@ -1559,8 +1571,9 @@ def combo_leg(db, market, now, asset, one_minute_direction):
         return None
     start, projected = projection
     direction = "UP" if projected > start else "DOWN"
+    cycle_summary = None
     if asset == "BTC":
-        cycle_bias, _ = btc_cycle_context(db, now)
+        cycle_bias, cycle_summary = btc_cycle_context(db, now)
         if (cycle_bias and cycle_bias != direction
                 and weak_projection_vs_recent_range(start, projected, now)):
             log.info("Skipping BTC combo leg: weak price projection conflicts with 15m cycle context (%s)",
@@ -1586,7 +1599,7 @@ def combo_leg(db, market, now, asset, one_minute_direction):
     return {
         "asset": asset, "ticker": market["ticker"], "direction": direction,
         "start": start, "target": first_projection[1], "projected": projected,
-        "volume": volume, "symbol": symbol,
+        "volume": volume, "symbol": symbol, "cycle_summary": cycle_summary,
     }
 
 
@@ -1613,8 +1626,7 @@ def send_btc_eth_combo(db, btc_market, eth_market, now,
     history = combo_history_summary(db, now)
     minutes, seconds = divmod(max(0, int(remaining)), 60)
     _, streak_text = recent_btc_streak(db, now)
-    _, cycle_summary = btc_cycle_context(db, now)
-    cycle_text = f"{streak_text}\n{cycle_summary}"
+    cycle_text = f"{streak_text}\n{btc_leg['cycle_summary']}"
     message = (
         "🧩 COMBO BTC + ETH · ÚLTIMOS 6 MIN\n"
         f"⏳ Tiempo restante: {minutes:02d}:{seconds:02d}\n"
