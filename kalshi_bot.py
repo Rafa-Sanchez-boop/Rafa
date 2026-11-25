@@ -24,7 +24,7 @@ EARLY_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("EARLY_WINDOW_SECONDS"
 LATE_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("LATE_WINDOW_SECONDS", "300")))
 COMBO_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("COMBO_WINDOW_SECONDS", "360")))
 MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
-BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-v4.6-close-guards")
+BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-v4.7-cycle-context")
 PANEL_URL = os.getenv("RAFA_PANEL_URL", "").rstrip("/")
 PANEL_SECRET = os.getenv("RAFA_PANEL_SECRET", "")
 PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
@@ -525,6 +525,30 @@ def sample(db, ticker, now, mid):
     db.execute("INSERT OR IGNORE INTO kalshi_only_samples VALUES (?,?,?)",
                (ticker, now, str(mid)))
 
+def recent_btc_streak(db, now):
+    """Return the signed streak of the latest officially settled BTC 15m outcomes."""
+    try:
+        rows = db.execute("""SELECT direction FROM kalshi_15m_outcomes
+            WHERE close_time<=? ORDER BY close_time DESC LIMIT 16""", (int(now),)).fetchall()
+    except sqlite3.Error:
+        log.exception("Recent BTC 15m streak unavailable")
+        return 0.0, "Contexto de racha BTC 15m: datos no disponibles."
+    if not rows:
+        return 0.0, "Contexto de racha BTC 15m: reuniendo cierres oficiales."
+    direction = rows[0][0]
+    if direction not in ("UP", "DOWN"):
+        return 0.0, "Contexto de racha BTC 15m: dato oficial inválido."
+    streak = 0
+    for (item_direction,) in rows:
+        if item_direction != direction:
+            break
+        streak += 1
+    signed_streak = min(streak, 4) / 4.0
+    if direction == "DOWN":
+        signed_streak = -signed_streak
+    return signed_streak, f"📚 Contexto agregado BTC 15m: {direction_label(direction)} × {streak} cierres oficiales seguidos."
+
+
 def record_kalshi_15m_chart(db, now):
     """Store settled Kalshi BTC 15m outcomes and send their streak chart."""
     payload = get_json("/markets", {
@@ -605,7 +629,8 @@ def journal_opening_quote(db, market, now, open_at, close_at):
         VALUES (?,?,?,?,?,?,?)""",
         (market["ticker"], now, close_at, str(bid), str(ask), str(mid), kraken_price))
 
-def make_model_features(phase, mid, kalshi_change, remaining):
+def make_model_features(phase, mid, kalshi_change, remaining, btc_streak):
+
     """Capture only values available when the forecast is issued."""
     snapshot = kraken_5m_snapshot
     if (snapshot is None or time.time() - snapshot[0] > 30
@@ -618,6 +643,7 @@ def make_model_features(phase, mid, kalshi_change, remaining):
         float(kalshi_change) * 10.0,
         btc_return * 1000.0,
         max(0.0, min(1.0, float(remaining) / 900.0)),
+        max(-1.0, min(1.0, float(btc_streak))),
     ]
 
 
@@ -638,7 +664,7 @@ def train_adaptive_model(db, now):
     for raw_features, actual in rows:
         try:
             features = json.loads(raw_features)
-            if len(features) == 5 and all(math.isfinite(float(v)) for v in features):
+            if len(features) == 6 and all(math.isfinite(float(v)) for v in features):
                 examples.append(([float(v) for v in features], 1.0 if actual == "UP" else 0.0))
         except (TypeError, ValueError):
             continue
@@ -664,7 +690,7 @@ def train_adaptive_model(db, now):
     def normalize(features):
         return [(value - mean) / scale for value, mean, scale in zip(features, means, scales)]
 
-    weights = [0.0] * 6
+    weights = [0.0] * 7
     learning_rate = 0.04
     for _ in range(500):
         gradients = [0.0] * len(weights)
@@ -719,6 +745,8 @@ def adaptive_model_allows(db, features, direction):
         return True
     try:
         model = json.loads(row[0])
+        if len(model.get("means", [])) != len(features):
+            return True
         if (model.get("samples", 0) < 50
                 or model.get("balanced_accuracy", 0) < 0.58):
             return True
@@ -978,7 +1006,7 @@ def closing_confidence(db, ticker, phase, direction, now, remaining, start, proj
 
 
 def forecast_display(ticker, phase_label, direction, confidence, start, target, projected,
-                     bias_direction, bias_evidence):
+                     bias_direction, bias_evidence, cycle_text):
     """Format the plain-text BTC/Kalshi alert without the forecast card image."""
     if bias_direction == "UP":
         bias_text = "🔄 Posible giro en el objetivo: 🟢 UP · sesgo de cierre por encima del objetivo."
@@ -993,6 +1021,8 @@ def forecast_display(ticker, phase_label, direction, confidence, start, target, 
         f"🎯 Primer objetivo: USD {target:,.2f}\n"
         f"{bias_text}\n"
         f"📍 Cierre estimado por momentum: USD {projected:,.2f}\n"
+        f"{cycle_text}\n"
+        "La racha se usa como contexto estadístico; no impone la dirección.\n"
         "Kalshi: resultado oficial se evalúa por separado.\n"
         "Proyección experimental, no garantía."
     )
@@ -1043,7 +1073,8 @@ def signal(db, m, now, phase, kraken_direction=None):
         (ticker, now-60)).fetchone()
     prior_mid = dec(prior_quote[0]) if prior_quote else None
     kalshi_change = float(mid-prior_mid) if prior_mid is not None else 0.0
-    model_features = make_model_features(phase, mid, kalshi_change, close_at-now)
+    btc_streak, cycle_text = recent_btc_streak(db, now)
+    model_features = make_model_features(phase, mid, kalshi_change, close_at-now, btc_streak)
     if not adaptive_model_allows(db, model_features, direction):
         log.info("Skipping %s %s: validated BTC model disagrees", ticker, phase)
         return
@@ -1058,7 +1089,7 @@ def signal(db, m, now, phase, kraken_direction=None):
     phase_label = "PRIMEROS 5 MIN" if phase == "EARLY_5M" else "ÚLTIMOS 5 MIN"
     confidence = closing_confidence(db, ticker, phase, direction, now, close_at-now, start, projected)
     message, photo = forecast_display(ticker, phase_label, direction, confidence,
-                                      start, first_target, projected, bias, bias_evidence)
+                                      start, first_target, projected, bias, bias_evidence, cycle_text)
     if notify(message, db=db, broadcast=True, photo=photo):
         alerted_phases.add(alert_key)
         db.execute("""INSERT OR IGNORE INTO kalshi_only_alerts
@@ -1467,7 +1498,8 @@ def combo_leg(db, market, now, asset, one_minute_direction):
             (market["ticker"], now-60)).fetchone()
         prior_mid = dec(prior[0]) if prior else None
         change = float(q[2]-prior_mid) if prior_mid is not None else 0.0
-        features = make_model_features("LAST_5M", q[2], change, close_at-now)
+        btc_streak, _ = recent_btc_streak(db, now)
+        features = make_model_features("LAST_5M", q[2], change, close_at-now, btc_streak)
         if not adaptive_model_allows(db, features, direction):
             return None
     return {
@@ -1499,6 +1531,7 @@ def send_btc_eth_combo(db, btc_market, eth_market, now,
         return
     history = combo_history_summary(db, now)
     minutes, seconds = divmod(max(0, int(remaining)), 60)
+    _, cycle_text = recent_btc_streak(db, now)
     message = (
         "🧩 COMBO BTC + ETH · ÚLTIMOS 6 MIN\n"
         f"⏳ Tiempo restante: {minutes:02d}:{seconds:02d}\n"
@@ -1509,6 +1542,8 @@ def send_btc_eth_combo(db, btc_market, eth_market, now,
         f"{direction_label(eth_leg['direction'])} · inicio USD {eth_leg['start']:,.2f} "
         f"→ objetivo USD {eth_leg['target']:,.2f} · cierre estimado USD {eth_leg['projected']:,.2f}\n"
         f"{history}\n"
+        f"{cycle_text}\n"
+        "La racha oficial entra en el contexto estadístico BTC; no garantiza el próximo cierre.\n"
         "Combo experimental: ambas patas deben acertar; no garantiza resultado."
     )
     if not notify(message, db=db, broadcast=True):
