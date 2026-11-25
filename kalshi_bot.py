@@ -285,10 +285,7 @@ def kraken_close_projection(now, remaining):
     if current == prior:
         return None
     change_5m = current - prior
-    # Ignore tiny five-minute changes that are too small to support a directional projection.
-    if abs(change_5m) < current * Decimal("0.0001"):
-        return None
-    # Do not extend one observed five-minute impulse across a longer horizon.
+    # Keep the forecast horizon aligned with a five-minute window.
     horizon = min(max(Decimal("0"), Decimal(str(remaining))), Decimal("300"))
     projected = current + change_5m * horizon / Decimal("300")
     if projected <= 0:
@@ -1125,11 +1122,8 @@ def signal(db, m, now, phase, kraken_direction=None):
     if close_at is None or close_at <= now:
         return
     five_min_direction = kraken_trend_5m(now)
-    if five_min_direction not in ("UP", "DOWN") or kraken_direction not in ("UP", "DOWN"):
-        log.info("Skipping %s %s: Kraken trend is unavailable", ticker, phase)
-        return
-    if five_min_direction != kraken_direction:
-        log.info("Skipping %s %s: one-minute and five-minute Kraken trends disagree", ticker, phase)
+    if five_min_direction not in ("UP", "DOWN"):
+        log.info("Skipping %s %s: five-minute Kraken trend is unavailable", ticker, phase)
         return
     projection = kraken_close_projection(now, close_at-now)
     if projection is None:
@@ -1141,9 +1135,6 @@ def signal(db, m, now, phase, kraken_direction=None):
             and weak_projection_vs_recent_range(start, projected, now)):
         log.info("%s %s: weak projection conflicts with BTC 15m cycle context (%s); alert remains enabled",
                  ticker, phase, cycle_bias)
-    if direction != five_min_direction:
-        log.info("Skipping %s %s: close projection conflicts with five-minute direction", ticker, phase)
-        return
     if not adaptive_direction_gate(db, phase, direction):
         log.info("Skipping %s %s: recent outcomes paused this phase/direction", ticker, phase)
         return
