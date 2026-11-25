@@ -1822,23 +1822,58 @@ def sync_dashboard(db, now, force=False):
         log.exception("Prediction panel sync failed")
 
 
-def combo_history_summary(db, now):
+def combo_history_summary(db, now, btc_direction, eth_direction):
+    """Report smoothed historical rates for each leg and the exact combo pair."""
     rows = db.execute("""SELECT c.btc_direction,c.eth_direction,b.result,e.result
         FROM kalshi_combo_forecasts c
         JOIN kalshi_only_results b ON b.ticker=c.btc_ticker
         JOIN kalshi_only_results e ON e.ticker=c.eth_ticker
         WHERE c.issued_at<? AND b.result IN ('yes','no') AND e.result IN ('yes','no')
         ORDER BY c.issued_at DESC LIMIT 100""", (now,)).fetchall()
-    count = len(rows)
-    if count < 30:
-        return f"📊 Acierto histórico BTC+ETH: reuniendo datos ({count}/30); sin porcentaje todavía."
-    btc_hits = sum((bd == "UP") == (br == "yes") for bd, ed, br, er in rows)
-    eth_hits = sum((ed == "UP") == (er == "yes") for bd, ed, br, er in rows)
-    combo_hits = sum((bd == "UP") == (br == "yes") and
-                     (ed == "UP") == (er == "yes")
-                     for bd, ed, br, er in rows)
-    return (f"📊 Histórico (n={count}): BTC {btc_hits/count:.0%} · "
-            f"ETH {eth_hits/count:.0%} · combo completo {combo_hits/count:.0%}.")
+    evaluated = []
+    for btc_pred, eth_pred, btc_result, eth_result in rows:
+        btc_actual = "UP" if btc_result == "yes" else "DOWN"
+        eth_actual = "UP" if eth_result == "yes" else "DOWN"
+        evaluated.append((
+            btc_pred, eth_pred,
+            btc_pred == btc_actual,
+            eth_pred == eth_actual,
+        ))
+
+    def line(label, samples):
+        if not samples:
+            return f"{label}: reuniendo historial (n=0)"
+        hits = sum(samples)
+        n = len(samples)
+        # Laplace smoothing avoids reporting 100% from one or two lucky outcomes.
+        probability = (hits+1)/(n+2)
+        quality = "preliminar" if n < 10 else "histórica"
+        return f"{label}: {probability:.0%} {quality} ({hits}/{n}; n={n})"
+
+    btc_samples = [btc_ok for bd, ed, btc_ok, eth_ok in evaluated
+                   if bd == btc_direction]
+    eth_samples = [eth_ok for bd, ed, btc_ok, eth_ok in evaluated
+                   if ed == eth_direction]
+    pair_samples = [btc_ok and eth_ok for bd, ed, btc_ok, eth_ok in evaluated
+                    if bd == btc_direction and ed == eth_direction]
+    global_samples = [btc_ok and eth_ok for _, _, btc_ok, eth_ok in evaluated]
+    lines = [
+        "📊 Probabilidad basada en combos ya liquidados:",
+        line(f"BTC {btc_direction}", btc_samples),
+        line(f"ETH {eth_direction}", eth_samples),
+    ]
+    pair_label = f"Ambas ({btc_direction}+{eth_direction})"
+    if len(pair_samples) >= 5:
+        lines.append(line(pair_label, pair_samples))
+    elif pair_samples:
+        lines.append(line(pair_label, pair_samples) + " · muestra baja")
+    elif global_samples:
+        lines.append(
+            f"{pair_label}: pocos casos exactos (n=0); "
+            + line("base conjunta de todos los combos", global_samples))
+    else:
+        lines.append(f"{pair_label}: reuniendo historial (n=0)")
+    return "\n".join(lines)
 
 
 def market_already_prices_direction_at_99(yes_mid, direction, remaining):
@@ -1929,7 +1964,7 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
     if db.execute("SELECT 1 FROM kalshi_combo_forecasts WHERE combo_key=?",
                   (combo_key,)).fetchone():
         return
-    history = combo_history_summary(db, now)
+    history = combo_history_summary(db, now, btc_leg["direction"], eth_leg["direction"])
     minutes, seconds = divmod(max(0, int(remaining)), 60)
     _, streak_text = recent_btc_streak(db, now)
     cycle_text = f"{streak_text}\n{btc_leg['cycle_summary']}"
