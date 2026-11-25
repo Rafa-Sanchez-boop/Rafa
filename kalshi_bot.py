@@ -973,6 +973,28 @@ def cycle_pattern_summary(db, asset):
     }
 
 
+def combo_directional_bias(db, asset):
+    """Compare historical combo-leg accuracy for UP versus DOWN using official results."""
+    prefix = "btc" if asset == "BTC" else "eth"
+    ticker_column = prefix + "_ticker"
+    direction_column = prefix + "_direction"
+    rows = db.execute(f"""SELECT c.{direction_column},
+            CASE WHEN r.result='yes' THEN 'UP' ELSE 'DOWN' END
+        FROM kalshi_combo_forecasts c
+        JOIN kalshi_only_results r ON r.ticker=c.{ticker_column}
+        WHERE r.result IN ('yes','no')
+        ORDER BY c.issued_at DESC LIMIT 100""").fetchall()
+    rates = {}
+    for direction in ("UP", "DOWN"):
+        samples = [actual == direction for predicted, actual in rows
+                   if predicted == direction]
+        if len(samples) >= 5:
+            rates[direction] = (sum(samples)+1)/(len(samples)+2)
+    if "UP" not in rates or "DOWN" not in rates:
+        return 0.0
+    return max(-1.0, min(1.0, rates["UP"]-rates["DOWN"]))
+
+
 def learned_direction(db, market, asset, now, phase):
     """Combine completed Kalshi cycles with this contract's live Kalshi quote movement."""
     q = quote(market)
@@ -997,7 +1019,8 @@ def learned_direction(db, market, asset, now, phase):
                      if cycle["completed"] else 0.0)
     live_score = max(-1.0, min(1.0, quote_change/0.05))
     # Give the current contract's live Kalshi chart a slight edge over older cycles.
-    combined_score = 0.60*live_score + 0.40*history_score
+    combo_bias = combo_directional_bias(db, asset) if phase == "COMBO_5M" else 0.0
+    combined_score = 0.55*live_score + 0.35*history_score + 0.10*combo_bias
     if combined_score > 0:
         direction = "UP"
     elif combined_score < 0:
@@ -1935,10 +1958,14 @@ def combo_leg(db, market, now, asset):
         volume = dec(market.get("volume_24h_fp")) or dec(market.get("volume_24h")) or Decimal(0)
     if first_projection[1] == start:
         first_projection = (start, projected)
+    projected_move = abs(projected-start)
+    target_move = abs(first_projection[1]-start)
+    eta_seconds = (close_at-now) * min(1.0, float(target_move/projected_move)) if projected_move else close_at-now
     btc_streak, _, _, _ = prepare_btc_opening_context(db, now)
     return {
         "asset": asset, "ticker": market["ticker"], "direction": direction,
         "start": start, "target": first_projection[1], "projected": projected,
+        "move_amount": target_move, "eta_seconds": eta_seconds,
         "volume": volume, "symbol": symbol, "price_unit": price_unit,
         "model_features": features, "learning_basis": basis,
         "cycle_summary": pattern_summary,
@@ -1964,25 +1991,27 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
     if db.execute("SELECT 1 FROM kalshi_combo_forecasts WHERE combo_key=?",
                   (combo_key,)).fetchone():
         return
-    history = combo_history_summary(db, now, btc_leg["direction"], eth_leg["direction"])
-    minutes, seconds = divmod(max(0, int(remaining)), 60)
-    _, streak_text = recent_btc_streak(db, now)
-    cycle_text = f"{streak_text}\n{btc_leg['cycle_summary']}"
+    # Historical probability uses only prior combo forecasts with official settlements.
+    probability_stats = combo_history_summary(
+        db, now, btc_leg["direction"], eth_leg["direction"])
+    log.info("Internal combo calibration (not shown in alert): %s",
+             probability_stats.replace("\n", " | "))
+    btc_move_label = "Subida" if btc_leg["direction"] == "UP" else "Bajada"
+    eth_move_label = "Subida" if eth_leg["direction"] == "UP" else "Bajada"
+    btc_eta = max(0, int(btc_leg["eta_seconds"]))
+    eth_eta = max(0, int(eth_leg["eta_seconds"]))
+    btc_eta_label = f"{btc_eta//60:02d}:{btc_eta%60:02d}"
+    eth_eta_label = f"{eth_eta//60:02d}:{eth_eta%60:02d}"
     message = (
-        "🧩 COMBO BTC + ETH · ÚLTIMOS 5 MIN\n"
-        f"⏳ Tiempo restante: {minutes:02d}:{seconds:02d}\n"
-        f"🧾 BTC: {btc_leg['ticker']}\n"
-        f"{direction_label(btc_leg['direction'])} · inicio BTC/USD ${btc_leg['start']:,.2f} "
-        f"→ objetivo ${btc_leg['target']:,.2f} · cierre estimado ${btc_leg['projected']:,.2f}\n"
-        f"🧠 Base BTC: {btc_leg['learning_basis']}\n"
-        f"🧾 ETH: {eth_leg['ticker']}\n"
-        f"{direction_label(eth_leg['direction'])} · Kalshi YES inicia ${eth_leg['start']:.3f} "
-        f"→ objetivo ${eth_leg['target']:.3f} · cierre estimado ${eth_leg['projected']:.3f}\n"
-        f"🧠 Base ETH: {eth_leg['learning_basis']}\n"
-        f"{history}\n"
-        f"{cycle_text}\n"
-        "La racha oficial entra en el contexto estadístico BTC; no garantiza el próximo cierre.\n"
-        "Combo experimental: ambas patas deben acertar; no garantiza resultado."
+        "🧩 COMBO BTC + ETH\n"
+        f"BTC: {direction_label(btc_leg['direction'])}\n"
+        f"⏱ {btc_move_label} estimada en {btc_eta_label}\n"
+        f"📏 {btc_move_label} estimada: USD {btc_leg['move_amount']:,.2f}\n"
+        f"📍 Cierre estimado: USD {btc_leg['projected']:,.2f}\n"
+        f"ETH: {direction_label(eth_leg['direction'])}\n"
+        f"⏱ {eth_move_label} estimada en {eth_eta_label}\n"
+        f"📏 {eth_move_label} estimada (Kalshi YES): USD {eth_leg['move_amount']:.3f}\n"
+        f"📍 Cierre estimado (Kalshi YES): USD {eth_leg['projected']:.3f}"
     )
     if not notify(message, db=db, broadcast=True):
         return
