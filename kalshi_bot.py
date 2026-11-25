@@ -444,23 +444,6 @@ def db_open():
             ("rules_snapshot", "TEXT")):
         if column not in feedback_columns:
             db.execute(f"ALTER TABLE kalshi_prediction_feedback ADD COLUMN {column} {declaration}")
-    db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
-        (id, predicted_direction, actual_direction, status, source, note)
-        VALUES ('user-report-2026-11-23', 'DOWN', 'UP', 'reported',
-                'user_report',
-                'User reported the bot forecast moved left/down; BTC actually rose right/up. Exact ticker, time, and prices were not provided.')""")
-    db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
-        (id, predicted_direction, actual_direction, start_price, target_price,
-         actual_price, status, source, note)
-        VALUES ('user-report-target-61388-61645', 'UP', 'REVERSAL_NEAR_LEVEL',
-                '61388.40', '61645.95', '61388.40', 'reported',
-                'user_report',
-                'User reported the rise reversed near 61388.40; the bot target 61645.95 overshot the observed move. Exact ticker and timestamp were not provided.')""")
-    db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
-        (id, predicted_direction, actual_direction, status, source, note)
-        VALUES ('user-report-final-down-screenshot-20261123', 'UP', 'DOWN',
-                'reported', 'user_report',
-                'User-provided BTC 15-minute screenshots show a falling chart and red move of USD 64.05 then USD 64.14 with 1%/99% displayed. User reports the bot forecast UP but the market finished DOWN. Objective text is truncated (about 61,300.5); exact ticker, timestamp, and final BTC price are unavailable, so this remains a manual report, not an OHLC-verified result.')""")
     # Shadow journal: captures only the first quote observed during the
     # market's opening minute. It never sends alerts or places orders.
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_opening_journal
@@ -474,6 +457,38 @@ def db_open():
          btc REAL, volatility REAL, candidate TEXT, PRIMARY KEY(ticker,phase))""")
     db.execute("""CREATE TABLE IF NOT EXISTS rafa_shadow_daily
         (day TEXT PRIMARY KEY, report TEXT NOT NULL)""")
+    reset_version = "learning-reset-2026-11-25-v1"
+    reset_row = db.execute(
+        "SELECT value FROM telegram_state WHERE key='learning_reset_version'").fetchone()
+    if not reset_row or reset_row[0] != reset_version:
+        learning_tables = (
+            "kalshi_only_samples", "kalshi_15m_outcomes",
+            "kalshi_only_results", "kalshi_prediction_feedback",
+            "adaptive_models", "kalshi_opening_journal", "rafa_shadow",
+            "rafa_shadow_daily", "rafa_candle_context",
+            "rafa_shadow_milestones", "rafa_close_estimates",
+        )
+        for table in learning_tables:
+            exists = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,)).fetchone()
+            if exists:
+                db.execute(f"DELETE FROM {table}")
+        # Retain only currently open combo rows so a deploy cannot repeat a combo.
+        combo_table = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kalshi_combo_forecasts'"
+        ).fetchone()
+        if combo_table:
+            db.execute("DELETE FROM kalshi_combo_forecasts WHERE close_at <= ?", (time.time(),))
+            db.execute("""DELETE FROM kalshi_combo_reviews
+                          WHERE combo_key NOT IN
+                          (SELECT combo_key FROM kalshi_combo_forecasts)""")
+        db.execute("DELETE FROM telegram_state WHERE key='adaptive_training_state'")
+        db.execute("""INSERT INTO telegram_state(key,value)
+                      VALUES ('learning_reset_version',?)
+                      ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                   (reset_version,))
+        log.warning("Prior learning and model history cleared; Telegram access and alert deduplication preserved")
     db.commit()
     return db
 
@@ -1846,7 +1861,7 @@ def combo_leg(db, market, now, asset, one_minute_direction):
             (market["ticker"], now-60)).fetchone()
         prior_mid = dec(prior[0]) if prior else None
         change = float(q[2]-prior_mid) if prior_mid is not None else 0.0
-        btc_streak, _, _, _ = prepare_btc_opening_context(db, now)
+        btc_streak, _, _, cycle_summary = prepare_btc_opening_context(db, now)
         features = make_model_features("LAST_5M", q[2], change, close_at-now, btc_streak)
         if not adaptive_model_allows(db, features, direction):
             return None
@@ -1854,6 +1869,7 @@ def combo_leg(db, market, now, asset, one_minute_direction):
         "asset": asset, "ticker": market["ticker"], "direction": direction,
         "start": start, "target": first_projection[1], "projected": projected,
         "volume": volume, "symbol": symbol, "model_features": features,
+        "cycle_summary": cycle_summary if asset == "BTC" else "",
     }
 
 def send_btc_eth_combo(db, btc_market, eth_market, now,
