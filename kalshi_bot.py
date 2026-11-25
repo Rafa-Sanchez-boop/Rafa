@@ -549,6 +549,51 @@ def recent_btc_streak(db, now):
     return signed_streak, f"📚 Contexto agregado BTC 15m: {direction_label(direction)} × {streak} cierres oficiales seguidos."
 
 
+def btc_cycle_context(db, now):
+    """Compare the latest three official BTC 15m outcomes with prior matching sequences."""
+    rows = db.execute("""SELECT direction FROM kalshi_15m_outcomes
+        WHERE close_time<=? ORDER BY close_time ASC""", (int(now),)).fetchall()
+    directions = [row[0] for row in rows if row[0] in ("UP", "DOWN")]
+    if len(directions) < 3:
+        return None, "Patrón histórico BTC 15m: reuniendo tres cierres oficiales."
+    pattern = tuple(directions[-3:])
+    pattern_text = " → ".join(pattern)
+    following = [
+        directions[index]
+        for index in range(3, len(directions))
+        if tuple(directions[index-3:index]) == pattern
+    ]
+    count = len(following)
+    ups = sum(direction == "UP" for direction in following)
+    downs = count - ups
+    bias = None
+    if count >= 12:
+        posterior_up = (ups + 1) / (count + 2)
+        if posterior_up >= 0.65:
+            bias = "UP"
+        elif posterior_up <= 0.35:
+            bias = "DOWN"
+    if count:
+        summary = (f"Patrón anterior {pattern_text}: después hubo UP {ups}/{count} "
+                   f"y DOWN {downs}/{count} veces.")
+    else:
+        summary = f"Patrón anterior {pattern_text}: aún no hay casos posteriores comparables."
+    if bias is None:
+        summary += " Muestra insuficiente para inclinar la señal."
+    else:
+        summary += f" Sesgo histórico validado: {direction_label(bias)}."
+    return bias, summary
+
+
+def weak_projection_vs_recent_range(start, projected, now):
+    """Flag a close projection smaller than one quarter of the recent five-minute range."""
+    recent = [price for timestamp, price in kraken_samples if now-300 <= timestamp <= now]
+    if start <= 0 or len(recent) < 2:
+        return False
+    recent_range = max(recent) - min(recent)
+    return recent_range > 0 and abs(projected-start) <= recent_range * Decimal("0.25")
+
+
 def record_kalshi_15m_chart(db, now):
     """Store settled Kalshi BTC 15m outcomes and send their streak chart."""
     payload = get_json("/markets", {
@@ -1062,6 +1107,12 @@ def signal(db, m, now, phase, kraken_direction=None):
         return
     start, projected = projection
     direction = "UP" if projected > start else "DOWN"
+    cycle_bias, cycle_summary = btc_cycle_context(db, now)
+    if (cycle_bias and cycle_bias != direction
+            and weak_projection_vs_recent_range(start, projected, now)):
+        log.info("Skipping %s %s: weak price projection conflicts with BTC 15m cycle context (%s)",
+                 ticker, phase, cycle_bias)
+        return
     if direction != five_min_direction:
         log.info("Skipping %s %s: close projection conflicts with five-minute direction", ticker, phase)
         return
@@ -1073,7 +1124,9 @@ def signal(db, m, now, phase, kraken_direction=None):
         (ticker, now-60)).fetchone()
     prior_mid = dec(prior_quote[0]) if prior_quote else None
     kalshi_change = float(mid-prior_mid) if prior_mid is not None else 0.0
-    btc_streak, cycle_text = recent_btc_streak(db, now)
+    btc_streak, streak_text = recent_btc_streak(db, now)
+    _, cycle_summary = btc_cycle_context(db, now)
+    cycle_text = f"{streak_text}\n{cycle_summary}"
     model_features = make_model_features(phase, mid, kalshi_change, close_at-now, btc_streak)
     if not adaptive_model_allows(db, model_features, direction):
         log.info("Skipping %s %s: validated BTC model disagrees", ticker, phase)
@@ -1485,6 +1538,13 @@ def combo_leg(db, market, now, asset, one_minute_direction):
         return None
     start, projected = projection
     direction = "UP" if projected > start else "DOWN"
+    if asset == "BTC":
+        cycle_bias, _ = btc_cycle_context(db, now)
+        if (cycle_bias and cycle_bias != direction
+                and weak_projection_vs_recent_range(start, projected, now)):
+            log.info("Skipping BTC combo leg: weak price projection conflicts with 15m cycle context (%s)",
+                     cycle_bias)
+            return None
     if direction != five_minute_direction:
         return None
     if not adaptive_direction_gate(db, "COMBO_6M", direction):
@@ -1531,7 +1591,9 @@ def send_btc_eth_combo(db, btc_market, eth_market, now,
         return
     history = combo_history_summary(db, now)
     minutes, seconds = divmod(max(0, int(remaining)), 60)
-    _, cycle_text = recent_btc_streak(db, now)
+    _, streak_text = recent_btc_streak(db, now)
+    _, cycle_summary = btc_cycle_context(db, now)
+    cycle_text = f"{streak_text}\n{cycle_summary}"
     message = (
         "🧩 COMBO BTC + ETH · ÚLTIMOS 6 MIN\n"
         f"⏳ Tiempo restante: {minutes:02d}:{seconds:02d}\n"
