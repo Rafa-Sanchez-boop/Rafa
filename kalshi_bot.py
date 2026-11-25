@@ -54,6 +54,7 @@ eth_kraken_samples = []
 eth_kraken_last_quote = None
 eth_kraken_5m_snapshot = None
 btc_cycle_context_cache = None
+btc_opening_context_cache = None
 
 def kraken_trend(now):
     """Compare real Kraken BTC/USD last trades at least 60 seconds apart."""
@@ -633,6 +634,24 @@ def btc_cycle_context(db, now):
     return result
 
 
+def prepare_btc_opening_context(db, now):
+    """Precompute prior official-close streak and cycle stats before the next forecast window."""
+    global btc_opening_context_cache
+    latest_row = db.execute("""SELECT MAX(close_time) FROM kalshi_15m_outcomes
+        WHERE close_time<=?""", (int(now),)).fetchone()
+    latest_close = latest_row[0] if latest_row else None
+    if (btc_opening_context_cache is not None
+            and btc_opening_context_cache[0] == latest_close
+            and now-btc_opening_context_cache[1] < 60):
+        return btc_opening_context_cache[2:]
+    cycle_bias, cycle_summary = btc_cycle_context(db, now)
+    btc_streak, streak_text = recent_btc_streak(db, now)
+    btc_opening_context_cache = (
+        latest_close, now, btc_streak, streak_text, cycle_bias, cycle_summary)
+    log.debug("Prepared BTC opening context from prior official 15m closes")
+    return btc_opening_context_cache[2:]
+
+
 def record_kalshi_15m_chart(db, now):
     """Store settled Kalshi BTC 15m outcomes and send their streak chart."""
     payload = get_json("/markets", {
@@ -1207,7 +1226,7 @@ def signal(db, m, now, phase, kraken_direction=None):
         if direction != five_min_direction:
             log.info("Skipping %s %s: close projection conflicts with five-minute direction", ticker, phase)
             return
-    cycle_bias, cycle_summary = btc_cycle_context(db, now)
+    btc_streak, streak_text, cycle_bias, cycle_summary = prepare_btc_opening_context(db, now)
     if (cycle_bias and cycle_bias != direction
             and weak_projection_vs_recent_range(start, projected, now)):
         log.info("%s %s: weak projection conflicts with BTC 15m cycle context (%s); alert remains enabled",
@@ -1220,7 +1239,6 @@ def signal(db, m, now, phase, kraken_direction=None):
         (ticker, now-60)).fetchone()
     prior_mid = dec(prior_quote[0]) if prior_quote else None
     kalshi_change = float(mid-prior_mid) if prior_mid is not None else 0.0
-    btc_streak, streak_text = recent_btc_streak(db, now)
     cycle_text = f"{streak_text}\n{cycle_summary}"
     model_features = make_model_features(phase, mid, kalshi_change, close_at-now, btc_streak)
     if not adaptive_model_allows(db, model_features, direction):
@@ -1742,12 +1760,14 @@ def scan():
     if payload is None:
         with db_open() as db:
             record_kalshi_15m_chart(db, now)
+            prepare_btc_opening_context(db, now)
             sync_dashboard(db, now)
         return
     kraken_direction = kraken_trend(now)
     eth_kraken_direction = eth_kraken_trend(now) if eth_payload is not None else None
     with db_open() as db:
         record_kalshi_15m_chart(db, now)
+        prepare_btc_opening_context(db, now)
         for m in payload.get("markets", []):
             ticker = m.get("ticker", "")
             if not isinstance(ticker, str) or not ticker.startswith(SERIES + "-"):
