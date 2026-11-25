@@ -12,12 +12,14 @@ services:
     envVars:
       - key: DB_PATH
         value: /var/data/kalshi_bot.sqlite3
-      - key: DAY1_MAX_SPREAD
-        value: "0.08"
-      - key: DAY1_UP_MID
-        value: "0.60"
-      - key: DAY1_DOWN_MID
-        value: "0.40"
+      - key: KALSHI_SERIES
+        value: KXBTC15M
+      - key: KALSHI_ETH_SERIES
+        value: KXETH15M
+      - key: SCAN_SECONDS
+        value: "20"
+      - key: COMBO_WINDOW_SECONDS
+        value: "360"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
