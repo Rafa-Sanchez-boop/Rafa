@@ -1846,7 +1846,8 @@ def combo_leg(db, market, now, asset, one_minute_direction):
             (market["ticker"], now-60)).fetchone()
         prior_mid = dec(prior[0]) if prior else None
         change = float(q[2]-prior_mid) if prior_mid is not None else 0.0
-        features = make_model_features("LAST_5M", q[2], change, close_at-now)
+        btc_streak, _, _, _ = prepare_btc_opening_context(db, now)
+        features = make_model_features("LAST_5M", q[2], change, close_at-now, btc_streak)
         if not adaptive_model_allows(db, features, direction):
             return None
     return {
