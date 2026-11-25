@@ -28,7 +28,7 @@ RULES_SNAPSHOT = json.dumps({
     "series": SERIES, "eth_series": ETH_SERIES,
     "scan_seconds": SCAN_SECONDS, "combo_window_seconds": COMBO_WINDOW_SECONDS,
     "signal_rule": "Direction from validated adaptive BTC model when available, otherwise official outcomes, recent quote momentum, and existing history; no fixed 0.60/0.40 or spread cutoff",
-    "combo_rule": "BTC + ETH learned-history combo during the final six minutes",
+    "combo_rule": "BTC + ETH during final six minutes; each leg requires matching one-minute and five-minute Kraken direction and matching projected direction, with prior adaptive model check",
     "learning": "Score new BTC and combo legs against Kalshi official settlement and retain feedback history",
     "automatic_orders": False,
 }, separators=(",", ":"), sort_keys=True)
@@ -257,14 +257,17 @@ def kraken_trend_5m(now):
         kraken_5m_snapshot = (now, prior_price, current)
         return "UP" if current > prior_price else "DOWN"
 
-def kraken_first_minute_projection(now, remaining):
-    """Project the opening 60-second BTC move across at most the first five minutes."""
+def kraken_first_minute_projection(now, remaining, opened_at=None):
+    """Project only from BTC samples recorded after this contract opened."""
     if kraken_last_quote is None or remaining < 0:
         return None
     quote_time, current = kraken_last_quote
     if now - quote_time > 30:
         return None
-    candidates = [(t, price) for t, price in kraken_samples if t <= now - 60]
+    candidates = [
+        (t, price) for t, price in kraken_samples
+        if t <= now - 60 and (opened_at is None or t >= opened_at)
+    ]
     if not candidates:
         return None
     prior_time, prior = max(candidates, key=lambda sample: sample[0])
@@ -279,7 +282,6 @@ def kraken_first_minute_projection(now, remaining):
     if projected <= 0 or projected == current:
         return None
     return current, projected
-
 
 def kraken_close_projection(now, remaining):
     """Project from Kraken's fresh five-minute reference, including across worker restarts."""
@@ -1332,11 +1334,15 @@ def signal(db, m, now, phase, kraken_direction=None):
     close_at = ts(m.get("close_time"))
     if close_at is None or close_at <= now:
         return
+    opened_at = ts(m.get("open_time"))
     if phase == "EARLY_5M":
+        elapsed = now - opened_at if opened_at is not None else None
+        if elapsed is None or elapsed < 60 or elapsed > 300:
+            return
         if kraken_direction not in ("UP", "DOWN"):
             log.info("Skipping %s %s: 60-second Kraken trend is unavailable", ticker, phase)
             return
-        projection = kraken_first_minute_projection(now, close_at-now)
+        projection = kraken_first_minute_projection(now, close_at-now, opened_at)
         if projection is None:
             log.info("Skipping %s %s: opening 60-second price sample is unavailable", ticker, phase)
             return
@@ -1784,55 +1790,59 @@ def market_already_prices_direction_at_99(yes_mid, direction, remaining):
     return False
 
 
-def combo_leg(db, market, now, asset, one_minute_direction=None):
-    """Choose each combo leg from the same saved model and official-outcome history."""
+def combo_leg(db, market, now, asset, one_minute_direction):
+    """Use the prior BTC/ETH combo confirmation filters from November 24."""
     q = quote(market)
     if q is None:
+        return None
+    volume = dec(market.get("volume_24h_fp"))
+    if volume is None:
+        volume = dec(market.get("volume_24h"))
+    if volume is None or volume < MIN_VOLUME:
         return None
     close_at = ts(market.get("close_time"))
     opened = ts(market.get("open_time"))
     if close_at is None or opened is None or close_at <= now or abs((close_at-opened)-900) > 60:
         return None
-    phase = "COMBO_6M"
-    direction, features, basis, quote_change, cycle_summary = learned_direction(
-        db, market, asset, now, phase)
-    if direction not in ("UP", "DOWN"):
-        return None
-    if market_already_prices_direction_at_99(q[2], direction, close_at-now):
-        log.info("Skipping %s combo leg: Kalshi already prices %s near 99%% within four minutes",
-                 market["ticker"], direction)
-        return None
-    if not adaptive_direction_gate(db, phase, direction, asset):
-        return None
     if asset == "BTC":
-        start_projection = kraken_close_projection(now, close_at-now)
+        five_minute_direction = kraken_trend_5m(now)
+        projection = kraken_close_projection(now, close_at-now)
         first_projection_fn = kraken_nearest_level_projection
         symbol = "BTC/USD"
     else:
-        start_projection = eth_close_projection(now, close_at-now)
+        five_minute_direction = eth_kraken_trend_5m(now)
+        projection = eth_close_projection(now, close_at-now)
         first_projection_fn = eth_nearest_level_projection
         symbol = "ETH/USD"
-    if start_projection is None:
+    if (one_minute_direction not in ("UP", "DOWN")
+            or five_minute_direction not in ("UP", "DOWN")
+            or one_minute_direction != five_minute_direction
+            or projection is None):
         return None
-    start, raw_projected = start_projection
-    distance = abs(raw_projected-start)
-    if distance <= 0:
+    start, projected = projection
+    direction = "UP" if projected > start else "DOWN"
+    if direction != five_minute_direction:
         return None
-    projected = start+distance if direction == "UP" else start-distance
-    projection = (start, projected)
+    if not adaptive_direction_gate(db, "COMBO_6M", direction, asset):
+        return None
     first_projection = first_projection_fn(now, direction, projection)
     if first_projection is None or first_projection[1] == start:
         return None
-    volume = dec(market.get("volume_24h_fp"))
-    if volume is None:
-        volume = dec(market.get("volume_24h"))
+    features = None
+    if asset == "BTC":
+        prior = db.execute("""SELECT yes_mid FROM kalshi_only_samples
+            WHERE ticker=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 1""",
+            (market["ticker"], now-60)).fetchone()
+        prior_mid = dec(prior[0]) if prior else None
+        change = float(q[2]-prior_mid) if prior_mid is not None else 0.0
+        features = make_model_features("LAST_5M", q[2], change, close_at-now)
+        if not adaptive_model_allows(db, features, direction):
+            return None
     return {
         "asset": asset, "ticker": market["ticker"], "direction": direction,
         "start": start, "target": first_projection[1], "projected": projected,
-        "volume": volume, "symbol": symbol, "cycle_summary": cycle_summary,
-        "learning_basis": basis, "model_features": features,
+        "volume": volume, "symbol": symbol, "model_features": features,
     }
-
 
 def send_btc_eth_combo(db, btc_market, eth_market, now,
                        btc_one_minute_direction, eth_one_minute_direction):
@@ -1931,6 +1941,7 @@ def scan():
                 sample(db, ticker, now, q[2])
                 journal_opening_quote(db, market, now, opened, closes)
             open_btc.append(market)
+            signal(db, market, now, "EARLY_5M", kraken_direction)
             learned_signal(db, market, now)
         if eth_payload is not None:
             for market in eth_payload.get("markets", []):
