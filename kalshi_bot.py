@@ -27,7 +27,7 @@ PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
 RULES_SNAPSHOT = json.dumps({
     "series": SERIES, "eth_series": ETH_SERIES,
     "scan_seconds": SCAN_SECONDS, "combo_window_seconds": COMBO_WINDOW_SECONDS,
-    "signal_rule": "Direction from validated adaptive BTC model when available, otherwise official outcomes, recent quote momentum, and existing history; no fixed 0.60/0.40 or spread cutoff",
+    "signal_rule": "EARLY_5M direction from validated BTC model and official outcomes/close history; Kraken provides BTC/USD price reference and move size, not a direction gate",
     "combo_rule": "BTC + ETH during final six minutes; each leg requires matching one-minute and five-minute Kraken direction and matching projected direction, with prior adaptive model check",
     "learning": "Score new BTC and combo legs against Kalshi official settlement and retain feedback history",
     "automatic_orders": False,
@@ -1340,24 +1340,25 @@ def signal(db, m, now, phase, kraken_direction=None):
         elapsed = now - opened_at if opened_at is not None else None
         if elapsed is None or elapsed < 60 or elapsed > 300:
             return
-        if kraken_direction not in ("UP", "DOWN"):
-            log.info("Skipping %s %s: 60-second Kraken trend is unavailable", ticker, phase)
-            return
-        projection = kraken_first_minute_projection(now, close_at-now, opened_at)
-        if projection is None:
-            log.info("Skipping %s %s: opening 60-second price sample is unavailable", ticker, phase)
-            return
-        start, projected = projection
         history_direction, _, history_basis, _, _ = learned_direction(
             db, m, "BTC", now, "EARLY_5M")
         if history_direction not in ("UP", "DOWN"):
             log.info("Skipping %s %s: prior official-close context has no direction", ticker, phase)
             return
-        if history_direction != kraken_direction:
-            log.info("Skipping %s %s: opening 60-second move %s disagrees with prior-close context %s (%s)",
-                     ticker, phase, kraken_direction, history_direction, history_basis)
+        projection = kraken_first_minute_projection(now, close_at-now, opened_at)
+        if projection is None:
+            log.info("Skipping %s %s: opening price reference is unavailable", ticker, phase)
             return
-        direction = kraken_direction
+        start, raw_projected = projection
+        move = abs(raw_projected-start)
+        if move <= 0:
+            log.info("Skipping %s %s: opening price range is unavailable", ticker, phase)
+            return
+        # Kraken supplies the price reference and move size; historical learning sets the direction.
+        projected = start + move if history_direction == "UP" else start - move
+        direction = history_direction
+        log.info("Early direction from prior official-close context: %s (%s)",
+                 direction, history_basis)
     else:
         five_min_direction = kraken_trend_5m(now)
         if five_min_direction not in ("UP", "DOWN") or kraken_direction not in ("UP", "DOWN"):
