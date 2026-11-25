@@ -1,5 +1,4 @@
-"""Kalshi BTC 15-minute alerts with Kraken BTC/USD confirmation; no automatic trading.
-Forecasts estimate BTC/USD direction from Kraken; Kalshi's official settlement is scored separately.
+"""First-day Kalshi BTC15M quote alerts, preserving official-outcome learning; no automatic trading.
 """
 import json
 import logging
@@ -13,38 +12,28 @@ import requests
 import btc_assistant
 
 BASE = "https://external-api.kalshi.com/trade-api/v2"
-SERIES = os.getenv("KALSHI_SERIES", "KXBTC15M")
-ETH_SERIES = os.getenv("KALSHI_ETH_SERIES", "KXETH15M")
+SERIES = "KXBTC15M"
 DB_PATH = os.getenv("DB_PATH", "/var/data/kalshi_bot.sqlite3")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
-OBSERVE_SECONDS = max(60, int(os.getenv("OBSERVE_SECONDS", "60")))
-EARLY_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("EARLY_WINDOW_SECONDS", "300")))
-LATE_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("LATE_WINDOW_SECONDS", "300")))
-COMBO_WINDOW_SECONDS = max(OBSERVE_SECONDS, int(os.getenv("COMBO_WINDOW_SECONDS", "360")))
-MIN_VOLUME = Decimal(os.getenv("MIN_VOLUME_24H", "100"))
-BOT_VERSION = os.getenv("BOT_VERSION", "rafa-kalshi-v4.11-no-auto-pauses")
+SCAN_SECONDS = 20
+FIRST_DAY_MAX_SPREAD = Decimal(os.getenv("DAY1_MAX_SPREAD", "0.08"))
+FIRST_DAY_UP_MID = Decimal(os.getenv("DAY1_UP_MID", "0.60"))
+FIRST_DAY_DOWN_MID = Decimal(os.getenv("DAY1_DOWN_MID", "0.40"))
+BOT_VERSION = os.getenv("BOT_VERSION", "rafa-first-day-with-learning")
 PANEL_URL = os.getenv("RAFA_PANEL_URL", "").rstrip("/")
 PANEL_SECRET = os.getenv("RAFA_PANEL_SECRET", "")
 PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
 RULES_SNAPSHOT = json.dumps({
-    "series": SERIES, "combo_eth_series": ETH_SERIES,
-    "combo_window_seconds": COMBO_WINDOW_SECONDS, "scan_seconds": SCAN_SECONDS,
-    "observe_seconds": OBSERVE_SECONDS,
-    "early_window_seconds": EARLY_WINDOW_SECONDS,
-    "late_window_seconds": LATE_WINDOW_SECONDS,
-    "minimum_volume_24h": str(MIN_VOLUME),
-    "signal_rule": "Kraken BTC/USD close projection confirmed by 1m and 5m trends; Kalshi official settlement scored separately",
-    "btc_cycle_context": "Latest three official BTC 15m outcomes and historical next-outcome frequencies; only a validated pattern can veto a weak conflicting projection",
-    "automatic_accuracy_pauses": False,
-    "combo_rule": "Independent BTC + ETH forecasts; send only when both pass their asset checks within the final six minutes",
+    "series": SERIES, "scan_seconds": SCAN_SECONDS,
+    "signal_rule": f"First-day Kalshi BTC15M rule: YES midpoint >= {FIRST_DAY_UP_MID} means UP; <= {FIRST_DAY_DOWN_MID} means DOWN; spread <= {FIRST_DAY_MAX_SPREAD}; one alert per contract",
+    "learning": "Score the forecast against Kalshi official settlement; retain adaptive learning and feedback history",
     "automatic_orders": False,
 }, separators=(",", ":"), sort_keys=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kalshi-only")
 http = requests.Session()
-http.headers["User-Agent"] = "KalshiOnlyBTC15M/4.5"
+http.headers["User-Agent"] = "KalshiBTC15MDay1Learning/1.0"
 # Extra in-process protection against duplicate alerts during a worker lifetime.
 alerted_phases = set()
 KRAKEN_URL = "https://api.kraken.com/0/public/Ticker"
@@ -1173,6 +1162,81 @@ def send_early_wait_notice(db, m, now):
         log.info("Early forecast waiting notice sent: %s", ticker)
 
 
+def first_day_signal(db, market, now):
+    """Restore the original BTC15M Kalshi quote rule while recording official-outcome feedback."""
+    ticker = market.get("ticker", "")
+    if not ticker or not ticker.startswith(SERIES + "-"):
+        return
+    # The first-day setup sent at most one alert for each contract.
+    if db.execute("SELECT 1 FROM kalshi_only_alerts WHERE ticker=? LIMIT 1",
+                  (ticker,)).fetchone():
+        return
+    q = quote(market)
+    if q is None:
+        return
+    bid, ask, mid = q
+    spread = ask - bid
+    if spread > FIRST_DAY_MAX_SPREAD:
+        return
+    if mid >= FIRST_DAY_UP_MID:
+        direction, reason = "UP", "Kalshi favorece YES"
+        entry = ask
+    elif mid <= FIRST_DAY_DOWN_MID:
+        direction, reason = "DOWN", "Kalshi favorece NO"
+        entry = Decimal(1) - bid
+    else:
+        return
+    close_at = ts(market.get("close_time"))
+    if close_at is None or close_at <= now:
+        return
+    opened_at = ts(market.get("open_time"))
+    remaining = max(0, int((close_at - now) / 60))
+    prior_quote = db.execute("""SELECT yes_mid FROM kalshi_only_samples
+        WHERE ticker=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 1""",
+        (ticker, now-60)).fetchone()
+    prior_mid = dec(prior_quote[0]) if prior_quote else None
+    quote_change = float(mid-prior_mid) if prior_mid is not None else 0.0
+    btc_streak, _, _, _ = prepare_btc_opening_context(db, now)
+    features = make_model_features("EARLY_5M", mid, quote_change,
+                                   close_at-now, btc_streak)
+    # The adaptive model can record disagreement but cannot suppress the original alert.
+    adaptive_model_allows(db, features, direction)
+    confidence_line = (
+        f"📊 Kalshi YES midpoint: {mid:.0%} · spread: {spread:.0%}"
+    )
+    msg = (
+        "🚨 KALSHI BTC 15 MIN 🚨\n\n"
+        f"📊 SEÑAL: {direction_label(direction)}\n"
+        f"💰 Entrada de referencia: USD {entry:.2f}\n"
+        f"⏱ Tiempo restante: {remaining} min\n"
+        f"📈 Análisis: {reason}\n"
+        f"{confidence_line}\n"
+        f"🎯 Contrato: {ticker}\n\n"
+        "Señal orientativa basada en la cotización de Kalshi; no garantiza el resultado."
+    )
+    if not notify(msg, db=db, broadcast=True):
+        return
+    db.execute("""INSERT OR IGNORE INTO kalshi_only_alerts
+        (ticker,phase,sent_at,direction,bot_version,rules_snapshot)
+        VALUES (?,?,?,?,?,?)""",
+        (ticker, "DAY1", now, direction, BOT_VERSION, RULES_SNAPSHOT))
+    db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
+        (id,ticker,phase,predicted_direction,issued_at,close_at,status,source,
+         bot_version,rules_snapshot,model_features)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (f"kalshi-day1:{ticker}", ticker, "DAY1", direction, now, close_at,
+         "pending", "bot_forecast", BOT_VERSION, RULES_SNAPSHOT,
+         json.dumps(features, separators=(",", ":")) if features is not None else None))
+    try:
+        shadow_record(db, ticker, "EARLY_5M", now, direction, q,
+                      Decimal(str(quote_change)), dec(market.get("volume_24h_fp")) or Decimal(0),
+                      None)
+    except Exception:
+        log.exception("Opening learning shadow record failed")
+    log.info("First-day BTC15M alert sent: %s %s at YES midpoint %.3f",
+             ticker, direction, mid)
+
+
 def signal(db, m, now, phase, kraken_direction=None):
     """Send a Kraken BTC/USD forecast; keep Kalshi settlement separate."""
     ticker = m["ticker"]
@@ -1284,6 +1348,7 @@ def evaluate_btc_forecasts(db, now):
                                 start_price, target_price, issued_at
                          FROM kalshi_prediction_feedback
                          WHERE status='pending' AND close_at <= ?
+                           AND phase IN ('EARLY_5M','LAST_5M')
                          ORDER BY close_at LIMIT 100""", (now,)).fetchall()
     for row in rows:
         (forecast_id, ticker, phase, predicted, close_at, start_text,
@@ -1438,6 +1503,13 @@ def check_results(db, now):
         for phase, direction in predictions:
             if phase == "COMBO_6M":
                 continue
+            if phase == "DAY1":
+                actual_direction = "UP" if result == "yes" else "DOWN"
+                db.execute("""UPDATE kalshi_prediction_feedback
+                    SET actual_direction=?, evaluated_at=?, status='evaluated',
+                        note='Scored against Kalshi official settlement.'
+                    WHERE id=? AND status='pending'""",
+                    (actual_direction, now, f"kalshi-day1:{ticker}"))
             correct = (direction == "UP" and result == "yes") or (
                 direction == "DOWN" and result == "no")
             notify(f"🧠 BTC — REVISIÓN DE PREDICCIÓN\n🧾 {ticker}\n"
@@ -1754,8 +1826,7 @@ def send_btc_eth_combo(db, btc_market, eth_market, now,
 
 
 def scan():
-    payload = get_json("/markets", {"series_ticker": SERIES, "status": "open", "limit": 100})
-    eth_payload = get_json("/markets", {"series_ticker": ETH_SERIES, "status": "open", "limit": 100})
+    payload = get_json("/markets", {"series_ticker": SERIES, "status": "open", "limit": 10})
     now = time.time()
     if payload is None:
         with db_open() as db:
@@ -1763,62 +1834,35 @@ def scan():
             prepare_btc_opening_context(db, now)
             sync_dashboard(db, now)
         return
-    kraken_direction = kraken_trend(now)
-    eth_kraken_direction = eth_kraken_trend(now) if eth_payload is not None else None
     with db_open() as db:
         record_kalshi_15m_chart(db, now)
         prepare_btc_opening_context(db, now)
-        for m in payload.get("markets", []):
-            ticker = m.get("ticker", "")
+        for market in payload.get("markets", []):
+            ticker = market.get("ticker", "")
             if not isinstance(ticker, str) or not ticker.startswith(SERIES + "-"):
                 continue
-            opened, closes = ts(m.get("open_time")), ts(m.get("close_time"))
-            if opened is None or closes is None or not (opened <= now < closes):
+            opened_at, close_at = ts(market.get("open_time")), ts(market.get("close_time"))
+            if opened_at is None or close_at is None or not (opened_at <= now < close_at):
                 continue
-            if closes - opened > 960:
+            if close_at - opened_at > 960:
                 continue
-            q = quote(m)
+            q = quote(market)
             if q:
                 sample(db, ticker, now, q[2])
-                journal_opening_quote(db, m, now, opened, closes)
-            elapsed = now - opened
-            remaining = closes - now
-            phase = None
-            if OBSERVE_SECONDS <= elapsed <= EARLY_WINDOW_SECONDS:
-                phase = "EARLY_5M"
-            elif 0 < remaining <= LATE_WINDOW_SECONDS:
-                phase = "LAST_5M"
-            if phase:
-                signal(db, m, now, phase, kraken_direction)
-                if phase == "EARLY_5M":
-                    send_early_wait_notice(db, m, now)
-            if eth_payload is not None:
-                for eth_market in eth_payload.get("markets", []):
-                    eth_ticker = eth_market.get("ticker", "")
-                    if not isinstance(eth_ticker, str) or not eth_ticker.startswith(ETH_SERIES + "-"):
-                        continue
-                    eth_opened, eth_closes = ts(eth_market.get("open_time")), ts(eth_market.get("close_time"))
-                    if (eth_opened is None or eth_closes is None
-                            or not (eth_opened <= now < eth_closes)
-                            or abs((eth_closes-eth_opened)-900) > 60):
-                        continue
-                    eth_quote = quote(eth_market)
-                    if eth_quote:
-                        sample(db, eth_ticker, now, eth_quote[2])
-                        journal_opening_quote(db, eth_market, now, eth_opened, eth_closes)
-                    send_btc_eth_combo(db, m, eth_market, now,
-                                       kraken_direction, eth_kraken_direction)
-        # Check completed markets infrequently to reduce requests.
+                journal_opening_quote(db, market, now, opened_at, close_at)
+            first_day_signal(db, market, now)
+        # Keep settlement scoring and model updates; preserve the existing learning history.
         if int(now // 300) != int((now - SCAN_SECONDS) // 300):
             check_results(db, now)
         maybe_train_adaptive_model(db, now)
         try:
             shadow_daily(db, now)
         except Exception:
-            log.exception('Rafa shadow daily evaluation failed')
+            log.exception("Rafa shadow daily evaluation failed")
         db.execute("DELETE FROM kalshi_only_samples WHERE observed_at < ?", (now - 48 * 3600,))
         db.commit()
         sync_dashboard(db, now)
+
 
 def telegram_test_once():
     """Send one diagnostic message, without fabricating a market signal."""
@@ -1838,7 +1882,7 @@ def telegram_test_once():
         log.error("Telegram diagnostic: test message failed or was not accepted")
 
 def main():
-    log.info("Kalshi BTC15M quote-momentum alerts and Telegram BTC assistant; no automatic trading")
+    log.info("Kalshi BTC15M first-day quote alerts with preserved learning; no automatic trading")
     btc_assistant.register_commands()
     while True:
         try:
