@@ -72,7 +72,7 @@ def kraken_trend(now):
         kraken_last_quote = (now, price)
         kraken_samples.append((now, price))
         kraken_samples[:] = [(t, p) for t, p in kraken_samples if now - t <= 600]
-        prior = next((p for t, p in kraken_samples if t <= now - 60), None)
+        prior = next((p for t, p in reversed(kraken_samples) if t <= now - 60), None)
         if prior is None or price == prior:
             return None
         return "UP" if price > prior else "DOWN"
@@ -264,6 +264,30 @@ def kraken_trend_5m(now):
             return None
         kraken_5m_snapshot = (now, prior_price, current)
         return "UP" if current > prior_price else "DOWN"
+
+def kraken_first_minute_projection(now, remaining):
+    """Project the opening 60-second BTC move across at most the first five minutes."""
+    if kraken_last_quote is None or remaining < 0:
+        return None
+    quote_time, current = kraken_last_quote
+    if now - quote_time > 30:
+        return None
+    candidates = [(t, price) for t, price in kraken_samples if t <= now - 60]
+    if not candidates:
+        return None
+    prior_time, prior = max(candidates, key=lambda sample: sample[0])
+    if now - prior_time > 90 or current == prior:
+        return None
+    change_60s = current - prior
+    horizon = min(max(Decimal("0"), Decimal(str(remaining))), Decimal("300"))
+    projected_move = change_60s * horizon / Decimal("60")
+    cap = current * Decimal("0.0025")
+    projected_move = max(-cap, min(cap, projected_move))
+    projected = current + projected_move
+    if projected <= 0 or projected == current:
+        return None
+    return current, projected
+
 
 def kraken_close_projection(now, remaining):
     """Project from Kraken's fresh five-minute reference, including across worker restarts."""
@@ -1152,26 +1176,37 @@ def signal(db, m, now, phase, kraken_direction=None):
     close_at = ts(m.get("close_time"))
     if close_at is None or close_at <= now:
         return
-    five_min_direction = kraken_trend_5m(now)
-    if five_min_direction not in ("UP", "DOWN") or kraken_direction not in ("UP", "DOWN"):
-        log.info("Skipping %s %s: Kraken trend is unavailable", ticker, phase)
-        return
-    if five_min_direction != kraken_direction:
-        log.info("Skipping %s %s: one-minute and five-minute Kraken trends disagree", ticker, phase)
-        return
-    projection = kraken_close_projection(now, close_at-now)
-    if projection is None:
-        return
-    start, projected = projection
-    direction = "UP" if projected > start else "DOWN"
-    if (phase == "LAST_5M"
-            and market_already_prices_direction_at_99(mid, direction, close_at-now)):
-        log.info("Skipping %s %s: Kalshi already prices %s near 99%% within four minutes",
-                 ticker, phase, direction)
-        return
-    if direction != five_min_direction:
-        log.info("Skipping %s %s: close projection conflicts with five-minute direction", ticker, phase)
-        return
+    if phase == "EARLY_5M":
+        if kraken_direction not in ("UP", "DOWN"):
+            log.info("Skipping %s %s: 60-second Kraken trend is unavailable", ticker, phase)
+            return
+        projection = kraken_first_minute_projection(now, close_at-now)
+        if projection is None:
+            log.info("Skipping %s %s: opening 60-second price sample is unavailable", ticker, phase)
+            return
+        start, projected = projection
+        direction = kraken_direction
+    else:
+        five_min_direction = kraken_trend_5m(now)
+        if five_min_direction not in ("UP", "DOWN") or kraken_direction not in ("UP", "DOWN"):
+            log.info("Skipping %s %s: Kraken trend is unavailable", ticker, phase)
+            return
+        if five_min_direction != kraken_direction:
+            log.info("Skipping %s %s: one-minute and five-minute Kraken trends disagree", ticker, phase)
+            return
+        projection = kraken_close_projection(now, close_at-now)
+        if projection is None:
+            return
+        start, projected = projection
+        direction = "UP" if projected > start else "DOWN"
+        if (phase == "LAST_5M"
+                and market_already_prices_direction_at_99(mid, direction, close_at-now)):
+            log.info("Skipping %s %s: Kalshi already prices %s near 99%% within four minutes",
+                     ticker, phase, direction)
+            return
+        if direction != five_min_direction:
+            log.info("Skipping %s %s: close projection conflicts with five-minute direction", ticker, phase)
+            return
     cycle_bias, cycle_summary = btc_cycle_context(db, now)
     if (cycle_bias and cycle_bias != direction
             and weak_projection_vs_recent_range(start, projected, now)):
@@ -1191,9 +1226,12 @@ def signal(db, m, now, phase, kraken_direction=None):
     if not adaptive_model_allows(db, model_features, direction):
         log.info("Skipping %s %s: validated BTC model disagrees", ticker, phase)
         return
-    first_projection = kraken_nearest_level_projection(now, direction, projection)
-    if first_projection is None or first_projection[1] == start:
-        return
+    if phase == "EARLY_5M":
+        first_projection = projection
+    else:
+        first_projection = kraken_nearest_level_projection(now, direction, projection)
+        if first_projection is None or first_projection[1] == start:
+            return
     first_target = first_projection[1]
     bias, bias_evidence = target_close_bias(now, close_at-now, start, first_target, projected, kraken_samples)
     db.execute("""CREATE TABLE IF NOT EXISTS rafa_close_estimates
