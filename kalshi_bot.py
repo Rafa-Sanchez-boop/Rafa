@@ -1041,7 +1041,7 @@ def learned_direction(db, market, asset, now, phase):
 
 
 def maybe_train_adaptive_model(db, now):
-    """Run the daily self-learning pass at 9 a.m. Chicago time, retrying on new results."""
+    """Run the daily self-learning pass at 9 a.m. New York time, retrying on new results."""
     local_now = datetime.fromtimestamp(now, ZoneInfo("America/New_York"))
     if (local_now.hour, local_now.minute) < (9, 0):
         return
@@ -2046,7 +2046,7 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
 
 
 def daily_bot_schedule(now=None):
-    """Pause 03:00–06:00 and collect data without forecasts until 09:00 Chicago time."""
+    """Pause 03:00–06:00 and collect data without forecasts until 09:00 New York time."""
     instant = time.time() if now is None else now
     local_now = datetime.fromtimestamp(instant, ZoneInfo("America/New_York"))
     if 3 <= local_now.hour < 6:
@@ -2151,7 +2151,7 @@ def main():
     while True:
         mode, local_now = daily_bot_schedule()
         if mode != previous_mode:
-            log.info("Daily schedule %s at %s (Chicago time)",
+            log.info("Daily schedule %s at %s (New York time)",
                      mode, local_now.strftime("%Y-%m-%d %H:%M %Z"))
             previous_mode = mode
         if mode == "paused":
