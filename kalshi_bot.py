@@ -19,7 +19,7 @@ DB_PATH = os.getenv("DB_PATH", "/var/data/kalshi_bot.sqlite3")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
-COMBO_WINDOW_SECONDS = max(60, int(os.getenv("COMBO_WINDOW_SECONDS", "300")))
+COMBO_WINDOW_SECONDS = max(60, int(os.getenv("COMBO_WINDOW_SECONDS", "360")))
 MIN_VOLUME = Decimal("0")
 BOT_VERSION = os.getenv("BOT_VERSION", "rafa-learning-history-btc-eth")
 PANEL_URL = os.getenv("RAFA_PANEL_URL", "").rstrip("/")
@@ -27,7 +27,7 @@ PANEL_SECRET = os.getenv("RAFA_PANEL_SECRET", "")
 PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
 RULES_SNAPSHOT = json.dumps({
     "series": SERIES, "eth_series": ETH_SERIES,
-    "scan_seconds": SCAN_SECONDS, "combo_window_seconds": min(COMBO_WINDOW_SECONDS, 300),
+    "scan_seconds": SCAN_SECONDS, "combo_window_seconds": min(COMBO_WINDOW_SECONDS, 360),
     "signal_rule": "Opening and final-five-minute direction from Kalshi official close cycles plus live Kalshi YES movement; Kraken is used only as BTC/USD price reference",
     "combo_rule": "Sample BTC and ETH Kalshi markets from open; send a combo during the final five minutes using settled cycles and live Kalshi YES movement; Kraken supplies BTC/USD price only",
     "learning": "Score new BTC and combo legs against Kalshi official settlement and retain feedback history",
@@ -1984,7 +1984,7 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
     if btc_close is None or eth_close is None or abs(btc_close-eth_close) > 2:
         return
     remaining = btc_close-now
-    if not (0 < remaining <= min(COMBO_WINDOW_SECONDS, 300)):
+    if not (0 < remaining <= min(COMBO_WINDOW_SECONDS, 360)):
         return
     btc_leg = combo_leg(db, btc_market, now, "BTC")
     eth_leg = combo_leg(db, eth_market, now, "ETH")
