@@ -1661,9 +1661,7 @@ def evaluate_combo_reviews(db, now):
 
 
 def check_results(db, now):
-    # Separately score BTC/USD price forecasts against Kraken. Kalshi settlement
-    # below remains the official outcome for the prediction-market contract.
-    evaluate_btc_forecasts(db, now)
+    # Prioritize official Kalshi settlements so price reviews cannot delay them.
     # Use Kalshi's official result field, never Kraken, for completed markets.
     rows = db.execute("""SELECT DISTINCT ticker FROM kalshi_only_alerts
         WHERE ticker NOT IN (SELECT ticker FROM kalshi_only_results)""").fetchall()
@@ -1696,6 +1694,9 @@ def check_results(db, now):
                    db=db, broadcast=True)
 
     evaluate_combo_reviews(db, now)
+
+    # Price-based BTC reviews are secondary and must not hold up official results.
+    evaluate_btc_forecasts(db, now)
 
     # Label every journaled opening quote with Kalshi's official settlement.
     # The market midpoint is a benchmark probability, not a bot forecast.
