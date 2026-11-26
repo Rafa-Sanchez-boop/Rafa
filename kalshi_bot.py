@@ -2045,7 +2045,18 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
     log.info("BTC+ETH combo sent: %s / %s", btc_leg["direction"], eth_leg["direction"])
 
 
-def scan():
+def daily_bot_schedule(now=None):
+    """Pause 03:00–06:00 and collect data without forecasts until 09:00 Chicago time."""
+    instant = time.time() if now is None else now
+    local_now = datetime.fromtimestamp(instant, ZoneInfo("America/Chicago"))
+    if 3 <= local_now.hour < 6:
+        return "paused", local_now
+    if 6 <= local_now.hour < 9:
+        return "analysis", local_now
+    return "active", local_now
+
+
+def scan(predictions_enabled=True):
     payload = get_json("/markets", {"series_ticker": SERIES, "status": "open", "limit": 100})
     eth_payload = get_json("/markets", {"series_ticker": ETH_SERIES, "status": "open", "limit": 100})
     now = time.time()
@@ -2077,10 +2088,11 @@ def scan():
                 sample(db, ticker, now, q[2])
                 journal_opening_quote(db, market, now, opened, closes)
             open_btc.append(market)
-            signal(db, market, now, "EARLY_5M")
-            if closes-now <= 300:
-                signal(db, market, now, "LAST_5M")
-            send_early_wait_notice(db, market, now)
+            if predictions_enabled:
+                signal(db, market, now, "EARLY_5M")
+                if closes-now <= 300:
+                    signal(db, market, now, "LAST_5M")
+                send_early_wait_notice(db, market, now)
         if eth_payload is not None:
             for market in eth_payload.get("markets", []):
                 ticker = market.get("ticker", "")
@@ -2100,7 +2112,8 @@ def scan():
             btc_close = ts(btc_market.get("close_time"))
             for eth_market in open_eth:
                 eth_close = ts(eth_market.get("close_time"))
-                if btc_close is not None and eth_close is not None and abs(btc_close-eth_close) <= 2:
+                if (predictions_enabled and btc_close is not None and eth_close is not None
+                        and abs(btc_close-eth_close) <= 2):
                     send_btc_eth_combo(db, btc_market, eth_market, now)
         if int(now // 300) != int((now-SCAN_SECONDS) // 300):
             check_results(db, now)
@@ -2134,9 +2147,19 @@ def telegram_test_once():
 def main():
     log.info("Kalshi BTC15M adaptive alerts and BTC+ETH combos; no automatic trading")
     btc_assistant.register_commands()
+    previous_mode = None
     while True:
+        mode, local_now = daily_bot_schedule()
+        if mode != previous_mode:
+            log.info("Daily schedule %s at %s (Chicago time)",
+                     mode, local_now.strftime("%Y-%m-%d %H:%M %Z"))
+            previous_mode = mode
+        if mode == "paused":
+            resume_at = local_now.replace(hour=6, minute=0, second=0, microsecond=0)
+            time.sleep(min(60, max(1, (resume_at-local_now).total_seconds())))
+            continue
         try:
-            scan()
+            scan(predictions_enabled=(mode == "active"))
         except Exception:
             log.exception("Scan failed")
         try:
