@@ -39,6 +39,7 @@ http = requests.Session()
 http.headers["User-Agent"] = "KalshiBTC15MAdaptive/1.0"
 # Extra in-process protection against duplicate alerts during a worker lifetime.
 alerted_phases = set()
+last_results_check = 0.0
 KRAKEN_URL = "https://api.kraken.com/0/public/Ticker"
 kraken_samples = []
 kraken_last_quote = None
@@ -1594,7 +1595,7 @@ def evaluate_btc_forecasts(db, now):
                            "Primer objetivo: sin dato")
             reversal_line = ("🔄 El precio tocó el objetivo y luego revirtió antes del cierre.\n"
                              if reached and actual != predicted else "")
-            notify("🧠 BTC — REVISIÓN DE PREDICCIÓN\n"
+            notify("🏁 RESULTADO OFICIAL — EVALUACIÓN BTC\n"
                    f"🧾 {ticker} ({phase})\n"
                    f"🔮 Pronóstico: {direction_label(predicted)} desde USD {start_price:,.2f}\n"
                    f"📈 Máximo/mínimo después de la señal: USD {peak:,.2f} / USD {trough:,.2f}\n"
@@ -1648,7 +1649,7 @@ def evaluate_combo_reviews(db, now):
         losses = total-wins
         accuracy = wins/total if total else 0.0
         message = "\n".join([
-            "🧠 REVISIÓN DEL COMBO BTC + ETH",
+            "🏁 RESULTADO OFICIAL DEL COMBO BTC + ETH",
             f"🧾 BTC {btc_ticker}: pronóstico {direction_label(btc_pred)} · oficial {btc_result.upper()} {'✅' if btc_ok else '❌'}",
             f"🧾 ETH {eth_ticker}: pronóstico {direction_label(eth_pred)} · oficial {eth_result.upper()} {'✅' if eth_ok else '❌'}",
             f"🏁 Combo: {'✅ ACERTÓ LAS DOS PATAS' if combo_ok else '❌ NO ACERTÓ EL COMBO'}",
@@ -2057,6 +2058,7 @@ def daily_bot_schedule(now=None):
 
 
 def scan(predictions_enabled=True):
+    global last_results_check
     payload = get_json("/markets", {"series_ticker": SERIES, "status": "open", "limit": 100})
     eth_payload = get_json("/markets", {"series_ticker": ETH_SERIES, "status": "open", "limit": 100})
     now = time.time()
@@ -2115,8 +2117,9 @@ def scan(predictions_enabled=True):
                 if (predictions_enabled and btc_close is not None and eth_close is not None
                         and abs(btc_close-eth_close) <= 2):
                     send_btc_eth_combo(db, btc_market, eth_market, now)
-        if int(now // 300) != int((now-SCAN_SECONDS) // 300):
+        if now - last_results_check >= 60:
             check_results(db, now)
+            last_results_check = now
         maybe_train_adaptive_model(db, now)
         try:
             shadow_daily(db, now)
