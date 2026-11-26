@@ -6,7 +6,7 @@ import math
 import os
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
 import requests
@@ -382,6 +382,15 @@ def ts(x):
     except (ValueError, AttributeError):
         return None
 
+
+def pattern_session_start(now):
+    """Return the start of today's 06:00 New York pattern session."""
+    local_now = datetime.fromtimestamp(now, ZoneInfo("America/New_York"))
+    start = local_now.replace(hour=6, minute=0, second=0, microsecond=0)
+    if local_now < start:
+        start -= timedelta(days=1)
+    return start.timestamp()
+
 def db_open():
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     db = sqlite3.connect(DB_PATH, timeout=30)
@@ -573,15 +582,17 @@ def sample(db, ticker, now, mid):
                (ticker, now, str(mid)))
 
 def recent_btc_streak(db, now):
-    """Return the signed streak of consecutive officially settled BTC 15m outcomes."""
+    """Return the current signed BTC streak using outcomes from this 06:00 NY session."""
+    session_start = pattern_session_start(now)
     try:
         rows = db.execute("""SELECT close_time,direction FROM kalshi_15m_outcomes
-            WHERE close_time<=? ORDER BY close_time DESC LIMIT 16""", (int(now),)).fetchall()
+            WHERE close_time>=? AND close_time<=? ORDER BY close_time DESC LIMIT 16""",
+            (int(session_start), int(now))).fetchall()
     except sqlite3.Error:
         log.exception("Recent BTC 15m streak unavailable")
         return 0.0, "Contexto de racha BTC 15m: datos no disponibles."
     if not rows:
-        return 0.0, "Contexto de racha BTC 15m: reuniendo cierres oficiales."
+        return 0.0, "Contexto de racha BTC 15m: reuniendo cierres oficiales desde las 6:00 a. m. NY."
     direction = rows[0][1]
     if direction not in ("UP", "DOWN"):
         return 0.0, "Contexto de racha BTC 15m: dato oficial inválido."
@@ -595,32 +606,37 @@ def recent_btc_streak(db, now):
     signed_streak = min(streak, 4) / 4.0
     if direction == "DOWN":
         signed_streak = -signed_streak
-    return signed_streak, f"📚 Contexto agregado BTC 15m: {direction_label(direction)} × {streak} cierres oficiales consecutivos."
+    return signed_streak, f"📚 Racha BTC 15m de hoy: {direction_label(direction)} × {streak} cierres consecutivos desde las 6:00 a. m. NY."
 
 
 def btc_cycle_context(db, now):
-    """Cache a bounded comparison of the latest three consecutive outcomes and prior matches."""
+    """Compare today's latest three BTC cycles only with matches from today's 06:00 NY session."""
     global btc_cycle_context_cache
+    session_start = pattern_session_start(now)
     latest_row = db.execute("""SELECT MAX(close_time) FROM kalshi_15m_outcomes
-        WHERE close_time<=?""", (int(now),)).fetchone()
+        WHERE close_time>=? AND close_time<=?""",
+        (int(session_start), int(now))).fetchone()
     latest_close = latest_row[0] if latest_row else None
     if (btc_cycle_context_cache is not None
-            and btc_cycle_context_cache[0] == latest_close
-            and now-btc_cycle_context_cache[1] < 60):
-        return btc_cycle_context_cache[2], btc_cycle_context_cache[3]
+            and btc_cycle_context_cache[0] == session_start
+            and btc_cycle_context_cache[1] == latest_close
+            and now-btc_cycle_context_cache[2] < 60):
+        return btc_cycle_context_cache[3], btc_cycle_context_cache[4]
 
     rows = db.execute("""SELECT close_time,direction FROM kalshi_15m_outcomes
-        WHERE close_time<=? ORDER BY close_time DESC LIMIT 600""", (int(now),)).fetchall()
+        WHERE close_time>=? AND close_time<=?
+        ORDER BY close_time DESC LIMIT 600""",
+        (int(session_start), int(now))).fetchall()
     rows.reverse()
     if len(rows) < 3:
-        result = (None, "Patrón histórico BTC 15m: reuniendo tres cierres oficiales.")
+        result = (None, "Patrón BTC 15m de hoy: reuniendo tres cierres oficiales desde las 6:00 a. m. NY.")
     else:
         times = [row[0] for row in rows]
         directions = [row[1] for row in rows]
         pattern = tuple(directions[-3:])
         pattern_text = " → ".join(pattern)
         if times[-1]-times[-2] != 900 or times[-2]-times[-3] != 900:
-            result = (None, "Patrón histórico BTC 15m: faltan cierres consecutivos para comparar.")
+            result = (None, "Patrón BTC 15m de hoy: faltan cierres consecutivos para comparar.")
         else:
             following = []
             for index in range(3, len(directions)):
@@ -640,35 +656,38 @@ def btc_cycle_context(db, now):
                 elif posterior_up <= 0.35:
                     bias = "DOWN"
             if count:
-                summary = (f"Patrón anterior {pattern_text}: después hubo UP {ups}/{count} "
+                summary = (f"Patrón de hoy {pattern_text}: después hubo UP {ups}/{count} "
                            f"y DOWN {downs}/{count} veces.")
             else:
-                summary = f"Patrón anterior {pattern_text}: aún no hay casos consecutivos comparables."
+                summary = f"Patrón de hoy {pattern_text}: todavía no hay casos comparables."
             if bias is None:
                 summary += " Muestra insuficiente para inclinar la señal."
             else:
-                summary += f" Sesgo histórico validado: {direction_label(bias)}."
+                summary += f" Sesgo de hoy: {direction_label(bias)}."
             result = (bias, summary)
-    btc_cycle_context_cache = (latest_close, now, result[0], result[1])
+    btc_cycle_context_cache = (session_start, latest_close, now, result[0], result[1])
     return result
 
 
 def prepare_btc_opening_context(db, now):
-    """Precompute prior official-close streak and cycle stats before the next forecast window."""
+    """Prepare streak and three-cycle context from outcomes since 06:00 New York time."""
     global btc_opening_context_cache
+    session_start = pattern_session_start(now)
     latest_row = db.execute("""SELECT MAX(close_time) FROM kalshi_15m_outcomes
-        WHERE close_time<=?""", (int(now),)).fetchone()
+        WHERE close_time>=? AND close_time<=?""",
+        (int(session_start), int(now))).fetchone()
     latest_close = latest_row[0] if latest_row else None
     if (btc_opening_context_cache is not None
-            and btc_opening_context_cache[0] == latest_close
-            and now-btc_opening_context_cache[1] < 60):
-        return btc_opening_context_cache[2:]
+            and btc_opening_context_cache[0] == session_start
+            and btc_opening_context_cache[1] == latest_close
+            and now-btc_opening_context_cache[2] < 60):
+        return btc_opening_context_cache[3:]
     cycle_bias, cycle_summary = btc_cycle_context(db, now)
     btc_streak, streak_text = recent_btc_streak(db, now)
     btc_opening_context_cache = (
-        latest_close, now, btc_streak, streak_text, cycle_bias, cycle_summary)
-    log.debug("Prepared BTC opening context from prior official 15m closes")
-    return btc_opening_context_cache[2:]
+        session_start, latest_close, now, btc_streak, streak_text, cycle_bias, cycle_summary)
+    log.debug("Prepared today's BTC opening context from 06:00 New York outcomes")
+    return btc_opening_context_cache[3:]
 
 
 def record_kalshi_15m_chart(db, now):
@@ -797,12 +816,15 @@ def _sigmoid(value):
 
 def train_adaptive_model(db, now):
     """Fit a small local classifier from settled, out-of-sample bot forecasts."""
+    session_start = pattern_session_start(now)
     rows = db.execute("""SELECT model_features, actual_direction
         FROM kalshi_prediction_feedback
         WHERE status='evaluated' AND source='bot_forecast'
           AND model_features IS NOT NULL
           AND actual_direction IN ('UP','DOWN')
-        ORDER BY evaluated_at ASC""").fetchall()
+          AND issued_at>=? AND issued_at<?
+        ORDER BY evaluated_at ASC""",
+        (session_start, now)).fetchall()
     examples = []
     for raw_features, actual in rows:
         try:
@@ -867,6 +889,7 @@ def train_adaptive_model(db, now):
         "weights": weights, "means": means, "scales": scales,
         "balanced_accuracy": balanced_accuracy, "samples": len(examples),
         "validation_samples": len(validation),
+        "pattern_session_start": session_start,
     }
     db.execute("""INSERT INTO adaptive_models(name, model_json, trained_at, samples, validation_score)
         VALUES ('btc_direction', ?, ?, ?, ?)
@@ -908,8 +931,8 @@ def adaptive_model_allows(db, features, direction):
         log.exception("Adaptive model could not read its saved parameters")
     return True
 
-def adaptive_model_prediction(db, features):
-    """Return a direction only when the saved BTC model passed its own validation."""
+def adaptive_model_prediction(db, features, now):
+    """Use a BTC model only if it was trained from this 06:00 NY session's forecasts."""
     if features is None:
         return None
     row = db.execute("SELECT model_json FROM adaptive_models WHERE name='btc_direction'").fetchone()
@@ -917,7 +940,8 @@ def adaptive_model_prediction(db, features):
         return None
     try:
         model = json.loads(row[0])
-        if (len(model.get("means", [])) != len(features)
+        if (model.get("pattern_session_start") != pattern_session_start(now)
+                or len(model.get("means", [])) != len(features)
                 or model.get("samples", 0) < 50
                 or model.get("validation_samples", 0) < 10
                 or model.get("balanced_accuracy", 0) < 0.58):
@@ -938,15 +962,20 @@ def adaptive_model_prediction(db, features):
         return None
 
 
-def cycle_pattern_summary(db, asset):
-    """Summarize completed Kalshi cycles and sampled time above/below 50 cents."""
+def cycle_pattern_summary(db, asset, now):
+    """Summarize only completed Kalshi cycles and samples from today's 06:00 NY session."""
+    session_start = pattern_session_start(now)
     if asset == "BTC":
         markets = db.execute("""SELECT ticker,direction FROM kalshi_15m_outcomes
-            WHERE direction IN ('UP','DOWN') ORDER BY close_time DESC LIMIT 20""").fetchall()
+            WHERE close_time>=? AND close_time<=? AND direction IN ('UP','DOWN')
+            ORDER BY close_time DESC LIMIT 20""",
+            (int(session_start), int(now))).fetchall()
     else:
         markets = db.execute("""SELECT ticker,CASE WHEN result='yes' THEN 'UP' ELSE 'DOWN' END
-            FROM kalshi_only_results WHERE ticker LIKE ? AND result IN ('yes','no')
-            ORDER BY observed_at DESC LIMIT 20""", (ETH_SERIES + "-%",)).fetchall()
+            FROM kalshi_only_results WHERE ticker LIKE ? AND observed_at>=?
+              AND observed_at<=? AND result IN ('yes','no')
+            ORDER BY observed_at DESC LIMIT 20""",
+            (ETH_SERIES + "-%", session_start, now)).fetchall()
     completed = len(markets)
     up_closes = sum(direction == "UP" for _, direction in markets)
     down_closes = completed - up_closes
@@ -956,8 +985,9 @@ def cycle_pattern_summary(db, asset):
         placeholders = ",".join("?" for _ in tickers)
         samples = db.execute(
             f"SELECT ticker,observed_at,yes_mid FROM kalshi_only_samples "
-            f"WHERE ticker IN ({placeholders}) ORDER BY ticker,observed_at",
-            tickers).fetchall()
+            f"WHERE ticker IN ({placeholders}) AND observed_at>=? AND observed_at<=? "
+            f"ORDER BY ticker,observed_at",
+            (*tickers, session_start, now)).fetchall()
         by_ticker = {}
         for ticker, observed, raw_mid in samples:
             mid = dec(raw_mid)
@@ -989,22 +1019,24 @@ def cycle_pattern_summary(db, asset):
     return {
         "markets": markets, "completed": completed, "up": up_closes,
         "down": down_closes,
-        "summary": (f"Ciclos cerrados n={completed}: UP {up_closes}/DOWN {down_closes}; "
-                    f"{quote_text}."),
+        "summary": (f"Ciclos de hoy desde 6:00 a. m. NY n={completed}: "
+                    f"UP {up_closes}/DOWN {down_closes}; {quote_text}."),
     }
 
 
-def combo_directional_bias(db, asset):
-    """Compare historical combo-leg accuracy for UP versus DOWN using official results."""
+def combo_directional_bias(db, asset, now):
+    """Compare today's settled combo legs only, preserving older results in storage."""
     prefix = "btc" if asset == "BTC" else "eth"
     ticker_column = prefix + "_ticker"
     direction_column = prefix + "_direction"
+    session_start = pattern_session_start(now)
     rows = db.execute(f"""SELECT c.{direction_column},
             CASE WHEN r.result='yes' THEN 'UP' ELSE 'DOWN' END
         FROM kalshi_combo_forecasts c
         JOIN kalshi_only_results r ON r.ticker=c.{ticker_column}
-        WHERE r.result IN ('yes','no')
-        ORDER BY c.issued_at DESC LIMIT 100""").fetchall()
+        WHERE r.result IN ('yes','no') AND c.issued_at>=? AND c.issued_at<=?
+        ORDER BY c.issued_at DESC LIMIT 100""",
+        (session_start, now)).fetchall()
     rates = {}
     for direction in ("UP", "DOWN"):
         samples = [actual == direction for predicted, actual in rows
@@ -1034,13 +1066,13 @@ def learned_direction(db, market, asset, now, phase):
             (market.get("ticker", ""), now-60)).fetchone()
     prior_mid = dec(prior_quote[0]) if prior_quote else None
     quote_change = float(mid-prior_mid) if prior_mid is not None else 0.0
-    cycle = cycle_pattern_summary(db, asset)
+    cycle = cycle_pattern_summary(db, asset, now)
     outcomes = [direction for _, direction in cycle["markets"]]
     history_score = ((cycle["up"]-cycle["down"])/cycle["completed"]
                      if cycle["completed"] else 0.0)
     live_score = max(-1.0, min(1.0, quote_change/0.05))
     # Give the current contract's live Kalshi chart a slight edge over older cycles.
-    combo_bias = combo_directional_bias(db, asset) if phase == "COMBO_5M" else 0.0
+    combo_bias = combo_directional_bias(db, asset, now) if phase == "COMBO_5M" else 0.0
     combined_score = 0.55*live_score + 0.35*history_score + 0.10*combo_bias
     if combined_score > 0:
         direction = "UP"
@@ -1055,7 +1087,7 @@ def learned_direction(db, market, asset, now, phase):
     features = make_model_features(feature_phase, mid, quote_change,
                                    close_at-now, btc_streak)
     if asset == "BTC":
-        model_hint = adaptive_model_prediction(db, features)
+        model_hint = adaptive_model_prediction(db, features, now)
         if model_hint is not None:
             model_direction, model_probability_up, model_samples, model_score = model_hint
             model_confidence = max(model_probability_up, 1.0-model_probability_up)
@@ -1085,10 +1117,13 @@ def maybe_train_adaptive_model(db, now):
     if (local_now.hour, local_now.minute) < (9, 0):
         return
     today = local_now.strftime("%Y-%m-%d")
+    session_start = pattern_session_start(now)
     count = db.execute("""SELECT COUNT(*) FROM kalshi_prediction_feedback
         WHERE status='evaluated' AND source='bot_forecast' AND model_features IS NOT NULL
-          AND actual_direction IN ('UP','DOWN')""").fetchone()[0]
-    state_key = "adaptive_training_state_9am"
+          AND actual_direction IN ('UP','DOWN')
+          AND issued_at>=? AND issued_at<?""",
+        (session_start, now)).fetchone()[0]
+    state_key = f"adaptive_training_state_6am_{int(session_start)}"
     row = db.execute("SELECT value FROM telegram_state WHERE key=?", (state_key,)).fetchone()
     if row and row[0].startswith(today + ":"):
         _, status, previous_count = row[0].split(":")
