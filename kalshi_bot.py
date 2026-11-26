@@ -7,6 +7,7 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
 import requests
 import btc_assistant
@@ -1040,20 +1041,26 @@ def learned_direction(db, market, asset, now, phase):
 
 
 def maybe_train_adaptive_model(db, now):
-    """Train daily, retrying after five more scored examples when data/model checks fail."""
-    today = time.strftime("%Y-%m-%d", time.gmtime(now))
+    """Run the daily self-learning pass at 9 a.m. Chicago time, retrying on new results."""
+    local_now = datetime.fromtimestamp(now, ZoneInfo("America/Chicago"))
+    if (local_now.hour, local_now.minute) < (9, 0):
+        return
+    today = local_now.strftime("%Y-%m-%d")
     count = db.execute("""SELECT COUNT(*) FROM kalshi_prediction_feedback
         WHERE status='evaluated' AND source='bot_forecast' AND model_features IS NOT NULL
           AND actual_direction IN ('UP','DOWN')""").fetchone()[0]
-    row = db.execute("SELECT value FROM telegram_state WHERE key='adaptive_training_state'").fetchone()
+    state_key = "adaptive_training_state_9am"
+    row = db.execute("SELECT value FROM telegram_state WHERE key=?", (state_key,)).fetchone()
     if row and row[0].startswith(today + ":"):
         _, status, previous_count = row[0].split(":")
         if status == "trained" or count < int(previous_count) + 5:
             return
+    log.info("Daily self-learning pass at %s: reviewing %d settled bot forecasts",
+             local_now.strftime("%Y-%m-%d %H:%M %Z"), count)
     trained = train_adaptive_model(db, now)
     state = f"{today}:{'trained' if trained else 'pending'}:{count}"
-    db.execute("""INSERT INTO telegram_state(key,value) VALUES ('adaptive_training_state',?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (state,))
+    db.execute("""INSERT INTO telegram_state(key,value) VALUES (?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (state_key, state))
 
 
 def adaptive_direction_gate(db, phase, direction, asset="BTC"):
