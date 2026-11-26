@@ -1054,6 +1054,25 @@ def learned_direction(db, market, asset, now, phase):
     feature_phase = "LAST_5M" if phase in ("LAST_5M", "COMBO_5M") else "EARLY_5M"
     features = make_model_features(feature_phase, mid, quote_change,
                                    close_at-now, btc_streak)
+    if asset == "BTC":
+        model_hint = adaptive_model_prediction(db, features)
+        if model_hint is not None:
+            model_direction, model_probability_up, model_samples, model_score = model_hint
+            model_confidence = max(model_probability_up, 1.0-model_probability_up)
+            if (model_samples >= 100 and model_score >= 0.62
+                    and model_confidence >= 0.65):
+                if model_direction != direction:
+                    log.info(
+                        "Validated adaptive model selected %s over Kalshi cycle direction %s "
+                        "(confidence %.1f%%, balanced validation %.1f%%, n=%d)",
+                        model_direction, direction, model_confidence*100,
+                        model_score*100, model_samples)
+                direction = model_direction
+            else:
+                log.info(
+                    "Adaptive model remains advisory: confidence %.1f%%, "
+                    "balanced validation %.1f%%, n=%d",
+                    model_confidence*100, model_score*100, model_samples)
     basis = (f"Kalshi actual + histórico n={cycle['completed']} "
              f"(UP {cycle['up']}/DOWN {cycle['down']}) + movimiento YES {quote_change:+.3f}")
     return (direction, features, basis, quote_change,
