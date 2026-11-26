@@ -500,7 +500,26 @@ def get_json(path, params=None):
             time.sleep(2 ** attempt)
     return None
 
+def alerts_paused(now=None):
+    """Return whether broadcast notifications are paused until the configured local time."""
+    raw = os.getenv("ALERTS_PAUSED_UNTIL", "").strip()
+    if not raw:
+        return False
+    try:
+        release_at = datetime.fromisoformat(raw)
+        if release_at.tzinfo is None:
+            release_at = release_at.replace(tzinfo=ZoneInfo("America/New_York"))
+        instant = time.time() if now is None else now
+        return instant < release_at.timestamp()
+    except ValueError:
+        log.error("Invalid ALERTS_PAUSED_UNTIL value; broadcast notifications are enabled")
+        return False
+
+
 def notify(msg, db=None, broadcast=False, photo=None):
+    if broadcast and alerts_paused():
+        log.info("Broadcast notification suppressed until ALERTS_PAUSED_UNTIL")
+        return False
     if not TOKEN:
         log.warning("Telegram not configured")
         return False
@@ -2051,6 +2070,8 @@ def daily_bot_schedule(now=None):
     """Pause 03:00–06:00 and collect data without forecasts until 09:00 New York time."""
     instant = time.time() if now is None else now
     local_now = datetime.fromtimestamp(instant, ZoneInfo("America/New_York"))
+    if alerts_paused(instant):
+        return "analysis", local_now
     if 3 <= local_now.hour < 6:
         return "paused", local_now
     if 6 <= local_now.hour < 9:
