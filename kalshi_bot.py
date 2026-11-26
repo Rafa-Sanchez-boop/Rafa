@@ -1693,7 +1693,12 @@ def evaluate_combo_reviews(db, now):
             f"🏁 Combo: {'✅ ACERTÓ LAS DOS PATAS' if combo_ok else '❌ NO ACERTÓ EL COMBO'}",
             f"📊 Acumulado: {wins} acertados · {losses} fallados de {total} ({accuracy:.0%} de combos completos).",
         ])
-        if notify(message, db=db, broadcast=True):
+        if alerts_paused():
+            db.execute("INSERT OR IGNORE INTO kalshi_combo_reviews VALUES (?,?)",
+                       (combo_key, now))
+            log.info("Combo result evaluated and saved during notification pause: %s",
+                     combo_key)
+        elif notify(message, db=db, broadcast=True):
             db.execute("INSERT OR IGNORE INTO kalshi_combo_reviews VALUES (?,?)",
                        (combo_key, now))
 
