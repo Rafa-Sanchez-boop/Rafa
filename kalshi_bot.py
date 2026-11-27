@@ -2118,16 +2118,24 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
     eth_eta = max(0, int(eth_leg["eta_seconds"]))
     btc_eta_label = f"{btc_eta//60:02d}:{btc_eta%60:02d}"
     eth_eta_label = f"{eth_eta//60:02d}:{eth_eta%60:02d}"
+    btc_sign = "+" if btc_leg["direction"] == "UP" else "-"
+    eth_sign = "+" if eth_leg["direction"] == "UP" else "-"
     message = (
-        "🧩 COMBO BTC + ETH\n"
-        f"BTC: {direction_label(btc_leg['direction'])}\n"
-        f"⏱ {btc_move_label} estimada en {btc_eta_label}\n"
-        f"📏 {btc_move_label} estimada: USD {btc_leg['move_amount']:,.2f}\n"
-        f"📍 Cierre estimado: USD {btc_leg['projected']:,.2f}\n"
-        f"ETH: {direction_label(eth_leg['direction'])}\n"
-        f"⏱ {eth_move_label} estimada en {eth_eta_label}\n"
-        f"📏 {eth_move_label} estimada (Kalshi YES): USD {eth_leg['move_amount']:.3f}\n"
-        f"📍 Cierre estimado (Kalshi YES): USD {eth_leg['projected']:.3f}"
+        "🧩 COMBO BTC + ETH\n\n"
+        "₿ BTC — PRECIO DE REFERENCIA KRAKEN\n"
+        f"Dirección prevista: {direction_label(btc_leg['direction'])}\n"
+        f"Precio BTC de referencia: USD {btc_leg['start']:,.2f}\n"
+        f"Movimiento estimado: {btc_sign}USD {btc_leg['move_amount']:,.2f}\n"
+        f"Precio BTC proyectado: USD {btc_leg['projected']:,.2f}\n"
+        f"Tiempo estimado del movimiento: {btc_eta_label}\n\n"
+        "◆ ETH — CONTRATO KALSHI YES\n"
+        f"Dirección prevista: {direction_label(eth_leg['direction'])}\n"
+        f"Cotización YES actual: USD {eth_leg['start']:.3f} por contrato\n"
+        f"Variación estimada: {eth_sign}USD {eth_leg['move_amount']:.3f} por contrato\n"
+        f"Cotización YES proyectada: USD {eth_leg['projected']:.3f} por contrato\n"
+        f"Tiempo estimado del movimiento: {eth_eta_label}\n\n"
+        "🏁 La liquidación oficial de BTC y ETH se informa por separado "
+        "cuando Kalshi publique ambos resultados."
     )
     if not notify(message, db=db, broadcast=True):
         return
