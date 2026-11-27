@@ -1403,15 +1403,54 @@ def closing_confidence(db, ticker, phase, direction, now, remaining, start, proj
         return None
 
 
+def kalshi_reversal_status(db, ticker, direction, now, opened_at):
+    """Detect a live Kalshi YES reversal and report its contract minute."""
+    if direction not in ("UP", "DOWN") or opened_at is None:
+        return None, "Todavía no hay muestras suficientes para validar un giro."
+    rows = db.execute("""SELECT observed_at,yes_mid FROM kalshi_only_samples
+        WHERE ticker=? AND observed_at>=? AND observed_at<=?
+        ORDER BY observed_at DESC LIMIT 4""",
+        (ticker, opened_at, now)).fetchall()
+    points = [(float(t), dec(mid)) for t, mid in reversed(rows)]
+    points = [(t, mid) for t, mid in points if mid is not None]
+    if not points or now-points[-1][0] > 15:
+        return None, "Cotización Kalshi desactualizada; giro no confirmado."
+    reversal = "DOWN" if direction == "UP" else "UP"
+    sign = Decimal("-1") if direction == "UP" else Decimal("1")
+    label = "🟢 UP" if reversal == "UP" else "🔴 DOWN"
+    if len(points) >= 4:
+        changes = [b[1]-a[1] for a, b in zip(points[-4:], points[-3:])]
+        net = points[-1][1]-points[-4][1]
+        if all(change*sign > 0 for change in changes) and abs(net) >= Decimal("0.020"):
+            minute = max(1, int((points[-4][0]-opened_at)//60)+1)
+            return reversal, (
+                f"Giro confirmado hacia {label} en el minuto {minute} "
+                f"(4 cotizaciones Kalshi; cambio YES {net:+.3f}).")
+    if len(points) >= 3:
+        recent = points[-3:]
+        changes = [b[1]-a[1] for a, b in zip(recent, recent[1:])]
+        net = recent[-1][1]-recent[0][1]
+        if all(change*sign > 0 for change in changes) and abs(net) >= Decimal("0.015"):
+            minute = max(1, int((recent[0][0]-opened_at)//60)+1)
+            return "PENDING_" + reversal, (
+                f"Posible giro hacia {label} desde el minuto {minute}; "
+                "en espera de una cotización más para confirmarlo.")
+    return None, "No hay un movimiento contrario confirmado en las cotizaciones Kalshi."
+
+
 def forecast_display(ticker, phase_label, direction, confidence, start, target, projected,
                      bias_direction, bias_evidence, cycle_text):
     """Format a BTC alert; Kraken is a numeric reference, never a direction input."""
     if bias_direction == "UP":
-        bias_text = "🔄 Posible giro en el objetivo: 🟢 UP · sesgo de cierre por encima del objetivo."
+        bias_text = f"🔄 Giro confirmado: 🟢 UP · {bias_evidence}"
     elif bias_direction == "DOWN":
-        bias_text = "🔄 Posible giro en el objetivo: 🔴 DOWN · sesgo de cierre por debajo del objetivo."
+        bias_text = f"🔄 Giro confirmado: 🔴 DOWN · {bias_evidence}"
+    elif bias_direction == "PENDING_UP":
+        bias_text = f"🔄 Posible giro: 🟡 hacia 🟢 UP · {bias_evidence}"
+    elif bias_direction == "PENDING_DOWN":
+        bias_text = f"🔄 Posible giro: 🟡 hacia 🔴 DOWN · {bias_evidence}"
     else:
-        bias_text = "🔄 Posible giro en el objetivo: 🟡 no confirmado · evidencia insuficiente."
+        bias_text = f"🔄 Posible giro: 🟡 no confirmado · {bias_evidence}"
     if start is not None and target is not None and projected is not None:
         price_text = (
             f"🌐 Referencia numérica Kraken BTC/USD: USD {start:,.2f}\n"
@@ -1606,8 +1645,9 @@ def signal(db, m, now, phase, kraken_direction=None):
     model_features = make_model_features(phase, mid, kalshi_change,
                                          remaining, btc_streak)
     cycle_text = f"{streak_text}\n{cycle_summary}\nBase: {history_basis}"
-    # Kraken supplies BTC price levels only; it does not vote on direction or reversal.
-    bias, bias_evidence = None, "La dirección se calcula con cierres y cotización de Kalshi."
+    # Reversals are detected only from fresh Kalshi YES samples, never from Kraken.
+    bias, bias_evidence = kalshi_reversal_status(
+        db, ticker, direction, now, opened_at)
     db.execute("""CREATE TABLE IF NOT EXISTS rafa_close_estimates
         (id TEXT PRIMARY KEY, estimated TEXT, absolute_error TEXT)""")
     confidence = (closing_confidence(
