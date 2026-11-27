@@ -20,14 +20,14 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = min(5, max(1, int(os.getenv("SCAN_SECONDS", "5"))))
 COMBO_WINDOW_SECONDS = 250
-OPENING_REVIEW_SECONDS = 0
-COMBO_RULE_VERSION = "combo-window-250-kalshi-only-kraken-price-paused-next-contract-v3"
+OPENING_REVIEW_SECONDS = 20
+COMBO_RULE_VERSION = "combo-btc-eth-last-250s-v1"
 COMBO_QUALITY_FILTERS_ENABLED = False
 COMBO_MIN_SETTLED = 30
 COMBO_MIN_JOINT_ACCURACY = 0.90
 COMBO_MIN_MARKET_PROBABILITY = Decimal("0.90")
 MIN_VOLUME = Decimal("0")
-BOT_VERSION = os.getenv("BOT_VERSION", "rafa-learning-history-btc-eth-next-contract-v1")
+BOT_VERSION = os.getenv("BOT_VERSION", "rafa-first-impulse-open-250s-combo-v1")
 PANEL_URL = os.getenv("RAFA_PANEL_URL", "").rstrip("/")
 PANEL_SECRET = os.getenv("RAFA_PANEL_SECRET", "")
 PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
@@ -35,12 +35,12 @@ RULES_SNAPSHOT = json.dumps({
     "series": SERIES, "eth_series": ETH_SERIES,
     "scan_seconds": SCAN_SECONDS, "opening_prediction_delay_seconds": OPENING_REVIEW_SECONDS,
     "combo_window_seconds": COMBO_WINDOW_SECONDS,
-    "signal_rule": "At each BTC 15-minute opening, use the immediately previous official Kalshi result plus its complete YES quote path and historical cycles; Kraken supplies numeric BTC/USD values only",
-    "opening_prediction_rule": "Send at the first active scan after Kalshi confirms the previous official result and publishes the new open contract; no 30-second wait",
+    "signal_rule": "At BTC 15-minute opening, wait for the first BTC/USD impulse and use the immediately previous completed Kalshi YES path to estimate the opposite pullback; send a separate forecast 250 seconds before close",
+    "opening_prediction_rule": "Wait at least 20 seconds after open for a BTC/USD move of at least 0.01%, then forecast the opposite pullback using the previous complete contract path",
     "combo_rule_version": COMBO_RULE_VERSION,
     "combo_quality_filters_enabled": COMBO_QUALITY_FILTERS_ENABLED,
     "combo_kraken_reference_enabled": False,
-    "combo_rule": "Sample aligned BTC and ETH Kalshi 15-minute markets; Kalshi history and YES quotes drive both directions; Kraken price reference is paused for combo BTC",
+    "combo_rule": "Send aligned BTC+ETH Kalshi 15-minute combos only during the final 250 seconds; retain both market legs and their own settlement results",
     "combo_quality_gate": "Paused; preserve confidence and settlement data for evaluation without suppressing combo alerts",
     "learning": "Score new BTC and combo legs against Kalshi official settlement and retain feedback history",
     "automatic_orders": False,
@@ -476,33 +476,30 @@ def db_open():
          btc REAL, volatility REAL, candidate TEXT, PRIMARY KEY(ticker,phase))""")
     db.execute("""CREATE TABLE IF NOT EXISTS rafa_shadow_daily
         (day TEXT PRIMARY KEY, report TEXT NOT NULL)""")
-    reset_version = "learning-reset-2026-11-25-v2"
+    reset_version = "full-bot-memory-reset-2026-11-27-v1"
     reset_row = db.execute(
         "SELECT value FROM telegram_state WHERE key='learning_reset_version'").fetchone()
     if not reset_row or reset_row[0] != reset_version:
-        reset_tables = (
-            "kalshi_only_samples", "kalshi_15m_outcomes",
-            "kalshi_15m_chart_sent", "kalshi_only_alerts",
-            "kalshi_only_results", "kalshi_prediction_feedback",
-            "adaptive_models", "kalshi_opening_journal", "rafa_shadow",
-            "rafa_shadow_daily", "rafa_candle_context",
-            "rafa_shadow_milestones", "rafa_close_estimates",
-            "kalshi_wait_notices", "kalshi_combo_forecasts",
-            "kalshi_combo_reviews",
-        )
-        for table in reset_tables:
-            exists = db.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                (table,)).fetchone()
-            if exists:
-                db.execute(f"DELETE FROM {table}")
-        db.execute("DELETE FROM telegram_state WHERE key IN "
-                   "('adaptive_training_state','dashboard_sync_attempt')")
+        # Keep Telegram subscriptions and invitation/access control. Clear all
+        # market history, signals, model state, dashboard cache, and old settings.
+        preserved_tables = {
+            "telegram_state", "telegram_subscribers",
+            "telegram_allowed", "telegram_invites",
+        }
+        tables = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        for (table,) in tables:
+            if table not in preserved_tables:
+                quoted = '"' + table.replace('"', '""') + '"'
+                db.execute(f"DELETE FROM {quoted}")
+        db.execute("""DELETE FROM telegram_state
+                      WHERE key NOT IN ('subscriber_seeded','private_access_v1')""")
         db.execute("""INSERT INTO telegram_state(key,value)
                       VALUES ('learning_reset_version',?)
                       ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
                    (reset_version,))
-        log.warning("Learning, model, and signal history cleared; Telegram access preserved")
+        log.warning("All learning, model, signal, and market history cleared; Telegram access preserved")
     db.commit()
     return db
 
@@ -1835,6 +1832,139 @@ def learned_signal(db, market, now):
              ticker, direction, basis)
 
 
+def opening_impulse_signal(db, market, now):
+    """Wait for BTC's first opening impulse, then estimate the opposite pullback."""
+    ticker = market.get("ticker", "")
+    if not ticker or not ticker.startswith(SERIES + "-"):
+        return
+    if db.execute(
+            "SELECT 1 FROM kalshi_only_alerts WHERE ticker=? AND phase='OPEN_IMPULSE'",
+            (ticker,)).fetchone():
+        return
+    opened_at = ts(market.get("open_time"))
+    close_at = ts(market.get("close_time"))
+    if opened_at is None or close_at is None or not (opened_at <= now < close_at):
+        return
+    if now-opened_at < 20:
+        return
+    if kraken_last_quote is None or now-kraken_last_quote[0] > 15:
+        return
+    opening = db.execute("""SELECT kraken_usd,yes_mid,observed_at
+        FROM kalshi_opening_journal WHERE ticker=? ORDER BY observed_at LIMIT 1""",
+        (ticker,)).fetchone()
+    if opening and opening[0]:
+        open_price = dec(opening[0])
+        open_mid = dec(opening[1])
+        observed_open = float(opening[2])
+    else:
+        opening_samples = [(t, p) for t, p in kraken_samples if opened_at <= t <= now]
+        if not opening_samples:
+            return
+        observed_open, open_price = opening_samples[0]
+        first_quote = db.execute("""SELECT yes_mid,observed_at FROM kalshi_only_samples
+            WHERE ticker=? AND observed_at>=? ORDER BY observed_at LIMIT 1""",
+            (ticker, opened_at)).fetchone()
+        open_mid = dec(first_quote[0]) if first_quote else None
+    if open_price is None or open_price <= 0 or now-observed_open < 15:
+        return
+    current_price = kraken_last_quote[1]
+    btc_move = current_price-open_price
+    if abs(btc_move) < open_price*Decimal("0.0001"):
+        return
+    q = quote(market)
+    if q is None:
+        return
+    current_mid = q[2]
+    if open_mid is not None and abs(current_mid-open_mid) < Decimal("0.005"):
+        return
+    impulse = "UP" if btc_move > 0 else "DOWN"
+    if open_mid is not None and ((current_mid > open_mid) != (impulse == "UP")):
+        return
+    reversal = "DOWN" if impulse == "UP" else "UP"
+
+    # Read the complete immediately previous contract and use its first
+    # retracement size and timing as a one-cycle reference.
+    previous = db.execute("""SELECT ticker,close_time FROM kalshi_15m_outcomes
+        WHERE close_time BETWEEN ? AND ? AND direction IN ('UP','DOWN')
+        ORDER BY close_time DESC LIMIT 1""",
+        (int(opened_at)-5, int(opened_at)+5)).fetchone()
+    if not previous:
+        log.info("Opening impulse waits for previous official BTC settlement: %s", ticker)
+        return
+    previous_ticker, previous_close = previous
+    previous_open = float(previous_close)-900
+    rows = db.execute("""SELECT observed_at,yes_mid FROM kalshi_only_samples
+        WHERE ticker=? AND observed_at>=? AND observed_at<=? ORDER BY observed_at""",
+        (previous_ticker, previous_open, float(previous_close))).fetchall()
+    path = [(float(t), dec(value)) for t, value in rows]
+    path = [(t, value) for t, value in path if value is not None]
+    if len(path) < 8 or path[0][0] > previous_open+20 or path[-1][0] < previous_close-30:
+        log.info("Opening impulse waits for the complete previous YES path: %s", previous_ticker)
+        return
+    opening_path = [(t, value) for t, value in path if t <= previous_open+90]
+    if len(opening_path) < 3:
+        return
+    initial_change = opening_path[-1][1]-opening_path[0][1]
+    previous_direction = "UP" if initial_change > 0 else "DOWN"
+    if abs(initial_change) < Decimal("0.010"):
+        return
+    if previous_direction == "UP":
+        extreme_index = max(range(len(opening_path)), key=lambda i: opening_path[i][1])
+        extreme_time, extreme = opening_path[extreme_index]
+        tail = [value for t, value in path if t >= extreme_time]
+        reversal_points = [(t, value) for t, value in path
+                           if t >= extreme_time and value <= extreme-Decimal("0.010")]
+        retrace = max(Decimal("0.25"), min(Decimal("1.0"),
+                        (extreme-min(tail))/abs(initial_change)))
+    else:
+        extreme_index = min(range(len(opening_path)), key=lambda i: opening_path[i][1])
+        extreme_time, extreme = opening_path[extreme_index]
+        tail = [value for t, value in path if t >= extreme_time]
+        reversal_points = [(t, value) for t, value in path
+                           if t >= extreme_time and value >= extreme+Decimal("0.010")]
+        retrace = max(Decimal("0.25"), min(Decimal("1.0"),
+                        (max(tail)-extreme)/abs(initial_change)))
+    elapsed = max(0, int(now-opened_at))
+    eta_seconds = (max(20, min(300, int(reversal_points[0][0]-previous_open-elapsed)))
+                   if reversal_points else 60)
+    target = (current_price-abs(btc_move)*retrace if reversal == "DOWN"
+              else current_price+abs(btc_move)*retrace)
+    if target <= 0:
+        return
+    eta_label = f"{eta_seconds//60:02d}:{eta_seconds%60:02d}"
+    impulse_label = direction_label(impulse)
+    reversal_label = direction_label(reversal)
+    confidence_note = ("tiempo basado en el primer retroceso observado en el contrato anterior"
+                       if reversal_points else "tiempo orientativo; no hubo retroceso equivalente en el anterior")
+    message = (
+        "🚨 BTC 15M · PRIMER IMPULSO DE APERTURA\n"
+        f"🧾 Contrato: {ticker}\n"
+        f"📈 Primer movimiento observado: {impulse_label} desde USD {open_price:,.2f} "
+        f"hasta USD {current_price:,.2f}\n"
+        f"🎯 Posible entrada hacia: {reversal_label} cerca de USD {current_price:,.2f}\n"
+        f"📍 Objetivo estimado: USD {target:,.2f}\n"
+        f"⏱ Tiempo estimado: {eta_label} ({confidence_note})\n"
+        f"📚 Referencia: recorrido completo de {previous_ticker}; "
+        f"impulso previo {previous_direction}, retroceso estimado {retrace:.0%}.\n"
+        f"⏳ Minuto actual del contrato: {elapsed//60:02d}:{elapsed%60:02d}\n"
+        "Proyección experimental; espera confirmación del precio antes de operar."
+    )
+    if notify(message, db=db, broadcast=True):
+        db.execute("""INSERT OR IGNORE INTO kalshi_only_alerts
+            (ticker,phase,sent_at,direction,bot_version,rules_snapshot)
+            VALUES (?,?,?,?,?,?)""",
+            (ticker, "OPEN_IMPULSE", now, reversal, BOT_VERSION, RULES_SNAPSHOT))
+        db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
+            (id,ticker,phase,predicted_direction,issued_at,close_at,start_price,
+             target_price,status,source,bot_version,rules_snapshot)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (f"kalshi-cycle:{ticker}:OPEN_IMPULSE", ticker, "OPEN_IMPULSE",
+             reversal, now, close_at, str(current_price), str(target), "pending",
+             "bot_forecast", BOT_VERSION, RULES_SNAPSHOT))
+        log.info("Opening impulse forecast sent: %s %s -> %s",
+                 ticker, impulse, reversal)
+
+
 def signal(db, m, now, phase, kraken_direction=None):
     """Issue opening or final-five-minute BTC forecasts; Kalshi sets direction."""
     ticker = m["ticker"]
@@ -1863,7 +1993,7 @@ def signal(db, m, now, phase, kraken_direction=None):
         if not (OPENING_REVIEW_SECONDS <= elapsed <= 300):
             return
     elif phase == "LAST_5M":
-        if not (0 < remaining <= 300):
+        if not (0 < remaining <= 250):
             return
     else:
         return
@@ -2633,10 +2763,10 @@ def scan(predictions_enabled=True):
                 journal_opening_quote(db, market, now, opened, closes)
             open_btc.append(market)
             if predictions_enabled:
-                signal(db, market, now, "EARLY_5M")
-                if closes-now <= 300:
+                opening_impulse_signal(db, market, now)
+                if closes-now <= 250:
                     signal(db, market, now, "LAST_5M")
-                monitor_kalshi_reversal(db, market, now, opened)
+                
                 # The next-contract forecast is sent as soon as its prior official result is available.
         if eth_payload is not None:
             for market in eth_payload.get("markets", []):
