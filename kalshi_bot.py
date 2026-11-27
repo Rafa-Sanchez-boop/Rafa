@@ -20,8 +20,10 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
 COMBO_WINDOW_SECONDS = max(60, int(os.getenv("COMBO_WINDOW_SECONDS", "360")))
-COMBO_MIN_SETTLED = 10
-COMBO_MIN_JOINT_ACCURACY = 0.60
+COMBO_RULE_VERSION = "combo-strict90-v1"
+COMBO_MIN_SETTLED = 30
+COMBO_MIN_JOINT_ACCURACY = 0.90
+COMBO_MIN_MARKET_PROBABILITY = Decimal("0.90")
 MIN_VOLUME = Decimal("0")
 BOT_VERSION = os.getenv("BOT_VERSION", "rafa-learning-history-btc-eth")
 PANEL_URL = os.getenv("RAFA_PANEL_URL", "").rstrip("/")
@@ -31,8 +33,9 @@ RULES_SNAPSHOT = json.dumps({
     "series": SERIES, "eth_series": ETH_SERIES,
     "scan_seconds": SCAN_SECONDS, "combo_window_seconds": min(COMBO_WINDOW_SECONDS, 360),
     "signal_rule": "Opening and final-five-minute direction from Kalshi official close cycles plus live Kalshi YES movement; Kraken is used only as BTC/USD price reference",
-    "combo_rule": "Sample BTC and ETH Kalshi markets from open; send a combo during the final five minutes using settled cycles and live Kalshi YES movement; Kraken supplies BTC/USD price only",
-    "combo_quality_gate": "Send only when at least 10 previously sent exact-pair combos have official settlements and at least 60% joint accuracy; never include silent shadow candidates in calibration",
+    "combo_rule_version": COMBO_RULE_VERSION,
+    "combo_rule": "Sample aligned BTC and ETH Kalshi 15-minute markets; Kraken supplies BTC/USD price only; BTC and ETH YES quotes drive direction and ETH price",
+    "combo_quality_gate": "Send only when each leg's Kalshi YES/NO midpoint supports the predicted direction at >=90% and this same rule version has >=30 resolved exact-pair candidates with >=90% joint accuracy; otherwise retain shadow candidates",
     "learning": "Score new BTC and combo legs against Kalshi official settlement and retain feedback history",
     "automatic_orders": False,
 }, separators=(",", ":"), sort_keys=True)
@@ -1692,13 +1695,17 @@ def ensure_combo_forecast_table(db):
         (combo_key TEXT PRIMARY KEY, btc_ticker TEXT NOT NULL, eth_ticker TEXT NOT NULL,
          issued_at REAL NOT NULL, close_at REAL NOT NULL,
          btc_direction TEXT NOT NULL, eth_direction TEXT NOT NULL,
-         alert_sent INTEGER NOT NULL DEFAULT 1)""")
+         alert_sent INTEGER NOT NULL DEFAULT 1,
+         combo_version TEXT NOT NULL DEFAULT 'legacy')""")
     columns = {row[1] for row in db.execute(
         "PRAGMA table_info(kalshi_combo_forecasts)")}
     if "alert_sent" not in columns:
         # Existing rows are real alerts; rejected candidates are stored as shadow rows.
         db.execute("""ALTER TABLE kalshi_combo_forecasts
             ADD COLUMN alert_sent INTEGER NOT NULL DEFAULT 1""")
+    if "combo_version" not in columns:
+        db.execute("""ALTER TABLE kalshi_combo_forecasts
+            ADD COLUMN combo_version TEXT NOT NULL DEFAULT 'legacy'""")
 
 def evaluate_combo_reviews(db, now):
     ensure_combo_forecast_table(db)
@@ -1758,10 +1765,14 @@ def evaluate_combo_reviews(db, now):
 
 
 def check_results(db, now):
-    # Prioritize official Kalshi settlements so price reviews cannot delay them.
+    # Include shadow combo candidates so they can be calibrated against official settlements.
+    ensure_combo_forecast_table(db)
     # Use Kalshi's official result field, never Kraken, for completed markets.
-    rows = db.execute("""SELECT DISTINCT ticker FROM kalshi_only_alerts
-        WHERE ticker NOT IN (SELECT ticker FROM kalshi_only_results)""").fetchall()
+    rows = db.execute("""SELECT ticker FROM (
+            SELECT ticker FROM kalshi_only_alerts
+            UNION SELECT btc_ticker AS ticker FROM kalshi_combo_forecasts
+            UNION SELECT eth_ticker AS ticker FROM kalshi_combo_forecasts
+        ) WHERE ticker NOT IN (SELECT ticker FROM kalshi_only_results)""").fetchall()
     for (ticker,) in rows[-30:]:
         payload = get_json("/markets/" + ticker)
         market = payload.get("market", {}) if payload else {}
@@ -1957,8 +1968,10 @@ def combo_history_summary(db, now, btc_direction, eth_direction):
         FROM kalshi_combo_forecasts c
         JOIN kalshi_only_results b ON b.ticker=c.btc_ticker
         JOIN kalshi_only_results e ON e.ticker=c.eth_ticker
-        WHERE c.issued_at<? AND c.alert_sent=1 AND b.result IN ('yes','no') AND e.result IN ('yes','no')
-        ORDER BY c.issued_at DESC LIMIT 100""", (now,)).fetchall()
+        WHERE c.issued_at<? AND c.combo_version=?
+          AND b.result IN ('yes','no') AND e.result IN ('yes','no')
+        ORDER BY c.issued_at DESC LIMIT 100""",
+        (now, COMBO_RULE_VERSION)).fetchall()
     evaluated = []
     for btc_pred, eth_pred, btc_result, eth_result in rows:
         btc_actual = "UP" if btc_result == "yes" else "DOWN"
@@ -1987,7 +2000,7 @@ def combo_history_summary(db, now, btc_direction, eth_direction):
                     if bd == btc_direction and ed == eth_direction]
     global_samples = [btc_ok and eth_ok for _, _, btc_ok, eth_ok in evaluated]
     lines = [
-        "📊 Probabilidad basada en combos ya liquidados:",
+        "📊 Historial validado del mismo algoritmo (incluye candidatos en sombra):",
         line(f"BTC {btc_direction}", btc_samples),
         line(f"ETH {eth_direction}", eth_samples),
     ]
@@ -2029,6 +2042,9 @@ def combo_leg(db, market, now, asset):
     if forecast is None:
         return None
     direction, features, basis, quote_change, pattern_summary = forecast
+    horizon_seconds = min(max(0.0, close_at-now), 300.0)
+    if horizon_seconds <= 0:
+        return None
     if asset == "BTC":
         projection = kraken_close_projection(now, close_at-now)
         if projection is None:
@@ -2049,14 +2065,17 @@ def combo_leg(db, market, now, asset):
         # No Kraken ETH feed is used. The ETH leg shows Kalshi YES price movement.
         mid = q[2]
         start = mid
-        previous = db.execute("""SELECT yes_mid FROM kalshi_only_samples
+        previous = db.execute("""SELECT yes_mid,observed_at FROM kalshi_only_samples
             WHERE ticker=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 1""",
-            (market["ticker"], now-60)).fetchone()
+            (market["ticker"], now-300)).fetchone()
         previous_mid = dec(previous[0]) if previous else None
-        move = abs(mid-previous_mid) if previous_mid is not None else Decimal("0")
-        move = max(move, Decimal("0.01"))
-        horizon = min(Decimal("1"), max(Decimal("0"), Decimal(str(close_at-now))/Decimal("300")))
-        projected = mid + (move*horizon if direction == "UP" else -move*horizon)
+        previous_time = float(previous[1]) if previous else None
+        if (previous_mid is None or previous_time is None
+                or now-previous_time > 360 or mid == previous_mid):
+            return None
+        move_5m = abs(mid-previous_mid)
+        horizon = Decimal(str(horizon_seconds))/Decimal("300")
+        projected = mid + (move_5m*horizon if direction == "UP" else -move_5m*horizon)
         projected = min(Decimal("0.99"), max(Decimal("0.01"), projected))
         first_projection = (start, projected)
         symbol = "ETH · Kalshi YES"
@@ -2064,18 +2083,37 @@ def combo_leg(db, market, now, asset):
         volume = dec(market.get("volume_24h_fp")) or dec(market.get("volume_24h")) or Decimal(0)
     if first_projection[1] == start:
         first_projection = (start, projected)
+    quantum = Decimal("0.01") if asset == "BTC" else Decimal("0.001")
+    start = start.quantize(quantum)
+    projected = projected.quantize(quantum)
+    first_target = first_projection[1].quantize(quantum)
+    if first_target == start and projected != start:
+        first_target = projected
     projected_move = abs(projected-start)
-    target_move = abs(first_projection[1]-start)
-    eta_seconds = (close_at-now) * min(1.0, float(target_move/projected_move)) if projected_move else close_at-now
+    target_move = abs(first_target-start)
+    if projected_move == 0 or target_move == 0:
+        return None
+    eta_seconds = horizon_seconds * min(1.0, float(target_move/projected_move))
     btc_streak, _, _, _ = prepare_btc_opening_context(db, now)
     return {
         "asset": asset, "ticker": market["ticker"], "direction": direction,
-        "start": start, "target": first_projection[1], "projected": projected,
+        "start": start, "target": first_target, "projected": projected,
         "move_amount": target_move, "eta_seconds": eta_seconds,
+        "projection_horizon_seconds": horizon_seconds, "yes_mid": q[2],
         "volume": volume, "symbol": symbol, "price_unit": price_unit,
         "model_features": features, "learning_basis": basis,
         "cycle_summary": pattern_summary,
     }
+
+
+def record_combo_candidate(db, combo_key, btc_leg, eth_leg, now, close_at, alert_sent):
+    db.execute("""INSERT OR IGNORE INTO kalshi_combo_forecasts
+        (combo_key,btc_ticker,eth_ticker,issued_at,close_at,
+         btc_direction,eth_direction,alert_sent,combo_version)
+        VALUES (?,?,?,?,?,?,?,?,?)""",
+        (combo_key, btc_leg["ticker"], eth_leg["ticker"], now, close_at,
+         btc_leg["direction"], eth_leg["direction"], int(alert_sent),
+         COMBO_RULE_VERSION))
 
 
 def send_btc_eth_combo(db, btc_market, eth_market, now):
@@ -2094,18 +2132,26 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
     if db.execute("SELECT 1 FROM kalshi_combo_forecasts WHERE combo_key=?",
                   (combo_key,)).fetchone():
         return
-    # Historical probability uses only prior combo forecasts with official settlements.
+    btc_market_probability = (btc_leg["yes_mid"] if btc_leg["direction"] == "UP"
+                              else Decimal("1")-btc_leg["yes_mid"])
+    eth_market_probability = (eth_leg["yes_mid"] if eth_leg["direction"] == "UP"
+                              else Decimal("1")-eth_leg["yes_mid"])
+    if (btc_market_probability < COMBO_MIN_MARKET_PROBABILITY
+            or eth_market_probability < COMBO_MIN_MARKET_PROBABILITY):
+        record_combo_candidate(db, combo_key, btc_leg, eth_leg, now, btc_close, False)
+        log.info(
+            "Combo shadowed: Kalshi odds disagree with direction or are below %.0f%% "
+            "(BTC=%.1f%%, ETH=%.1f%%)",
+            float(COMBO_MIN_MARKET_PROBABILITY*100),
+            float(btc_market_probability*100), float(eth_market_probability*100))
+        return
+    # Calibrate only against candidates from this exact combo algorithm version.
     probability_stats, pair_hits, pair_n = combo_history_summary(
         db, now, btc_leg["direction"], eth_leg["direction"])
     pair_accuracy = pair_hits / pair_n if pair_n else 0.0
     log.info("Internal combo calibration: %s", probability_stats.replace("\n", " | "))
     if pair_n < COMBO_MIN_SETTLED or pair_accuracy < COMBO_MIN_JOINT_ACCURACY:
-        db.execute("""INSERT OR IGNORE INTO kalshi_combo_forecasts
-            (combo_key,btc_ticker,eth_ticker,issued_at,close_at,
-             btc_direction,eth_direction,alert_sent)
-            VALUES (?,?,?,?,?,?,?,0)""",
-            (combo_key, btc_leg["ticker"], eth_leg["ticker"], now, btc_close,
-             btc_leg["direction"], eth_leg["direction"]))
+        record_combo_candidate(db, combo_key, btc_leg, eth_leg, now, btc_close, False)
         log.info(
             "Combo alert suppressed; shadow candidate retained: %s joint=%d/%d "
             "(%.1f%%), minimum=%d outcomes and %.1f%% accuracy",
@@ -2118,33 +2164,32 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
     eth_eta = max(0, int(eth_leg["eta_seconds"]))
     btc_eta_label = f"{btc_eta//60:02d}:{btc_eta%60:02d}"
     eth_eta_label = f"{eth_eta//60:02d}:{eth_eta%60:02d}"
+    projection_horizon = min(max(0, int(remaining)), 300)
+    projection_horizon_label = f"{projection_horizon//60:02d}:{projection_horizon%60:02d}"
     btc_sign = "+" if btc_leg["direction"] == "UP" else "-"
     eth_sign = "+" if eth_leg["direction"] == "UP" else "-"
     message = (
-        "🧩 COMBO BTC + ETH\n\n"
+        "🧩 COMBO BTC + ETH\n"
+        f"⏳ Horizonte común de proyección: {projection_horizon_label}\n\n"
         "₿ BTC — PRECIO DE REFERENCIA KRAKEN\n"
         f"Dirección prevista: {direction_label(btc_leg['direction'])}\n"
         f"Precio BTC de referencia: USD {btc_leg['start']:,.2f}\n"
-        f"Movimiento estimado: {btc_sign}USD {btc_leg['move_amount']:,.2f}\n"
-        f"Precio BTC proyectado: USD {btc_leg['projected']:,.2f}\n"
-        f"Tiempo estimado del movimiento: {btc_eta_label}\n\n"
+        f"Movimiento estimado hasta el primer objetivo: {btc_sign}USD {btc_leg['move_amount']:,.2f}\n"
+        f"Primer objetivo BTC: USD {btc_leg['target']:,.2f}\n"
+        f"Precio BTC proyectado al horizonte: USD {btc_leg['projected']:,.2f}\n"
+        f"Tiempo estimado hasta el primer objetivo: {btc_eta_label}\n\n"
         "◆ ETH — CONTRATO KALSHI YES\n"
         f"Dirección prevista: {direction_label(eth_leg['direction'])}\n"
         f"Cotización YES actual: USD {eth_leg['start']:.3f} por contrato\n"
         f"Variación estimada: {eth_sign}USD {eth_leg['move_amount']:.3f} por contrato\n"
-        f"Cotización YES proyectada: USD {eth_leg['projected']:.3f} por contrato\n"
-        f"Tiempo estimado del movimiento: {eth_eta_label}\n\n"
+        f"Cotización YES proyectada al horizonte: USD {eth_leg['projected']:.3f} por contrato\n"
+        f"Tiempo estimado hasta el objetivo: {eth_eta_label}\n\n"
         "🏁 La liquidación oficial de BTC y ETH se informa por separado "
         "cuando Kalshi publique ambos resultados."
     )
     if not notify(message, db=db, broadcast=True):
         return
-    db.execute("""INSERT OR IGNORE INTO kalshi_combo_forecasts
-        (combo_key,btc_ticker,eth_ticker,issued_at,close_at,
-         btc_direction,eth_direction,alert_sent)
-        VALUES (?,?,?,?,?,?,?,1)""",
-        (combo_key, btc_leg["ticker"], eth_leg["ticker"], now, btc_close,
-         btc_leg["direction"], eth_leg["direction"]))
+    record_combo_candidate(db, combo_key, btc_leg, eth_leg, now, btc_close, True)
     for leg in (btc_leg, eth_leg):
         db.execute("""INSERT OR IGNORE INTO kalshi_only_alerts
             (ticker,phase,sent_at,direction,bot_version,rules_snapshot)
