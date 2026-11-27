@@ -19,8 +19,9 @@ DB_PATH = os.getenv("DB_PATH", "/var/data/kalshi_bot.sqlite3")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
-COMBO_WINDOW_SECONDS = max(60, int(os.getenv("COMBO_WINDOW_SECONDS", "360")))
-COMBO_RULE_VERSION = "combo-strict90-v1"
+COMBO_WINDOW_SECONDS = max(60, int(os.getenv("COMBO_WINDOW_SECONDS", "300")))
+COMBO_RULE_VERSION = "combo-window-300-filters-paused-v1"
+COMBO_QUALITY_FILTERS_ENABLED = False
 COMBO_MIN_SETTLED = 30
 COMBO_MIN_JOINT_ACCURACY = 0.90
 COMBO_MIN_MARKET_PROBABILITY = Decimal("0.90")
@@ -31,11 +32,12 @@ PANEL_SECRET = os.getenv("RAFA_PANEL_SECRET", "")
 PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
 RULES_SNAPSHOT = json.dumps({
     "series": SERIES, "eth_series": ETH_SERIES,
-    "scan_seconds": SCAN_SECONDS, "combo_window_seconds": min(COMBO_WINDOW_SECONDS, 360),
+    "scan_seconds": SCAN_SECONDS, "combo_window_seconds": min(COMBO_WINDOW_SECONDS, 300),
     "signal_rule": "Opening and final-five-minute direction from Kalshi official close cycles plus live Kalshi YES movement; Kraken is used only as BTC/USD price reference",
     "combo_rule_version": COMBO_RULE_VERSION,
+    "combo_quality_filters_enabled": COMBO_QUALITY_FILTERS_ENABLED,
     "combo_rule": "Sample aligned BTC and ETH Kalshi 15-minute markets; Kraken supplies BTC/USD price only; BTC and ETH YES quotes drive direction and ETH price",
-    "combo_quality_gate": "Send only when each leg's Kalshi YES/NO midpoint supports the predicted direction at >=90% and this same rule version has >=30 resolved exact-pair candidates with >=90% joint accuracy; otherwise retain shadow candidates",
+    "combo_quality_gate": "Paused; preserve confidence and settlement data for evaluation without suppressing combo alerts",
     "learning": "Score new BTC and combo legs against Kalshi official settlement and retain feedback history",
     "automatic_orders": False,
 }, separators=(",", ":"), sort_keys=True)
@@ -1145,7 +1147,7 @@ def maybe_train_adaptive_model(db, now):
 
 def adaptive_direction_gate(db, phase, direction, asset="BTC"):
     """Measure recent accuracy for learning, but never pause an alert automatically."""
-    if phase == "COMBO_6M":
+    if phase in ("COMBO_5M", "COMBO_6M"):
         table = db.execute("""SELECT 1 FROM sqlite_master
             WHERE type='table' AND name='kalshi_combo_forecasts'""").fetchone()
         if not table:
@@ -1784,7 +1786,7 @@ def check_results(db, now):
         predictions = db.execute("""SELECT phase, direction FROM kalshi_only_alerts
             WHERE ticker=?""", (ticker,)).fetchall()
         for phase, direction in predictions:
-            if phase == "COMBO_6M":
+            if phase in ("COMBO_5M", "COMBO_6M"):
                 continue
             if phase in ("DAY1", "LEARNED"):
                 actual_direction = "UP" if result == "yes" else "DOWN"
@@ -2121,7 +2123,7 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
     if btc_close is None or eth_close is None or abs(btc_close-eth_close) > 2:
         return
     remaining = btc_close-now
-    if not (0 < remaining <= min(COMBO_WINDOW_SECONDS, 360)):
+    if not (0 < remaining <= min(COMBO_WINDOW_SECONDS, 300)):
         return
     btc_leg = combo_leg(db, btc_market, now, "BTC")
     eth_leg = combo_leg(db, eth_market, now, "ETH")
@@ -2136,8 +2138,9 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
                               else Decimal("1")-btc_leg["yes_mid"])
     eth_market_probability = (eth_leg["yes_mid"] if eth_leg["direction"] == "UP"
                               else Decimal("1")-eth_leg["yes_mid"])
-    if (btc_market_probability < COMBO_MIN_MARKET_PROBABILITY
-            or eth_market_probability < COMBO_MIN_MARKET_PROBABILITY):
+    if (COMBO_QUALITY_FILTERS_ENABLED and
+            (btc_market_probability < COMBO_MIN_MARKET_PROBABILITY
+             or eth_market_probability < COMBO_MIN_MARKET_PROBABILITY)):
         record_combo_candidate(db, combo_key, btc_leg, eth_leg, now, btc_close, False)
         log.info(
             "Combo shadowed: Kalshi odds disagree with direction or are below %.0f%% "
@@ -2150,7 +2153,8 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
         db, now, btc_leg["direction"], eth_leg["direction"])
     pair_accuracy = pair_hits / pair_n if pair_n else 0.0
     log.info("Internal combo calibration: %s", probability_stats.replace("\n", " | "))
-    if pair_n < COMBO_MIN_SETTLED or pair_accuracy < COMBO_MIN_JOINT_ACCURACY:
+    if (COMBO_QUALITY_FILTERS_ENABLED and
+            (pair_n < COMBO_MIN_SETTLED or pair_accuracy < COMBO_MIN_JOINT_ACCURACY)):
         record_combo_candidate(db, combo_key, btc_leg, eth_leg, now, btc_close, False)
         log.info(
             "Combo alert suppressed; shadow candidate retained: %s joint=%d/%d "
@@ -2194,14 +2198,14 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
         db.execute("""INSERT OR IGNORE INTO kalshi_only_alerts
             (ticker,phase,sent_at,direction,bot_version,rules_snapshot)
             VALUES (?,?,?,?,?,?)""",
-            (leg["ticker"], "COMBO_6M", now, leg["direction"], BOT_VERSION, RULES_SNAPSHOT))
+            (leg["ticker"], "COMBO_5M", now, leg["direction"], BOT_VERSION, RULES_SNAPSHOT))
     btc_features = btc_leg.get("model_features")
     if btc_features is not None:
         db.execute("""INSERT OR IGNORE INTO kalshi_prediction_feedback
             (id,ticker,phase,predicted_direction,issued_at,close_at,status,source,
              bot_version,rules_snapshot,model_features)
             VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (f"kalshi-combo-btc:{combo_key}", btc_leg["ticker"], "COMBO_6M",
+            (f"kalshi-combo-btc:{combo_key}", btc_leg["ticker"], "COMBO_5M",
              btc_leg["direction"], now, btc_close, "pending", "bot_forecast",
              BOT_VERSION, RULES_SNAPSHOT,
              json.dumps(btc_features, separators=(",", ":"))))
