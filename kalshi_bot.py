@@ -20,6 +20,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
 COMBO_WINDOW_SECONDS = max(60, int(os.getenv("COMBO_WINDOW_SECONDS", "300")))
+OPENING_REVIEW_SECONDS = 30
 COMBO_RULE_VERSION = "combo-window-300-filters-paused-v1"
 COMBO_QUALITY_FILTERS_ENABLED = False
 COMBO_MIN_SETTLED = 30
@@ -32,7 +33,8 @@ PANEL_SECRET = os.getenv("RAFA_PANEL_SECRET", "")
 PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
 RULES_SNAPSHOT = json.dumps({
     "series": SERIES, "eth_series": ETH_SERIES,
-    "scan_seconds": SCAN_SECONDS, "combo_window_seconds": min(COMBO_WINDOW_SECONDS, 300),
+    "scan_seconds": SCAN_SECONDS, "opening_review_seconds": OPENING_REVIEW_SECONDS,
+    "combo_window_seconds": min(COMBO_WINDOW_SECONDS, 300),
     "signal_rule": "Opening and final-five-minute direction from Kalshi official close cycles plus live Kalshi YES movement; Kraken is used only as BTC/USD price reference",
     "combo_rule_version": COMBO_RULE_VERSION,
     "combo_quality_filters_enabled": COMBO_QUALITY_FILTERS_ENABLED,
@@ -265,7 +267,7 @@ def kraken_trend_5m(now):
         kraken_5m_snapshot = (now, prior_price, current)
         return "UP" if current > prior_price else "DOWN"
 
-def kraken_first_minute_projection(now, remaining, opened_at=None):
+def kraken_opening_projection(now, remaining, opened_at=None):
     """Project only from BTC samples recorded after this contract opened."""
     if kraken_last_quote is None or remaining < 0:
         return None
@@ -274,16 +276,16 @@ def kraken_first_minute_projection(now, remaining, opened_at=None):
         return None
     candidates = [
         (t, price) for t, price in kraken_samples
-        if t <= now - 60 and (opened_at is None or t >= opened_at)
+        if t <= now - OPENING_REVIEW_SECONDS and (opened_at is None or t >= opened_at)
     ]
     if not candidates:
         return None
     prior_time, prior = max(candidates, key=lambda sample: sample[0])
-    if now - prior_time > 90 or current == prior:
+    if now - prior_time > 45 or current == prior:
         return None
-    change_60s = current - prior
+    change_30s = current - prior
     horizon = min(max(Decimal("0"), Decimal(str(remaining))), Decimal("300"))
-    projected_move = change_60s * horizon / Decimal("60")
+    projected_move = change_30s * horizon / Decimal(str(OPENING_REVIEW_SECONDS))
     cap = current * Decimal("0.0025")
     projected_move = max(-cap, min(cap, projected_move))
     projected = current + projected_move
@@ -785,7 +787,7 @@ def record_settled_eth_results(db, now):
 def journal_opening_quote(db, market, now, open_at, close_at):
     """Record an opening-minute quote for later out-of-sample evaluation."""
     elapsed = now - open_at
-    if elapsed < 0 or elapsed > 60:
+    if elapsed < 0 or elapsed > OPENING_REVIEW_SECONDS:
         return
     q = quote(market)
     if q is None:
@@ -1406,10 +1408,10 @@ def forecast_display(ticker, phase_label, direction, confidence, start, target, 
     return message, None
 
 def send_early_wait_notice(db, m, now):
-    """Tell subscribers after the first 60 seconds if opening/close context has not confirmed a direction."""
+    """Tell subscribers after the opening review window if direction is not confirmed."""
     ticker = m.get("ticker", "")
     opened = ts(m.get("open_time"))
-    if not ticker or opened is None or not (60 <= now-opened <= 300):
+    if not ticker or opened is None or not (OPENING_REVIEW_SECONDS <= now-opened <= 300):
         return
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_wait_notices
         (ticker TEXT, phase TEXT, sent_at REAL, PRIMARY KEY(ticker,phase))""")
@@ -1425,7 +1427,7 @@ def send_early_wait_notice(db, m, now):
         "🟡 BTC · PRIMEROS 5 MIN\n"
         f"🧾 {ticker}\n"
         "⏳ Sin confirmación todavía.\n"
-        "Ya revisé los primeros 60 segundos junto con los cierres oficiales anteriores. "
+        f"Ya revisé los primeros {OPENING_REVIEW_SECONDS} segundos junto con los cierres oficiales anteriores. "
         "Aún no hay confirmación suficiente de UP o DOWN; sigo evaluando y enviaré la señal si coincide la evidencia dentro de esta ventana."
     )
     if notify(message, db=db, broadcast=True):
@@ -1513,7 +1515,7 @@ def signal(db, m, now, phase, kraken_direction=None):
     remaining = close_at-now
     elapsed = now-opened_at
     if phase == "EARLY_5M":
-        if not (60 <= elapsed <= 300):
+        if not (OPENING_REVIEW_SECONDS <= elapsed <= 300):
             return
     elif phase == "LAST_5M":
         if not (0 < remaining <= 300):
@@ -1525,7 +1527,7 @@ def signal(db, m, now, phase, kraken_direction=None):
         return
     direction, _, history_basis, quote_change, cycle_summary = forecast
     if phase == "EARLY_5M":
-        projection = kraken_first_minute_projection(now, remaining, opened_at)
+        projection = kraken_opening_projection(now, remaining, opened_at)
         if projection is None:
             log.info("Skipping %s opening forecast: BTC price reference unavailable",
                      ticker)
