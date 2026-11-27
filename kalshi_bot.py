@@ -1552,10 +1552,11 @@ def send_reversal_event(db, ticker, phase, base_direction, reversal_direction,
         (ticker, event, reversal_direction)).fetchone():
         return
     label = direction_label(reversal_direction)
-    headline = ("⚠️ BTC — POSIBLE GIRO" if event == "possible"
+    headline = ("🔮 BTC — POSIBLE GIRO ANTICIPADO"
+                if event in ("possible", "predictive")
                 else "🔄 BTC — GIRO CONFIRMADO")
     state = ("Pendiente de confirmación en cotizaciones en vivo."
-             if event == "possible"
+             if event in ("possible", "predictive")
              else "Confirmado por movimiento consecutivo de cotizaciones YES.")
     message = (
         f"{headline} · AVISO SEPARADO\n"
@@ -1575,14 +1576,14 @@ def send_reversal_event(db, ticker, phase, base_direction, reversal_direction,
 
 
 def kalshi_probability_reversal(db, ticker, opened_at, now):
-    """Detect a 70% Kalshi YES probability flip over roughly 30 seconds."""
+    """Predict a 70% opposite-side move up to 30 seconds before it may happen."""
     rows = db.execute("""SELECT observed_at,yes_mid FROM kalshi_only_samples
         WHERE ticker=? AND observed_at>=? AND observed_at<=?
         ORDER BY observed_at""",
         (ticker, max(opened_at, now-45), now)).fetchall()
     points = [(float(t), dec(mid)) for t, mid in rows]
     points = [(t, mid) for t, mid in points if mid is not None]
-    if len(points) < 2 or now-points[-1][0] > 10:
+    if len(points) < 5 or now-points[-1][0] > 10:
         return None
     current_time, current_mid = points[-1]
     prior_candidates = [(t, mid) for t, mid in points
@@ -1591,39 +1592,105 @@ def kalshi_probability_reversal(db, ticker, opened_at, now):
         return None
     prior_time, prior_mid = min(prior_candidates, key=lambda p: abs((now-p[0])-30))
     prior_direction = "UP" if prior_mid >= Decimal("0.50") else "DOWN"
-    current_direction = "UP" if current_mid >= Decimal("0.50") else "DOWN"
     prior_probability = (prior_mid if prior_direction == "UP"
                          else Decimal("1")-prior_mid)
-    current_probability = (current_mid if current_direction == "UP"
-                           else Decimal("1")-current_mid)
-    if (prior_direction == current_direction
-            or prior_probability < Decimal("0.70")
-            or current_probability < Decimal("0.70")):
+    if prior_probability < Decimal("0.70"):
+        return None
+    reversal = "DOWN" if prior_direction == "UP" else "UP"
+    target_mid = Decimal("0.30") if reversal == "DOWN" else Decimal("0.70")
+    if (reversal == "UP" and current_mid >= Decimal("0.70")) or (
+            reversal == "DOWN" and current_mid <= Decimal("0.30")):
+        return None  # The threshold was already reached; this is no longer an early prediction.
+    recent = [(t, mid) for t, mid in points if t >= now-30]
+    if len(recent) < 4 or recent[-1][0]-recent[0][0] < 15:
+        return None
+    changes = [b[1]-a[1] for a, b in zip(recent[-4:], recent[-3:])]
+    rising = reversal == "UP"
+    if not all(change > 0 if rising else change < 0 for change in changes):
+        return None
+    rate_per_second = (current_mid-prior_mid)/Decimal(str(current_time-prior_time))
+    if (rising and rate_per_second <= 0) or (not rising and rate_per_second >= 0):
+        return None
+    seconds_to_threshold = (target_mid-current_mid)/rate_per_second
+    if seconds_to_threshold <= 0 or seconds_to_threshold > 30:
+        return None
+    projected_mid = current_mid + rate_per_second*Decimal("30")
+    projected_probability = (projected_mid if reversal == "UP"
+                             else Decimal("1")-projected_mid)
+    if projected_probability < Decimal("0.70"):
         return None
     elapsed = max(0, int(current_time-opened_at))
     moment = f"{elapsed//60:02d}:{elapsed%60:02d}"
-    movement = (
-        f"Kalshi pasó de {prior_direction} {prior_probability:.0%} "
-        f"hace {now-prior_time:.0f}s a {current_direction} "
-        f"{current_probability:.0%}; momento del contrato {moment}."
-    )
-    latest = [(t, mid) for t, mid in points if t >= now-15]
-    confirmed = len(latest) >= 3 and all(
-        (mid if current_direction == "UP" else Decimal("1")-mid)
-        >= Decimal("0.70") for _, mid in latest[-3:])
-    if confirmed:
-        return {
-            "event": "confirmed", "base": prior_direction,
-            "direction": current_direction, "possible_evidence": movement,
-            "evidence": (
-                movement + " El nuevo lado se mantuvo ≥70% en "
-                "3 cotizaciones consecutivas."),
-        }
+    eta = max(1, int(seconds_to_threshold))
+    label = direction_label(reversal)
     return {
-        "event": "possible", "base": prior_direction,
-        "direction": current_direction, "possible_evidence": movement,
-        "evidence": movement + " Pendiente de confirmación en las próximas cotizaciones.",
+        "base": prior_direction, "direction": reversal,
+        "evidence": (
+            f"Predicción anticipada: Kalshi estaba {prior_direction} "
+            f"{prior_probability:.0%} hace {now-prior_time:.0f}s; la tendencia YES "
+            f"proyecta {label} ≥70% en unos {eta}s "
+            f"(proyección lineal a 30s: {projected_probability:.0%}; "
+            f"ahora {reversal} "
+            f"{(current_mid if rising else Decimal('1')-current_mid):.0%}; "
+            f"minuto del contrato {moment})."
+        ),
     }
+
+
+def reversal_threshold_confirmed(db, ticker, direction, now):
+    """Confirm a predicted reversal after three recent quotes sustain 70% odds."""
+    rows = db.execute("""SELECT observed_at,yes_mid FROM kalshi_only_samples
+        WHERE ticker=? AND observed_at>=? AND observed_at<=?
+        ORDER BY observed_at DESC LIMIT 3""",
+        (ticker, now-15, now)).fetchall()
+    if len(rows) < 3 or now-float(rows[0][0]) > 10:
+        return False, "Aún no hay tres cotizaciones recientes para confirmar."
+    target = Decimal("0.70")
+    for _, raw_mid in rows:
+        mid = dec(raw_mid)
+        if mid is None:
+            return False, "Cotización Kalshi inválida."
+        probability = mid if direction == "UP" else Decimal("1")-mid
+        if probability < target:
+            return False, "La probabilidad todavía no se mantiene en 70%."
+    return True, (
+        f"Kalshi sostuvo {direction} ≥70% en tres cotizaciones recientes; "
+        "giro confirmado después del aviso anticipado.")
+
+
+def monitor_kalshi_reversal(db, market, now, opened_at):
+    """Use the previous full contract and predict an active-contract reversal early."""
+    ticker = market.get("ticker", "")
+    if not ticker or opened_at is None:
+        return
+    previous_context = previous_contract_path_context(db, opened_at)
+    if not previous_context:
+        previous_context = (
+            "Contexto previo incompleto: el aviso usa la tendencia en vivo de Kalshi."
+        )
+    predicted = kalshi_probability_reversal(db, ticker, opened_at, now)
+    if predicted:
+        send_reversal_event(
+            db, ticker, "LIVE_15M", predicted["base"], predicted["direction"],
+            "predictive", predicted["evidence"], previous_context, now)
+    db.execute("""CREATE TABLE IF NOT EXISTS kalshi_reversal_alert_events
+        (ticker TEXT NOT NULL, event TEXT NOT NULL, direction TEXT NOT NULL,
+         phase TEXT NOT NULL, sent_at REAL NOT NULL,
+         PRIMARY KEY(ticker,event,direction))""")
+    pending = db.execute("""SELECT direction,phase,sent_at
+        FROM kalshi_reversal_alert_events
+        WHERE ticker=? AND event='predictive' AND sent_at>=?
+        ORDER BY sent_at DESC""", (ticker, now-120)).fetchall()
+    for direction, phase, sent_at in pending:
+        confirmed, evidence = reversal_threshold_confirmed(
+            db, ticker, direction, now)
+        if not confirmed:
+            continue
+        base = "DOWN" if direction == "UP" else "UP"
+        send_reversal_event(
+            db, ticker, phase, base, direction, "confirmed",
+            evidence + f" Aviso anticipado enviado {now-sent_at:.0f}s antes.",
+            previous_context, now)
 
 
 def monitor_kalshi_reversal(db, market, now, opened_at):
