@@ -19,9 +19,9 @@ DB_PATH = os.getenv("DB_PATH", "/var/data/kalshi_bot.sqlite3")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = min(5, max(1, int(os.getenv("SCAN_SECONDS", "5"))))
-COMBO_WINDOW_SECONDS = max(60, int(os.getenv("COMBO_WINDOW_SECONDS", "300")))
+COMBO_WINDOW_SECONDS = 250
 OPENING_REVIEW_SECONDS = 0
-COMBO_RULE_VERSION = "combo-window-300-kalshi-only-kraken-price-paused-next-contract-v2"
+COMBO_RULE_VERSION = "combo-window-250-kalshi-only-kraken-price-paused-next-contract-v3"
 COMBO_QUALITY_FILTERS_ENABLED = False
 COMBO_MIN_SETTLED = 30
 COMBO_MIN_JOINT_ACCURACY = 0.90
@@ -34,7 +34,7 @@ PANEL_SITES_AUTH = os.getenv("RAFA_PANEL_SITES_AUTH", "")
 RULES_SNAPSHOT = json.dumps({
     "series": SERIES, "eth_series": ETH_SERIES,
     "scan_seconds": SCAN_SECONDS, "opening_prediction_delay_seconds": OPENING_REVIEW_SECONDS,
-    "combo_window_seconds": min(COMBO_WINDOW_SECONDS, 300),
+    "combo_window_seconds": COMBO_WINDOW_SECONDS,
     "signal_rule": "At each BTC 15-minute opening, use the immediately previous official Kalshi result plus its complete YES quote path and historical cycles; Kraken supplies numeric BTC/USD values only",
     "opening_prediction_rule": "Send at the first active scan after Kalshi confirms the previous official result and publishes the new open contract; no 30-second wait",
     "combo_rule_version": COMBO_RULE_VERSION,
