@@ -1403,10 +1403,76 @@ def closing_confidence(db, ticker, phase, direction, now, remaining, start, proj
         return None
 
 
-def kalshi_reversal_status(db, ticker, direction, now, opened_at):
-    """Detect a live Kalshi YES reversal and report its contract minute."""
+def historical_reversal_forecast(db, direction, now):
+    """Estimate likely reversal minute from complete, recently settled Kalshi paths."""
+    rows = db.execute("""SELECT ticker,close_time FROM kalshi_15m_outcomes
+        WHERE close_time>=? AND close_time<=? AND direction IN ('UP','DOWN')
+        ORDER BY close_time DESC LIMIT 80""",
+        (int(now-48*3600), int(now))).fetchall()
+    matched = reversals = 0
+    reversal_minutes = []
+    for ticker, raw_close in rows:
+        close_at = float(raw_close)
+        opened_at = close_at-900
+        samples = db.execute("""SELECT observed_at,yes_mid FROM kalshi_only_samples
+            WHERE ticker=? AND observed_at>=? AND observed_at<=?
+            ORDER BY observed_at""",
+            (ticker, opened_at, close_at)).fetchall()
+        points = [(float(t), dec(value)) for t, value in samples]
+        points = [(t, value) for t, value in points if value is not None]
+        if (len(points) < 8 or points[0][0] > opened_at+20
+                or points[-1][0] < close_at-30):
+            continue
+        opening = [(i, t, value) for i, (t, value) in enumerate(points)
+                   if t <= opened_at+90]
+        if len(opening) < 4:
+            continue
+        initial_change = opening[-1][2]-opening[0][2]
+        if abs(initial_change) < Decimal("0.010"):
+            continue
+        initial_direction = "UP" if initial_change > 0 else "DOWN"
+        if initial_direction != direction:
+            continue
+        matched += 1
+        first_after_opening = opening[-1][0]+1
+        for index in range(first_after_opening, len(points)-3):
+            segment = points[index:index+4]
+            changes = [b[1]-a[1] for a, b in zip(segment, segment[1:])]
+            net = segment[-1][1]-segment[0][1]
+            against = (all(change < 0 for change in changes) if direction == "UP"
+                       else all(change > 0 for change in changes))
+            if against and abs(net) >= Decimal("0.020"):
+                reversals += 1
+                reversal_minutes.append(max(
+                    1, int((segment[0][0]-opened_at)//60)+1))
+                break
+    if matched < 10:
+        return None, (
+            f"Historial de apertura insuficiente para estimar el giro "
+            f"(n={matched}; se requieren 10 recorridos comparables).")
+    rate = reversals/matched
+    if rate < 0.60 or not reversal_minutes:
+        return None, (
+            f"El historial no muestra un giro consistente en esta dirección "
+            f"({reversals}/{matched} contratos comparables).")
+    reversal_direction = "DOWN" if direction == "UP" else "UP"
+    median_minute = sorted(reversal_minutes)[len(reversal_minutes)//2]
+    return "PENDING_"+reversal_direction, (
+        f"El patrón histórico estima un posible giro hacia {reversal_direction} "
+        f"cerca del minuto {median_minute} "
+        f"({rate:.0%}, {reversals}/{matched} recorridos comparables); "
+        "es una estimación de apertura, todavía sin confirmación en vivo.")
+
+
+def kalshi_reversal_status(db, ticker, direction, now, opened_at,
+                           predict_opening=False):
+    """Detect a live Kalshi reversal or forecast its likely timing at opening."""
     if direction not in ("UP", "DOWN") or opened_at is None:
         return None, "Todavía no hay muestras suficientes para validar un giro."
+    if predict_opening:
+        forecast, evidence = historical_reversal_forecast(db, direction, now)
+        if forecast:
+            return forecast, evidence
     rows = db.execute("""SELECT observed_at,yes_mid FROM kalshi_only_samples
         WHERE ticker=? AND observed_at>=? AND observed_at<=?
         ORDER BY observed_at DESC LIMIT 4""",
@@ -1447,7 +1513,8 @@ def monitor_kalshi_reversal(db, market, now, opened_at):
     if not ticker or not forecast or forecast[1] not in ("UP", "DOWN"):
         return
     phase, predicted = forecast
-    status, evidence = kalshi_reversal_status(db, ticker, predicted, now, opened_at)
+    status, evidence = kalshi_reversal_status(
+        db, ticker, predicted, now, opened_at, predict_opening=False)
     if status not in ("UP", "DOWN"):
         return
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_reversal_alerts
@@ -1681,7 +1748,8 @@ def signal(db, m, now, phase, kraken_direction=None):
     cycle_text = f"{streak_text}\n{cycle_summary}\nBase: {history_basis}"
     # Reversals are detected only from fresh Kalshi YES samples, never from Kraken.
     bias, bias_evidence = kalshi_reversal_status(
-        db, ticker, direction, now, opened_at)
+        db, ticker, direction, now, opened_at,
+        predict_opening=(phase == "EARLY_5M"))
     db.execute("""CREATE TABLE IF NOT EXISTS rafa_close_estimates
         (id TEXT PRIMARY KEY, estimated TEXT, absolute_error TEXT)""")
     confidence = (closing_confidence(
