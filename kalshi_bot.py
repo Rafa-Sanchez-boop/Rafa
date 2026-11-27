@@ -521,19 +521,8 @@ def get_json(path, params=None):
     return None
 
 def alerts_paused(now=None):
-    """Return whether broadcast notifications are paused until the configured local time."""
-    raw = os.getenv("ALERTS_PAUSED_UNTIL", "").strip()
-    if not raw:
-        return False
-    try:
-        release_at = datetime.fromisoformat(raw)
-        if release_at.tzinfo is None:
-            release_at = release_at.replace(tzinfo=ZoneInfo("America/New_York"))
-        instant = time.time() if now is None else now
-        return instant < release_at.timestamp()
-    except ValueError:
-        log.error("Invalid ALERTS_PAUSED_UNTIL value; broadcast notifications are enabled")
-        return False
+    """Scheduled notification pauses are disabled by user request."""
+    return False
 
 
 def notify(msg, db=None, broadcast=False, photo=None):
@@ -2216,15 +2205,9 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
 
 
 def daily_bot_schedule(now=None):
-    """Pause 03:00–06:00 and collect data without forecasts until 09:00 New York time."""
+    """Keep alerts active continuously; keep collecting and learning every scan."""
     instant = time.time() if now is None else now
     local_now = datetime.fromtimestamp(instant, ZoneInfo("America/New_York"))
-    if alerts_paused(instant):
-        return "analysis", local_now
-    if 3 <= local_now.hour < 6:
-        return "paused", local_now
-    if 6 <= local_now.hour < 9:
-        return "analysis", local_now
     return "active", local_now
 
 
