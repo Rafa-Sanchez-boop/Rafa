@@ -268,24 +268,25 @@ def kraken_trend_5m(now):
         return "UP" if current > prior_price else "DOWN"
 
 def kraken_opening_projection(now, remaining, opened_at=None):
-    """Project only from BTC samples recorded after this contract opened."""
+    """Project from the earliest fresh BTC reference captured after this contract opened."""
     if kraken_last_quote is None or remaining < 0:
         return None
     quote_time, current = kraken_last_quote
     if now - quote_time > 30:
         return None
-    candidates = [
+    samples = [
         (t, price) for t, price in kraken_samples
-        if t <= now - OPENING_REVIEW_SECONDS and (opened_at is None or t >= opened_at)
+        if t <= now and (opened_at is None or t >= opened_at)
     ]
-    if not candidates:
+    if not samples:
         return None
-    prior_time, prior = max(candidates, key=lambda sample: sample[0])
-    if now - prior_time > 45 or current == prior:
+    prior_time, prior = min(samples, key=lambda sample: sample[0])
+    measured_seconds = Decimal(str(now - prior_time))
+    if measured_seconds < Decimal("10") or measured_seconds > Decimal("90") or current == prior:
         return None
-    change_30s = current - prior
+    change_since_open = current - prior
     horizon = min(max(Decimal("0"), Decimal(str(remaining))), Decimal("300"))
-    projected_move = change_30s * horizon / Decimal(str(OPENING_REVIEW_SECONDS))
+    projected_move = change_since_open * horizon / measured_seconds
     cap = current * Decimal("0.0025")
     projected_move = max(-cap, min(cap, projected_move))
     projected = current + projected_move
