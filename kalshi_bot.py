@@ -32,7 +32,7 @@ RULES_SNAPSHOT = json.dumps({
     "scan_seconds": SCAN_SECONDS, "combo_window_seconds": min(COMBO_WINDOW_SECONDS, 360),
     "signal_rule": "Opening and final-five-minute direction from Kalshi official close cycles plus live Kalshi YES movement; Kraken is used only as BTC/USD price reference",
     "combo_rule": "Sample BTC and ETH Kalshi markets from open; send a combo during the final five minutes using settled cycles and live Kalshi YES movement; Kraken supplies BTC/USD price only",
-    "combo_quality_gate": "Send only when exact-pair settled history has at least 10 outcomes and at least 60% joint accuracy; otherwise retain a silent shadow candidate for official-outcome learning",
+    "combo_quality_gate": "Send only when at least 10 previously sent exact-pair combos have official settlements and at least 60% joint accuracy; never include silent shadow candidates in calibration",
     "learning": "Score new BTC and combo legs against Kalshi official settlement and retain feedback history",
     "automatic_orders": False,
 }, separators=(",", ":"), sort_keys=True)
@@ -1037,7 +1037,7 @@ def combo_directional_bias(db, asset, now):
             CASE WHEN r.result='yes' THEN 'UP' ELSE 'DOWN' END
         FROM kalshi_combo_forecasts c
         JOIN kalshi_only_results r ON r.ticker=c.{ticker_column}
-        WHERE r.result IN ('yes','no') AND c.issued_at>=? AND c.issued_at<=?
+        WHERE r.result IN ('yes','no') AND c.alert_sent=1 AND c.issued_at>=? AND c.issued_at<=?
         ORDER BY c.issued_at DESC LIMIT 100""",
         (session_start, now)).fetchall()
     rates = {}
@@ -1154,7 +1154,7 @@ def adaptive_direction_gate(db, phase, direction, asset="BTC"):
                 CASE WHEN r.result='yes' THEN 'UP' ELSE 'DOWN' END
             FROM kalshi_combo_forecasts c
             JOIN kalshi_only_results r ON r.ticker=c.{ticker_column}
-            WHERE r.result IN ('yes','no')
+            WHERE r.result IN ('yes','no') AND c.alert_sent=1
             ORDER BY r.observed_at DESC LIMIT 12""").fetchall()
     else:
         rows = db.execute("""SELECT predicted_direction, actual_direction
@@ -1957,7 +1957,7 @@ def combo_history_summary(db, now, btc_direction, eth_direction):
         FROM kalshi_combo_forecasts c
         JOIN kalshi_only_results b ON b.ticker=c.btc_ticker
         JOIN kalshi_only_results e ON e.ticker=c.eth_ticker
-        WHERE c.issued_at<? AND b.result IN ('yes','no') AND e.result IN ('yes','no')
+        WHERE c.issued_at<? AND c.alert_sent=1 AND b.result IN ('yes','no') AND e.result IN ('yes','no')
         ORDER BY c.issued_at DESC LIMIT 100""", (now,)).fetchall()
     evaluated = []
     for btc_pred, eth_pred, btc_result, eth_result in rows:
