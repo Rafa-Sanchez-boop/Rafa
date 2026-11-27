@@ -1504,39 +1504,149 @@ def kalshi_reversal_status(db, ticker, direction, now, opened_at,
     return None, "No hay un movimiento contrario confirmado en las cotizaciones Kalshi."
 
 
-def monitor_kalshi_reversal(db, market, now, opened_at):
-    """Send one follow-up Telegram notice when a live BTC reversal is confirmed."""
-    ticker = market.get("ticker", "")
-    forecast = db.execute("""SELECT phase,direction FROM kalshi_only_alerts
-        WHERE ticker=? AND phase IN ('EARLY_5M','LAST_5M')
-        ORDER BY sent_at DESC LIMIT 1""", (ticker,)).fetchone()
-    if not ticker or not forecast or forecast[1] not in ("UP", "DOWN"):
-        return
-    phase, predicted = forecast
-    status, evidence = kalshi_reversal_status(
-        db, ticker, predicted, now, opened_at, predict_opening=False)
-    if status not in ("UP", "DOWN"):
-        return
+def previous_contract_path_context(db, opened_at):
+    """Return the official result and full YES path for the immediately previous BTC contract."""
+    previous = db.execute("""SELECT ticker,direction,close_time FROM kalshi_15m_outcomes
+        WHERE close_time BETWEEN ? AND ? AND direction IN ('UP','DOWN')
+        ORDER BY close_time DESC LIMIT 1""",
+        (int(opened_at)-5, int(opened_at)+5)).fetchone()
+    if not previous:
+        return None
+    ticker, direction, close_at = previous
+    previous_open = float(close_at)-900
+    rows = db.execute("""SELECT observed_at,yes_mid FROM kalshi_only_samples
+        WHERE ticker=? AND observed_at>=? AND observed_at<=?
+        ORDER BY observed_at""", (ticker, previous_open, float(close_at))).fetchall()
+    points = [(float(t), dec(mid)) for t, mid in rows]
+    points = [(t, mid) for t, mid in points if mid is not None]
+    if (len(points) < 8 or points[0][0] > previous_open+20
+            or points[-1][0] < float(close_at)-30):
+        return None
+    crossings = sum((a[1] >= Decimal("0.50")) != (b[1] >= Decimal("0.50"))
+                    for a, b in zip(points, points[1:]))
+    net = points[-1][1]-points[0][1]
+    return (
+        f"Contrato anterior {ticker}: resultado oficial {direction}; "
+        f"recorrido YES {points[0][1]:.3f}→{points[-1][1]:.3f}, "
+        f"{len(points)} muestras y {crossings} cruces de 50¢ (cambio neto {net:+.3f})."
+    )
+
+
+def send_reversal_event(db, ticker, phase, base_direction, reversal_direction,
+                        event, evidence, previous_context, now):
+    """Send and persist a separate possible or confirmed reversal alert."""
+    db.execute("""CREATE TABLE IF NOT EXISTS kalshi_reversal_alert_events
+        (ticker TEXT NOT NULL, event TEXT NOT NULL, direction TEXT NOT NULL,
+         phase TEXT NOT NULL, sent_at REAL NOT NULL,
+         PRIMARY KEY(ticker,event,direction))""")
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_reversal_alerts
         (ticker TEXT PRIMARY KEY, phase TEXT NOT NULL, direction TEXT NOT NULL,
          sent_at REAL NOT NULL)""")
-    if db.execute("SELECT 1 FROM kalshi_reversal_alerts WHERE ticker=?",
-                  (ticker,)).fetchone():
+    # Carry forward any confirmation already recorded by the earlier monitor version.
+    db.execute("""INSERT OR IGNORE INTO kalshi_reversal_alert_events
+        (ticker,event,direction,phase,sent_at)
+        SELECT ticker,'confirmed',direction,phase,sent_at
+        FROM kalshi_reversal_alerts""")
+    if db.execute("""SELECT 1 FROM kalshi_reversal_alert_events
+        WHERE ticker=? AND event=? AND direction=?""",
+        (ticker, event, reversal_direction)).fetchone():
         return
+    label = direction_label(reversal_direction)
+    headline = ("⚠️ BTC — POSIBLE GIRO" if event == "possible"
+                else "🔄 BTC — GIRO CONFIRMADO")
+    state = ("Pendiente de confirmación en cotizaciones en vivo."
+             if event == "possible"
+             else "Confirmado por movimiento consecutivo de cotizaciones YES.")
     message = (
-        "🔄 BTC — GIRO CONFIRMADO DURANTE EL CONTRATO\n"
-        f"🧾 {ticker}\n"
-        f"Señal inicial: {direction_label(predicted)}\n"
-        f"Movimiento contrario observado: {direction_label(status)}\n"
+        f"{headline} · AVISO SEPARADO\n"
+        f"🧾 Contrato actual: {ticker}\n"
+        f"Sesgo de referencia: {direction_label(base_direction)}\n"
+        f"Giro hacia: {label}\n"
         f"{evidence}\n"
-        "Confirmación basada en cotizaciones YES de Kalshi; es un aviso de cambio observado, no una garantía."
+        f"{previous_context}\n"
+        f"{state} Estimación experimental; no garantiza el próximo movimiento."
     )
     if notify(message, db=db, broadcast=True):
-        db.execute("""INSERT OR IGNORE INTO kalshi_reversal_alerts
-            (ticker,phase,direction,sent_at) VALUES (?,?,?,?)""",
-            (ticker, phase, status, now))
-        log.info("Kalshi reversal confirmed and sent: %s %s -> %s",
-                 ticker, predicted, status)
+        db.execute("""INSERT OR IGNORE INTO kalshi_reversal_alert_events
+            (ticker,event,direction,phase,sent_at) VALUES (?,?,?,?,?)""",
+            (ticker, event, reversal_direction, phase, now))
+        log.info("Standalone Kalshi reversal %s sent: %s -> %s at %s",
+                 event, ticker, reversal_direction, evidence)
+
+
+def kalshi_probability_reversal(db, ticker, opened_at, now):
+    """Detect a 70% Kalshi YES probability flip over roughly 30 seconds."""
+    rows = db.execute("""SELECT observed_at,yes_mid FROM kalshi_only_samples
+        WHERE ticker=? AND observed_at>=? AND observed_at<=?
+        ORDER BY observed_at""",
+        (ticker, max(opened_at, now-45), now)).fetchall()
+    points = [(float(t), dec(mid)) for t, mid in rows]
+    points = [(t, mid) for t, mid in points if mid is not None]
+    if len(points) < 2 or now-points[-1][0] > 10:
+        return None
+    current_time, current_mid = points[-1]
+    prior_candidates = [(t, mid) for t, mid in points
+                        if 20 <= now-t <= 40]
+    if not prior_candidates:
+        return None
+    prior_time, prior_mid = min(prior_candidates, key=lambda p: abs((now-p[0])-30))
+    prior_direction = "UP" if prior_mid >= Decimal("0.50") else "DOWN"
+    current_direction = "UP" if current_mid >= Decimal("0.50") else "DOWN"
+    prior_probability = (prior_mid if prior_direction == "UP"
+                         else Decimal("1")-prior_mid)
+    current_probability = (current_mid if current_direction == "UP"
+                           else Decimal("1")-current_mid)
+    if (prior_direction == current_direction
+            or prior_probability < Decimal("0.70")
+            or current_probability < Decimal("0.70")):
+        return None
+    elapsed = max(0, int(current_time-opened_at))
+    moment = f"{elapsed//60:02d}:{elapsed%60:02d}"
+    movement = (
+        f"Kalshi pasó de {prior_direction} {prior_probability:.0%} "
+        f"hace {now-prior_time:.0f}s a {current_direction} "
+        f"{current_probability:.0%}; momento del contrato {moment}."
+    )
+    latest = [(t, mid) for t, mid in points if t >= now-15]
+    confirmed = len(latest) >= 3 and all(
+        (mid if current_direction == "UP" else Decimal("1")-mid)
+        >= Decimal("0.70") for _, mid in latest[-3:])
+    if confirmed:
+        return {
+            "event": "confirmed", "base": prior_direction,
+            "direction": current_direction, "possible_evidence": movement,
+            "evidence": (
+                movement + " El nuevo lado se mantuvo ≥70% en "
+                "3 cotizaciones consecutivas."),
+        }
+    return {
+        "event": "possible", "base": prior_direction,
+        "direction": current_direction, "possible_evidence": movement,
+        "evidence": movement + " Pendiente de confirmación en las próximas cotizaciones.",
+    }
+
+
+def monitor_kalshi_reversal(db, market, now, opened_at):
+    """Compare the previous full contract and live 30-second odds; send separate alerts."""
+    ticker = market.get("ticker", "")
+    if not ticker or opened_at is None:
+        return
+    previous_context = previous_contract_path_context(db, opened_at)
+    if not previous_context:
+        previous_context = (
+            "Contrato anterior: recorrido completo o resultado oficial todavía no disponible."
+        )
+    event = kalshi_probability_reversal(db, ticker, opened_at, now)
+    if event is None:
+        return
+    # If the first scan catches an already-confirmed flip, send the possible notice first.
+    send_reversal_event(
+        db, ticker, "LIVE_15M", event["base"], event["direction"],
+        "possible", event["possible_evidence"], previous_context, now)
+    if event["event"] == "confirmed":
+        send_reversal_event(
+            db, ticker, "LIVE_15M", event["base"], event["direction"],
+            "confirmed", event["evidence"], previous_context, now)
 
 
 def forecast_display(ticker, phase_label, direction, confidence, start, target, projected,
