@@ -21,7 +21,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
 COMBO_WINDOW_SECONDS = max(60, int(os.getenv("COMBO_WINDOW_SECONDS", "300")))
 OPENING_REVIEW_SECONDS = 30
-COMBO_RULE_VERSION = "combo-window-300-filters-paused-v1"
+COMBO_RULE_VERSION = "combo-window-300-kalshi-only-kraken-price-paused-v1"
 COMBO_QUALITY_FILTERS_ENABLED = False
 COMBO_MIN_SETTLED = 30
 COMBO_MIN_JOINT_ACCURACY = 0.90
@@ -38,7 +38,8 @@ RULES_SNAPSHOT = json.dumps({
     "signal_rule": "Opening and final-five-minute direction from Kalshi official close cycles plus live Kalshi YES movement; Kraken is used only as BTC/USD price reference",
     "combo_rule_version": COMBO_RULE_VERSION,
     "combo_quality_filters_enabled": COMBO_QUALITY_FILTERS_ENABLED,
-    "combo_rule": "Sample aligned BTC and ETH Kalshi 15-minute markets; Kraken supplies BTC/USD price only; BTC and ETH YES quotes drive direction and ETH price",
+    "combo_kraken_reference_enabled": False,
+    "combo_rule": "Sample aligned BTC and ETH Kalshi 15-minute markets; Kalshi history and YES quotes drive both directions; Kraken price reference is paused for combo BTC",
     "combo_quality_gate": "Paused; preserve confidence and settlement data for evaluation without suppressing combo alerts",
     "learning": "Score new BTC and combo legs against Kalshi official settlement and retain feedback history",
     "automatic_orders": False,
@@ -2040,19 +2041,9 @@ def combo_leg(db, market, now, asset):
     if horizon_seconds <= 0:
         return None
     if asset == "BTC":
-        projection = kraken_close_projection(now, close_at-now)
-        if projection is None:
-            return None
-        start, raw_projected = projection
-        move = abs(raw_projected-start)
-        if move <= 0:
-            return None
-        projected = start+move if direction == "UP" else start-move
-        first_projection = kraken_nearest_level_projection(
-            now, direction, (start, projected))
-        if first_projection is None or first_projection[1] == start:
-            first_projection = (start, projected)
-        symbol = "BTC/USD"
+        # Combo evaluation is Kalshi-only during this experiment; do not use Kraken.
+        start = target = projected = move_amount = eta_seconds = None
+        symbol = "BTC/USD · Kraken reference paused"
         price_unit = "USD"
         volume = dec(market.get("volume_24h_fp")) or dec(market.get("volume_24h")) or Decimal(0)
     else:
@@ -2075,24 +2066,24 @@ def combo_leg(db, market, now, asset):
         symbol = "ETH · Kalshi YES"
         price_unit = "YES"
         volume = dec(market.get("volume_24h_fp")) or dec(market.get("volume_24h")) or Decimal(0)
-    if first_projection[1] == start:
-        first_projection = (start, projected)
-    quantum = Decimal("0.01") if asset == "BTC" else Decimal("0.001")
-    start = start.quantize(quantum)
-    projected = projected.quantize(quantum)
-    first_target = first_projection[1].quantize(quantum)
-    if first_target == start and projected != start:
-        first_target = projected
-    projected_move = abs(projected-start)
-    target_move = abs(first_target-start)
-    if projected_move == 0 or target_move == 0:
-        return None
-    eta_seconds = horizon_seconds * min(1.0, float(target_move/projected_move))
+        quantum = Decimal("0.001")
+        start = start.quantize(quantum)
+        projected = projected.quantize(quantum)
+        first_target = first_projection[1].quantize(quantum)
+        if first_target == start and projected != start:
+            first_target = projected
+        projected_move = abs(projected-start)
+        target_move = abs(first_target-start)
+        if projected_move == 0 or target_move == 0:
+            return None
+        eta_seconds = horizon_seconds * min(1.0, float(target_move/projected_move))
+        target = first_target
+        move_amount = target_move
     btc_streak, _, _, _ = prepare_btc_opening_context(db, now)
     return {
         "asset": asset, "ticker": market["ticker"], "direction": direction,
-        "start": start, "target": first_target, "projected": projected,
-        "move_amount": target_move, "eta_seconds": eta_seconds,
+        "start": start, "target": target, "projected": projected,
+        "move_amount": move_amount, "eta_seconds": eta_seconds,
         "projection_horizon_seconds": horizon_seconds, "yes_mid": q[2],
         "volume": volume, "symbol": symbol, "price_unit": price_unit,
         "model_features": features, "learning_basis": basis,
@@ -2156,24 +2147,34 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
         return
     btc_move_label = "Subida" if btc_leg["direction"] == "UP" else "Bajada"
     eth_move_label = "Subida" if eth_leg["direction"] == "UP" else "Bajada"
-    btc_eta = max(0, int(btc_leg["eta_seconds"]))
     eth_eta = max(0, int(eth_leg["eta_seconds"]))
-    btc_eta_label = f"{btc_eta//60:02d}:{btc_eta%60:02d}"
     eth_eta_label = f"{eth_eta//60:02d}:{eth_eta%60:02d}"
     projection_horizon = min(max(0, int(remaining)), 300)
     projection_horizon_label = f"{projection_horizon//60:02d}:{projection_horizon%60:02d}"
-    btc_sign = "+" if btc_leg["direction"] == "UP" else "-"
     eth_sign = "+" if eth_leg["direction"] == "UP" else "-"
+    if btc_leg["start"] is None:
+        btc_block = (
+            "₿ BTC — DIRECCIÓN KALSHI · KRAKEN PAUSADO PARA COMBOS\n"
+            f"Dirección prevista: {direction_label(btc_leg['direction'])}\n"
+            "Referencia numérica BTC/USD y proyección: pausadas en esta prueba.\n\n"
+        )
+    else:
+        btc_sign = "+" if btc_leg["direction"] == "UP" else "-"
+        btc_eta = max(0, int(btc_leg["eta_seconds"]))
+        btc_eta_label = f"{btc_eta//60:02d}:{btc_eta%60:02d}"
+        btc_block = (
+            "₿ BTC — PRECIO DE REFERENCIA KRAKEN\n"
+            f"Dirección prevista: {direction_label(btc_leg['direction'])}\n"
+            f"Precio BTC de referencia: USD {btc_leg['start']:,.2f}\n"
+            f"Movimiento estimado hasta el primer objetivo: {btc_sign}USD {btc_leg['move_amount']:,.2f}\n"
+            f"Primer objetivo BTC: USD {btc_leg['target']:,.2f}\n"
+            f"Precio BTC proyectado al horizonte: USD {btc_leg['projected']:,.2f}\n"
+            f"Tiempo estimado hasta el primer objetivo: {btc_eta_label}\n\n"
+        )
     message = (
         "🧩 COMBO BTC + ETH\n"
         f"⏳ Horizonte común de proyección: {projection_horizon_label}\n\n"
-        "₿ BTC — PRECIO DE REFERENCIA KRAKEN\n"
-        f"Dirección prevista: {direction_label(btc_leg['direction'])}\n"
-        f"Precio BTC de referencia: USD {btc_leg['start']:,.2f}\n"
-        f"Movimiento estimado hasta el primer objetivo: {btc_sign}USD {btc_leg['move_amount']:,.2f}\n"
-        f"Primer objetivo BTC: USD {btc_leg['target']:,.2f}\n"
-        f"Precio BTC proyectado al horizonte: USD {btc_leg['projected']:,.2f}\n"
-        f"Tiempo estimado hasta el primer objetivo: {btc_eta_label}\n\n"
+        f"{btc_block}"
         "◆ ETH — CONTRATO KALSHI YES\n"
         f"Dirección prevista: {direction_label(eth_leg['direction'])}\n"
         f"Cotización YES actual: USD {eth_leg['start']:.3f} por contrato\n"
