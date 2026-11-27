@@ -1438,6 +1438,40 @@ def kalshi_reversal_status(db, ticker, direction, now, opened_at):
     return None, "No hay un movimiento contrario confirmado en las cotizaciones Kalshi."
 
 
+def monitor_kalshi_reversal(db, market, now, opened_at):
+    """Send one follow-up Telegram notice when a live BTC reversal is confirmed."""
+    ticker = market.get("ticker", "")
+    forecast = db.execute("""SELECT phase,direction FROM kalshi_only_alerts
+        WHERE ticker=? AND phase IN ('EARLY_5M','LAST_5M')
+        ORDER BY sent_at DESC LIMIT 1""", (ticker,)).fetchone()
+    if not ticker or not forecast or forecast[1] not in ("UP", "DOWN"):
+        return
+    phase, predicted = forecast
+    status, evidence = kalshi_reversal_status(db, ticker, predicted, now, opened_at)
+    if status not in ("UP", "DOWN"):
+        return
+    db.execute("""CREATE TABLE IF NOT EXISTS kalshi_reversal_alerts
+        (ticker TEXT PRIMARY KEY, phase TEXT NOT NULL, direction TEXT NOT NULL,
+         sent_at REAL NOT NULL)""")
+    if db.execute("SELECT 1 FROM kalshi_reversal_alerts WHERE ticker=?",
+                  (ticker,)).fetchone():
+        return
+    message = (
+        "🔄 BTC — GIRO CONFIRMADO DURANTE EL CONTRATO\n"
+        f"🧾 {ticker}\n"
+        f"Señal inicial: {direction_label(predicted)}\n"
+        f"Movimiento contrario observado: {direction_label(status)}\n"
+        f"{evidence}\n"
+        "Confirmación basada en cotizaciones YES de Kalshi; es un aviso de cambio observado, no una garantía."
+    )
+    if notify(message, db=db, broadcast=True):
+        db.execute("""INSERT OR IGNORE INTO kalshi_reversal_alerts
+            (ticker,phase,direction,sent_at) VALUES (?,?,?,?)""",
+            (ticker, phase, status, now))
+        log.info("Kalshi reversal confirmed and sent: %s %s -> %s",
+                 ticker, predicted, status)
+
+
 def forecast_display(ticker, phase_label, direction, confidence, start, target, projected,
                      bias_direction, bias_evidence, cycle_text):
     """Format a BTC alert; Kraken is a numeric reference, never a direction input."""
@@ -2357,6 +2391,7 @@ def scan(predictions_enabled=True):
                 signal(db, market, now, "EARLY_5M")
                 if closes-now <= 300:
                     signal(db, market, now, "LAST_5M")
+                monitor_kalshi_reversal(db, market, now, opened)
                 # The next-contract forecast is sent as soon as its prior official result is available.
         if eth_payload is not None:
             for market in eth_payload.get("markets", []):
