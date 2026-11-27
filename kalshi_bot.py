@@ -20,6 +20,8 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "20")))
 COMBO_WINDOW_SECONDS = max(60, int(os.getenv("COMBO_WINDOW_SECONDS", "360")))
+COMBO_MIN_SETTLED = 10
+COMBO_MIN_JOINT_ACCURACY = 0.60
 MIN_VOLUME = Decimal("0")
 BOT_VERSION = os.getenv("BOT_VERSION", "rafa-learning-history-btc-eth")
 PANEL_URL = os.getenv("RAFA_PANEL_URL", "").rstrip("/")
@@ -30,6 +32,7 @@ RULES_SNAPSHOT = json.dumps({
     "scan_seconds": SCAN_SECONDS, "combo_window_seconds": min(COMBO_WINDOW_SECONDS, 360),
     "signal_rule": "Opening and final-five-minute direction from Kalshi official close cycles plus live Kalshi YES movement; Kraken is used only as BTC/USD price reference",
     "combo_rule": "Sample BTC and ETH Kalshi markets from open; send a combo during the final five minutes using settled cycles and live Kalshi YES movement; Kraken supplies BTC/USD price only",
+    "combo_quality_gate": "Send only when exact-pair settled history has at least 10 outcomes and at least 60% joint accuracy; otherwise retain a silent shadow candidate for official-outcome learning",
     "learning": "Score new BTC and combo legs against Kalshi official settlement and retain feedback history",
     "automatic_orders": False,
 }, separators=(",", ":"), sort_keys=True)
@@ -1684,22 +1687,32 @@ def evaluate_btc_forecasts(db, now):
             log.exception("Could not evaluate BTC forecast for %s", ticker)
 
 
-def evaluate_combo_reviews(db, now):
+def ensure_combo_forecast_table(db):
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_combo_forecasts
         (combo_key TEXT PRIMARY KEY, btc_ticker TEXT NOT NULL, eth_ticker TEXT NOT NULL,
          issued_at REAL NOT NULL, close_at REAL NOT NULL,
-         btc_direction TEXT NOT NULL, eth_direction TEXT NOT NULL)""")
+         btc_direction TEXT NOT NULL, eth_direction TEXT NOT NULL,
+         alert_sent INTEGER NOT NULL DEFAULT 1)""")
+    columns = {row[1] for row in db.execute(
+        "PRAGMA table_info(kalshi_combo_forecasts)")}
+    if "alert_sent" not in columns:
+        # Existing rows are real alerts; rejected candidates are stored as shadow rows.
+        db.execute("""ALTER TABLE kalshi_combo_forecasts
+            ADD COLUMN alert_sent INTEGER NOT NULL DEFAULT 1""")
+
+def evaluate_combo_reviews(db, now):
+    ensure_combo_forecast_table(db)
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_combo_reviews
         (combo_key TEXT PRIMARY KEY, reviewed_at REAL NOT NULL)""")
     pending = db.execute("""SELECT c.combo_key,c.btc_ticker,c.eth_ticker,
-            c.btc_direction,c.eth_direction,b.result,e.result
+            c.btc_direction,c.eth_direction,b.result,e.result,c.alert_sent
         FROM kalshi_combo_forecasts c
         JOIN kalshi_only_results b ON b.ticker=c.btc_ticker
         JOIN kalshi_only_results e ON e.ticker=c.eth_ticker
         LEFT JOIN kalshi_combo_reviews r ON r.combo_key=c.combo_key
         WHERE r.combo_key IS NULL AND b.result IN ('yes','no') AND e.result IN ('yes','no')
         ORDER BY c.close_at,c.combo_key""").fetchall()
-    for combo_key, btc_ticker, eth_ticker, btc_pred, eth_pred, btc_result, eth_result in pending:
+    for combo_key, btc_ticker, eth_ticker, btc_pred, eth_pred, btc_result, eth_result, alert_sent in pending:
         btc_actual = "UP" if btc_result == "yes" else "DOWN"
         eth_actual = "UP" if eth_result == "yes" else "DOWN"
         db.execute("""UPDATE kalshi_prediction_feedback
@@ -1710,11 +1723,17 @@ def evaluate_combo_reviews(db, now):
         btc_ok = btc_pred == btc_actual
         eth_ok = eth_pred == eth_actual
         combo_ok = btc_ok and eth_ok
+        if not alert_sent:
+            db.execute("INSERT OR IGNORE INTO kalshi_combo_reviews VALUES (?,?)",
+                       (combo_key, now))
+            log.info("Shadow combo evaluated without alert: %s; joint_success=%s",
+                     combo_key, combo_ok)
+            continue
         evaluated = db.execute("""SELECT c.btc_direction,c.eth_direction,b.result,e.result
             FROM kalshi_combo_forecasts c
             JOIN kalshi_only_results b ON b.ticker=c.btc_ticker
             JOIN kalshi_only_results e ON e.ticker=c.eth_ticker
-            WHERE b.result IN ('yes','no') AND e.result IN ('yes','no')""").fetchall()
+            WHERE c.alert_sent=1 AND b.result IN ('yes','no') AND e.result IN ('yes','no')""").fetchall()
         wins = sum((bd == "UP") == (br == "yes") and
                    (ed == "UP") == (er == "yes")
                    for bd, ed, br, er in evaluated)
@@ -1933,7 +1952,7 @@ def sync_dashboard(db, now, force=False):
 
 
 def combo_history_summary(db, now, btc_direction, eth_direction):
-    """Report smoothed historical rates for each leg and the exact combo pair."""
+    """Report smoothed leg rates and exact-pair joint outcomes."""
     rows = db.execute("""SELECT c.btc_direction,c.eth_direction,b.result,e.result
         FROM kalshi_combo_forecasts c
         JOIN kalshi_only_results b ON b.ticker=c.btc_ticker
@@ -1983,7 +2002,7 @@ def combo_history_summary(db, now, btc_direction, eth_direction):
             + line("base conjunta de todos los combos", global_samples))
     else:
         lines.append(f"{pair_label}: reuniendo historial (n=0)")
-    return "\n".join(lines)
+    return "\n".join(lines), sum(pair_samples), len(pair_samples)
 
 
 def market_already_prices_direction_at_99(yes_mid, direction, remaining):
@@ -2071,18 +2090,28 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
     if btc_leg is None or eth_leg is None:
         return
     combo_key = btc_leg["ticker"] + "|" + eth_leg["ticker"]
-    db.execute("""CREATE TABLE IF NOT EXISTS kalshi_combo_forecasts
-        (combo_key TEXT PRIMARY KEY, btc_ticker TEXT NOT NULL, eth_ticker TEXT NOT NULL,
-         issued_at REAL NOT NULL, close_at REAL NOT NULL,
-         btc_direction TEXT NOT NULL, eth_direction TEXT NOT NULL)""")
+    ensure_combo_forecast_table(db)
     if db.execute("SELECT 1 FROM kalshi_combo_forecasts WHERE combo_key=?",
                   (combo_key,)).fetchone():
         return
     # Historical probability uses only prior combo forecasts with official settlements.
-    probability_stats = combo_history_summary(
+    probability_stats, pair_hits, pair_n = combo_history_summary(
         db, now, btc_leg["direction"], eth_leg["direction"])
-    log.info("Internal combo calibration (not shown in alert): %s",
-             probability_stats.replace("\n", " | "))
+    pair_accuracy = pair_hits / pair_n if pair_n else 0.0
+    log.info("Internal combo calibration: %s", probability_stats.replace("\n", " | "))
+    if pair_n < COMBO_MIN_SETTLED or pair_accuracy < COMBO_MIN_JOINT_ACCURACY:
+        db.execute("""INSERT OR IGNORE INTO kalshi_combo_forecasts
+            (combo_key,btc_ticker,eth_ticker,issued_at,close_at,
+             btc_direction,eth_direction,alert_sent)
+            VALUES (?,?,?,?,?,?,?,0)""",
+            (combo_key, btc_leg["ticker"], eth_leg["ticker"], now, btc_close,
+             btc_leg["direction"], eth_leg["direction"]))
+        log.info(
+            "Combo alert suppressed; shadow candidate retained: %s joint=%d/%d "
+            "(%.1f%%), minimum=%d outcomes and %.1f%% accuracy",
+            combo_key, pair_hits, pair_n, pair_accuracy*100,
+            COMBO_MIN_SETTLED, COMBO_MIN_JOINT_ACCURACY*100)
+        return
     btc_move_label = "Subida" if btc_leg["direction"] == "UP" else "Bajada"
     eth_move_label = "Subida" if eth_leg["direction"] == "UP" else "Bajada"
     btc_eta = max(0, int(btc_leg["eta_seconds"]))
@@ -2103,8 +2132,9 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
     if not notify(message, db=db, broadcast=True):
         return
     db.execute("""INSERT OR IGNORE INTO kalshi_combo_forecasts
-        (combo_key,btc_ticker,eth_ticker,issued_at,close_at,btc_direction,eth_direction)
-        VALUES (?,?,?,?,?,?,?)""",
+        (combo_key,btc_ticker,eth_ticker,issued_at,close_at,
+         btc_direction,eth_direction,alert_sent)
+        VALUES (?,?,?,?,?,?,?,1)""",
         (combo_key, btc_leg["ticker"], eth_leg["ticker"], now, btc_close,
          btc_leg["direction"], eth_leg["direction"]))
     for leg in (btc_leg, eth_leg):
