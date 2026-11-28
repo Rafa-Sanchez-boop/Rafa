@@ -21,7 +21,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = min(5, max(1, int(os.getenv("SCAN_SECONDS", "5"))))
 COMBO_WINDOW_SECONDS = 180
 OPENING_REVIEW_SECONDS = 20
-COMBO_RULE_VERSION = "combo-btc-eth-adaptive-memory-v4"
+COMBO_RULE_VERSION = "combo-btc-kalshi-favorite-eth-adaptive-v5"
 COMBO_REVIEW_INTERVAL_SECONDS = 3 * 60 * 60
 COMBO_REVIEW_MIN_PAIRS = 8
 COMBO_POOR_PAIR_ACCURACY = 0.60
@@ -49,7 +49,7 @@ RULES_SNAPSHOT = json.dumps({
     "combo_rule_version": COMBO_RULE_VERSION,
     "combo_quality_filters_enabled": COMBO_QUALITY_FILTERS_ENABLED,
     "combo_kraken_reference_enabled": True,
-    "combo_rule": "In the final three minutes, analyze BTC and ETH independently using each Kalshi YES quote path and Kraken BTC/USD or ETH/USD spot movement over 60/180/300 seconds, intracontract persistence and reversals, asset-specific official cycles, and this combo engine’s own settled forecasts; never use the individual BTC predictor",
+    "combo_rule": "In the final three minutes, analyze BTC and ETH independently. For BTC, set direction to the higher Kalshi implied side probability (UP when YES midpoint is at least 50%, DOWN otherwise); Kraken and combo-only features can inform its price target but cannot override that side. Keep the existing independent combo model for ETH; never use the individual BTC predictor.",
     "combo_quality_gate": "Paused; preserve confidence and settlement data for evaluation without suppressing combo alerts",
     "learning": "Every 3 hours, review combo-only accuracy from official BTC/ETH settlements; after enough examples, fit bounded per-asset weights and keep every accepted version in persistent history",
     "combo_learning_minimums": {"recent_pairs": COMBO_REVIEW_MIN_PAIRS, "training_legs": COMBO_TRAIN_MIN_LEGS, "poor_pair_accuracy": COMBO_POOR_PAIR_ACCURACY},
@@ -2902,11 +2902,22 @@ def combo_leg(db, market, now, asset):
         "calibration": clamp(calibration_score) if calibration_score is not None else 0.0,
     }
     score = sum(weights[name]*components[name] for name in COMBO_DEFAULT_WEIGHTS)
-    if abs(score) < 0.08:
-        log.info("Combo %s leg held for mixed/flat Kalshi and Kraken evidence: %s score=%+.3f",
-                 asset, market["ticker"], score)
-        return None
-    direction = "UP" if score > 0 else "DOWN"
+    if asset == "BTC":
+        # BTC direction follows the higher Kalshi-implied side probability.
+        # Kraken and learned combo features remain context for projections only.
+        direction = "UP" if mid >= Decimal("0.50") else "DOWN"
+        market_probability = mid if direction == "UP" else Decimal("1")-mid
+        log.info("BTC combo direction follows Kalshi's higher side: %s %.1f%%; "
+                 "independent combo score=%+.3f",
+                 direction, float(market_probability*100), score)
+    else:
+        # Keep the existing independent combo model for ETH unchanged.
+        market_probability = None
+        if abs(score) < 0.08:
+            log.info("Combo %s leg held for mixed/flat Kalshi and Kraken evidence: %s score=%+.3f",
+                     asset, market["ticker"], score)
+            return None
+        direction = "UP" if score > 0 else "DOWN"
 
     horizon_seconds = min(max(0.0, close_at-now), 300.0)
     if horizon_seconds <= 0:
@@ -2962,6 +2973,7 @@ def combo_leg(db, market, now, asset):
         "start": start, "target": target, "projected": projected,
         "move_amount": move_amount, "eta_seconds": eta_seconds,
         "projection_horizon_seconds": horizon_seconds, "yes_mid": mid,
+        "market_probability": market_probability,
         "volume": volume, "symbol": symbol, "price_unit": price_unit,
         "model_features": None, "learning_basis": basis,
         "cycle_summary": cycle["summary"], "combo_score": score,
@@ -3047,6 +3059,7 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
         btc_block = (
             "₿ BTC — KALSHI + CONFIRMACIÓN KRAKEN\n"
             f"Dirección prevista: {direction_label(btc_leg['direction'])}\n"
+            f"Probabilidad mayor Kalshi: {btc_leg['market_probability']:.0%}\n"
             f"{btc_odds_line}"
             f"{btc_price} Proyección: reuniendo trayectoria.\n\n"
         )
@@ -3057,6 +3070,7 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
         btc_block = (
             "₿ BTC — PRECIO Y CONFIRMACIÓN KRAKEN\n"
             f"Dirección prevista: {direction_label(btc_leg['direction'])}\n"
+            f"Probabilidad mayor Kalshi: {btc_leg['market_probability']:.0%}\n"
             f"{btc_odds_line}"
             f"Precio BTC de referencia: USD {btc_leg['start']:,.2f}\n"
             f"Movimiento estimado hasta el primer objetivo: {btc_sign}USD {btc_leg['move_amount']:,.2f}\n"
