@@ -2252,13 +2252,12 @@ def combo_weights_for_asset(db, asset):
     except (TypeError, ValueError):
         stored = {}
     weights = {
-        name: max(0.0, min(0.70, float(stored.get(name, default))))
+        name: max(-0.35, min(0.70, float(stored.get(name, default))))
         for name, default in COMBO_DEFAULT_WEIGHTS.items()
     }
-    total = sum(weights.values())
-    return ({name: value/total for name, value in weights.items()}
-            if total else dict(COMBO_DEFAULT_WEIGHTS))
-
+    if sum(abs(value) for value in weights.values()) < 1e-6:
+        return dict(COMBO_DEFAULT_WEIGHTS)
+    return weights
 
 def record_combo_leg_features(db, combo_key, leg, now):
     components = leg.get("components")
@@ -2308,17 +2307,15 @@ def _fit_combo_weights(train_rows, initial_weights):
                 gradients[key] += (probability-float(actual_up))*3.0*float(components.get(key) or 0.0)
         for key in keys:
             gradient = gradients[key]/len(train_rows) + 0.60*(weights[key]-COMBO_DEFAULT_WEIGHTS[key])
-            weights[key] = max(0.02, min(0.70, weights[key]-0.08*gradient))
-        total = sum(weights.values())
-        weights = {key:value/total for key,value in weights.items()}
-    bounded = {
-        key: max(initial_weights[key]*0.75,
-                 min(initial_weights[key]*1.25, weights[key]))
+            weights[key] = max(-0.35, min(0.70, weights[key]-0.08*gradient))
+    # Bound each three-hour change; signed coefficients let repeated evidence
+    # reverse a pattern when an input has become consistently misleading.
+    return {
+        key: max(-0.35, min(0.70,
+                 max(initial_weights[key]-0.15,
+                     min(initial_weights[key]+0.15, weights[key]))))
         for key in keys
     }
-    total = sum(bounded.values())
-    return {key:value/total for key,value in bounded.items()}
-
 
 def maybe_adapt_combo_weights(db, now):
     """Review every three hours; update only with official outcomes and held-out gains."""
