@@ -19,9 +19,9 @@ DB_PATH = os.getenv("DB_PATH", "/var/data/kalshi_bot.sqlite3")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = min(5, max(1, int(os.getenv("SCAN_SECONDS", "5"))))
-COMBO_WINDOW_SECONDS = 360
+COMBO_WINDOW_SECONDS = 180
 OPENING_REVIEW_SECONDS = 20
-COMBO_RULE_VERSION = "combo-btc-eth-final-six-minutes-v1"
+COMBO_RULE_VERSION = "combo-btc-eth-final-three-minutes-v1"
 COMBO_QUALITY_FILTERS_ENABLED = False
 COMBO_MIN_SETTLED = 30
 COMBO_MIN_JOINT_ACCURACY = 0.90
@@ -40,7 +40,7 @@ RULES_SNAPSHOT = json.dumps({
     "combo_rule_version": COMBO_RULE_VERSION,
     "combo_quality_filters_enabled": COMBO_QUALITY_FILTERS_ENABLED,
     "combo_kraken_reference_enabled": False,
-    "combo_rule": "Send a separate BTC+ETH combo during the final six minutes only when both Kalshi 15-minute legs pass their own asset checks; evaluate each leg against its own official settlement",
+    "combo_rule": "Send a separate BTC+ETH combo during the final three minutes only when both Kalshi 15-minute legs pass their own asset checks; evaluate each leg against its own official settlement",
     "combo_quality_gate": "Paused; preserve confidence and settlement data for evaluation without suppressing combo alerts",
     "learning": "Score new BTC and combo legs against Kalshi official settlement and retain feedback history",
     "automatic_orders": False,
@@ -2689,7 +2689,7 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
             f"Tiempo estimado hasta el primer objetivo: {btc_eta_label}\n\n"
         )
     message = (
-        "🧩 COMBO BTC + ETH · ÚLTIMOS 6 MIN\n"
+        "🧩 COMBO BTC + ETH · ÚLTIMOS 3 MIN\n"
         f"⏳ Horizonte común de proyección: {projection_horizon_label}\n\n"
         f"{btc_block}"
         "◆ ETH — CONTRATO KALSHI YES\n"
