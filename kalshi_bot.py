@@ -21,7 +21,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = min(5, max(1, int(os.getenv("SCAN_SECONDS", "5"))))
 COMBO_WINDOW_SECONDS = 180
 OPENING_REVIEW_SECONDS = 20
-COMBO_RULE_VERSION = "combo-btc-eth-final-three-minutes-v1"
+COMBO_RULE_VERSION = "combo-btc-eth-independent-market-v2"
 COMBO_QUALITY_FILTERS_ENABLED = False
 COMBO_MIN_SETTLED = 30
 COMBO_MIN_JOINT_ACCURACY = 0.90
@@ -40,7 +40,7 @@ RULES_SNAPSHOT = json.dumps({
     "combo_rule_version": COMBO_RULE_VERSION,
     "combo_quality_filters_enabled": COMBO_QUALITY_FILTERS_ENABLED,
     "combo_kraken_reference_enabled": False,
-    "combo_rule": "Send a separate BTC+ETH combo during the final three minutes only when both Kalshi 15-minute legs pass their own asset checks; evaluate each leg against its own official settlement",
+    "combo_rule": "In the final three minutes, analyze BTC and ETH independently from their own Kalshi YES quotes, 60/180/300-second movement, intracontract paths, reversals, official cycle outcomes, and this combo engine’s own settled forecasts; never use the individual BTC predictor or Kraken to choose either combo direction",
     "combo_quality_gate": "Paused; preserve confidence and settlement data for evaluation without suppressing combo alerts",
     "learning": "Score new BTC and combo legs against Kalshi official settlement and retain feedback history",
     "automatic_orders": False,
@@ -2558,7 +2558,7 @@ def market_already_prices_direction_at_99(yes_mid, direction, remaining):
 
 
 def combo_leg(db, market, now, asset):
-    """Choose direction from Kalshi history and current chart; Kraken never votes."""
+    """Analyze one combo leg using only its Kalshi market path and combo-specific history."""
     q = quote(market)
     if q is None:
         return None
@@ -2566,63 +2566,149 @@ def combo_leg(db, market, now, asset):
     opened = ts(market.get("open_time"))
     if close_at is None or opened is None or close_at <= now or abs((close_at-opened)-900) > 60:
         return None
-    forecast = learned_direction(db, market, asset, now, "COMBO_5M")
-    if forecast is None:
+
+    mid = q[2]
+    # Require a real price path, so a restart or a stale single quote cannot make a combo.
+    points = db.execute("""SELECT observed_at,yes_mid FROM kalshi_only_samples
+        WHERE ticker=? AND observed_at>=? AND observed_at<=?
+        ORDER BY observed_at""",
+        (market["ticker"], max(opened, now-300), now)).fetchall()
+    points = [(float(t), dec(value)) for t, value in points if dec(value) is not None]
+    if len(points) < 4 or now-points[0][0] < 45:
+        log.info("Combo %s leg waiting for at least 45 seconds of fresh Kalshi path: %s",
+                 asset, market["ticker"])
         return None
-    direction, features, basis, quote_change, pattern_summary = forecast
+
+    def prior_mid(age, max_lag):
+        target_time = now-age
+        candidates = [(t, value) for t, value in points if t <= target_time]
+        if not candidates:
+            return None
+        observed, value = candidates[-1]
+        return value if target_time-observed <= max_lag else None
+
+    # Each horizon is independent evidence from this contract's own YES price.
+    changes = {}
+    for age, max_lag in ((60, 35), (180, 45), (300, 60)):
+        reference = prior_mid(age, max_lag)
+        changes[age] = float(mid-reference) if reference is not None else None
+
+    if changes[60] is None and changes[180] is None:
+        log.info("Combo %s leg waiting for a usable 60s or 180s quote comparison: %s",
+                 asset, market["ticker"])
+        return None
+
+    def clamp(value):
+        return max(-1.0, min(1.0, value))
+
+    # Scale each horizon against a meaningful YES-price move. Missing horizons
+    # are omitted and the remaining live evidence is reweighted.
+    live_parts = []
+    for age, scale, weight in ((60, 0.035, 0.35),
+                               (180, 0.060, 0.40),
+                               (300, 0.090, 0.25)):
+        if changes[age] is not None:
+            live_parts.append((clamp(changes[age]/scale), weight))
+    live_score = (sum(value*weight for value, weight in live_parts)
+                  / sum(weight for _, weight in live_parts))
+
+    first_mid = points[0][1]
+    above_share = sum(value >= Decimal("0.50") for _, value in points)/len(points)
+    crossings = sum((left[1] >= Decimal("0.50")) != (right[1] >= Decimal("0.50"))
+                    for left, right in zip(points, points[1:]))
+    path_score = (0.70*clamp(float(mid-first_mid)/0.08)
+                  + 0.30*(2.0*above_share-1.0))
+    # Frequent flips weaken the path's persistence without reversing its direction.
+    path_score *= max(0.35, 1.0-min(0.65, crossings*0.08))
+
+    # Broader cycle history is read for this asset only; it never comes from
+    # individual forecast feedback or the BTC-only adaptive model.
+    cycle = cycle_pattern_summary(db, asset, now)
+    cycle_score = ((cycle["up"]-cycle["down"])/cycle["completed"]
+                   if cycle["completed"] else None)
+
+    # Learn whether this combo engine's own prior calls for this asset worked.
+    # Use only its versioned combo forecasts matched to official Kalshi settlement.
+    prefix = "btc" if asset == "BTC" else "eth"
+    ticker_column = prefix + "_ticker"
+    direction_column = prefix + "_direction"
+    history = db.execute(f"""SELECT c.{direction_column},
+            CASE WHEN r.result='yes' THEN 'UP' ELSE 'DOWN' END
+        FROM kalshi_combo_forecasts c
+        JOIN kalshi_only_results r ON r.ticker=c.{ticker_column}
+        WHERE c.combo_version=? AND c.issued_at<?
+          AND r.result IN ('yes','no')
+        ORDER BY c.issued_at DESC LIMIT 100""",
+        (COMBO_RULE_VERSION, now)).fetchall()
+    rates = {}
+    for direction_name in ("UP", "DOWN"):
+        correct = [predicted == actual for predicted, actual in history
+                   if predicted == direction_name]
+        if len(correct) >= 3:
+            rates[direction_name] = (sum(correct)+1)/(len(correct)+2)
+    calibration_score = (rates["UP"]-rates["DOWN"]
+                         if "UP" in rates and "DOWN" in rates else None)
+
+    # Current contract momentum and path lead; official cycles and this engine's
+    # own settled forecasts act as small, separately tracked adjustments.
+    parts = [(live_score, 0.50), (path_score, 0.25),
+             (clamp((float(mid)-0.50)/0.25), 0.10)]
+    if cycle_score is not None:
+        parts.append((clamp(cycle_score), 0.10))
+    if calibration_score is not None:
+        parts.append((clamp(calibration_score), 0.15))
+    score = sum(value*weight for value, weight in parts)/sum(weight for _, weight in parts)
+    if abs(score) < 0.08:
+        log.info("Combo %s leg held for mixed/flat evidence: %s score=%+.3f",
+                 asset, market["ticker"], score)
+        return None
+    direction = "UP" if score > 0 else "DOWN"
+
     horizon_seconds = min(max(0.0, close_at-now), 300.0)
     if horizon_seconds <= 0:
         return None
+    volume = dec(market.get("volume_24h_fp")) or dec(market.get("volume_24h")) or Decimal(0)
     if asset == "BTC":
-        # Combo evaluation is Kalshi-only during this experiment; do not use Kraken.
+        # Kraken never votes in a combo, and the combo keeps BTC numeric projection
+        # separate from BTC's individual forecast.
         start = target = projected = move_amount = eta_seconds = None
-        symbol = "BTC/USD · Kraken reference paused"
+        symbol = "BTC/USD · referencia numérica pausada para combos"
         price_unit = "USD"
-        volume = dec(market.get("volume_24h_fp")) or dec(market.get("volume_24h")) or Decimal(0)
     else:
-        # No Kraken ETH feed is used. The ETH leg shows Kalshi YES price movement.
-        mid = q[2]
-        start = mid
-        previous = db.execute("""SELECT yes_mid,observed_at FROM kalshi_only_samples
-            WHERE ticker=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 1""",
-            (market["ticker"], now-300)).fetchone()
-        previous_mid = dec(previous[0]) if previous else None
-        previous_time = float(previous[1]) if previous else None
-        if (previous_mid is None or previous_time is None
-                or now-previous_time > 360 or mid == previous_mid):
+        move_reference = next((changes[age] for age in (300, 180, 60)
+                               if changes[age] is not None), None)
+        if move_reference is None or move_reference == 0:
             return None
-        move_5m = abs(mid-previous_mid)
-        horizon = Decimal(str(horizon_seconds))/Decimal("300")
-        projected = mid + (move_5m*horizon if direction == "UP" else -move_5m*horizon)
+        move = abs(Decimal(str(move_reference)))
+        projected = mid + (move*Decimal(str(horizon_seconds))/Decimal("300")
+                           if direction == "UP"
+                           else -move*Decimal(str(horizon_seconds))/Decimal("300"))
         projected = min(Decimal("0.99"), max(Decimal("0.01"), projected))
-        first_projection = (start, projected)
+        start = mid.quantize(Decimal("0.001"))
+        projected = projected.quantize(Decimal("0.001"))
+        target = projected
+        move_amount = abs(target-start)
+        if move_amount == 0:
+            return None
+        eta_seconds = horizon_seconds
         symbol = "ETH · Kalshi YES"
         price_unit = "YES"
-        volume = dec(market.get("volume_24h_fp")) or dec(market.get("volume_24h")) or Decimal(0)
-        quantum = Decimal("0.001")
-        start = start.quantize(quantum)
-        projected = projected.quantize(quantum)
-        first_target = first_projection[1].quantize(quantum)
-        if first_target == start and projected != start:
-            first_target = projected
-        projected_move = abs(projected-start)
-        target_move = abs(first_target-start)
-        if projected_move == 0 or target_move == 0:
-            return None
-        eta_seconds = horizon_seconds * min(1.0, float(target_move/projected_move))
-        target = first_target
-        move_amount = target_move
-    btc_streak, _, _, _ = prepare_btc_opening_context(db, now)
+
+    basis = (
+        f"Combo-only {asset}: score={score:+.3f}; "
+        f"YES Δ60/180/300s={changes[60]}/{changes[180]}/{changes[300]}; "
+        f"path={path_score:+.3f}, cruces50¢={crossings}, "
+        f"ciclos={cycle['completed']}, calibración_combo_n={len(history)}"
+    )
     return {
         "asset": asset, "ticker": market["ticker"], "direction": direction,
         "start": start, "target": target, "projected": projected,
         "move_amount": move_amount, "eta_seconds": eta_seconds,
-        "projection_horizon_seconds": horizon_seconds, "yes_mid": q[2],
+        "projection_horizon_seconds": horizon_seconds, "yes_mid": mid,
         "volume": volume, "symbol": symbol, "price_unit": price_unit,
-        "model_features": features, "learning_basis": basis,
-        "cycle_summary": pattern_summary,
+        "model_features": None, "learning_basis": basis,
+        "cycle_summary": cycle["summary"], "combo_score": score,
     }
-
 
 def record_combo_candidate(db, combo_key, btc_leg, eth_leg, now, close_at, alert_sent):
     db.execute("""INSERT OR IGNORE INTO kalshi_combo_forecasts
