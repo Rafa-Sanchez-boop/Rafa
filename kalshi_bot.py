@@ -8,7 +8,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import requests
 import btc_assistant
 
@@ -3031,6 +3031,14 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
     eth_eta_label = f"{eth_eta//60:02d}:{eth_eta%60:02d}"
     projection_horizon = min(max(0, int(remaining)), 300)
     projection_horizon_label = f"{projection_horizon//60:02d}:{projection_horizon%60:02d}"
+    btc_up_pct = int((btc_leg["yes_mid"] * 100).to_integral_value(rounding=ROUND_HALF_UP))
+    eth_up_pct = int((eth_leg["yes_mid"] * 100).to_integral_value(rounding=ROUND_HALF_UP))
+    btc_odds_line = (
+        f"Probabilidades Kalshi al momento: UP {btc_up_pct}% · DOWN {100-btc_up_pct}%\n"
+    )
+    eth_odds_line = (
+        f"Probabilidades Kalshi al momento: UP {eth_up_pct}% · DOWN {100-eth_up_pct}%\n"
+    )
     eth_sign = "+" if eth_leg["direction"] == "UP" else "-"
     if btc_leg["start"] is None:
         btc_price = (f"Precio actual Kraken BTC/USD: USD {btc_leg['kraken_price']:,.2f}."
@@ -3039,6 +3047,7 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
         btc_block = (
             "₿ BTC — KALSHI + CONFIRMACIÓN KRAKEN\n"
             f"Dirección prevista: {direction_label(btc_leg['direction'])}\n"
+            f"{btc_odds_line}"
             f"{btc_price} Proyección: reuniendo trayectoria.\n\n"
         )
     else:
@@ -3048,6 +3057,7 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
         btc_block = (
             "₿ BTC — PRECIO Y CONFIRMACIÓN KRAKEN\n"
             f"Dirección prevista: {direction_label(btc_leg['direction'])}\n"
+            f"{btc_odds_line}"
             f"Precio BTC de referencia: USD {btc_leg['start']:,.2f}\n"
             f"Movimiento estimado hasta el primer objetivo: {btc_sign}USD {btc_leg['move_amount']:,.2f}\n"
             f"Primer objetivo BTC: USD {btc_leg['target']:,.2f}\n"
@@ -3065,6 +3075,7 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
         "◆ ETH — CONTRATO KALSHI YES\n"
         f"{eth_kraken_line}"
         f"Dirección prevista: {direction_label(eth_leg['direction'])}\n"
+        f"{eth_odds_line}"
         f"Cotización YES actual: USD {eth_leg['start']:.3f} por contrato\n"
         f"Variación estimada: {eth_sign}USD {eth_leg['move_amount']:.3f} por contrato\n"
         f"Cotización YES proyectada al horizonte: USD {eth_leg['projected']:.3f} por contrato\n"
