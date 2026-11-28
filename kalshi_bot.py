@@ -42,7 +42,7 @@ RULES_SNAPSHOT = json.dumps({
     "combo_kraken_reference_enabled": False,
     "combo_rule": "In the final three minutes, analyze BTC and ETH independently from their own Kalshi YES quotes, 60/180/300-second movement, intracontract paths, reversals, official cycle outcomes, and this combo engine’s own settled forecasts; never use the individual BTC predictor or Kraken to choose either combo direction",
     "combo_quality_gate": "Paused; preserve confidence and settlement data for evaluation without suppressing combo alerts",
-    "learning": "Score new BTC and combo legs against Kalshi official settlement and retain feedback history",
+    "learning": "Keep BTC individual forecasts and combo analysis separate; score BTC and ETH combo legs only against their own official Kalshi settlements",
     "automatic_orders": False,
 }, separators=(",", ":"), sort_keys=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
