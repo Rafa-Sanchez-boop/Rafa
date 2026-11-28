@@ -21,7 +21,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = min(5, max(1, int(os.getenv("SCAN_SECONDS", "5"))))
 COMBO_WINDOW_SECONDS = 180
 OPENING_REVIEW_SECONDS = 20
-COMBO_RULE_VERSION = "combo-btc-eth-independent-kalshi-kraken-v3"
+COMBO_RULE_VERSION = "combo-btc-eth-adaptive-memory-v4"
 COMBO_REVIEW_INTERVAL_SECONDS = 3 * 60 * 60
 COMBO_REVIEW_MIN_PAIRS = 8
 COMBO_POOR_PAIR_ACCURACY = 0.60
@@ -48,7 +48,7 @@ RULES_SNAPSHOT = json.dumps({
     "opening_prediction_rule": "Wait at least 20 seconds after open for a BTC/USD move of at least 0.01%, then forecast the opposite pullback using the previous complete contract path",
     "combo_rule_version": COMBO_RULE_VERSION,
     "combo_quality_filters_enabled": COMBO_QUALITY_FILTERS_ENABLED,
-    "combo_kraken_reference_enabled": False,
+    "combo_kraken_reference_enabled": True,
     "combo_rule": "In the final three minutes, analyze BTC and ETH independently using each Kalshi YES quote path and Kraken BTC/USD or ETH/USD spot movement over 60/180/300 seconds, intracontract persistence and reversals, asset-specific official cycles, and this combo engine’s own settled forecasts; never use the individual BTC predictor",
     "combo_quality_gate": "Paused; preserve confidence and settlement data for evaluation without suppressing combo alerts",
     "learning": "Every 3 hours, review combo-only accuracy from official BTC/ETH settlements; after enough examples, fit bounded per-asset weights and keep every accepted version in persistent history",
