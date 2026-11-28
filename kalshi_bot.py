@@ -1882,51 +1882,61 @@ def opening_impulse_signal(db, market, now):
         return
     reversal = "DOWN" if impulse == "UP" else "UP"
 
-    # Read the complete immediately previous contract and use its first
-    # retracement size and timing as a one-cycle reference.
+    # Use the previous contract's full YES path when available. A restart can
+    # leave that path incomplete, so opening alerts must fall back instead of
+    # waiting forever for data that can no longer be collected.
+    reference_available = False
+    previous_ticker = None
+    previous_direction = None
+    reversal_points = []
+    retrace = Decimal("0.25")
+    eta_seconds = 60
     previous = db.execute("""SELECT ticker,close_time FROM kalshi_15m_outcomes
         WHERE close_time BETWEEN ? AND ? AND direction IN ('UP','DOWN')
         ORDER BY close_time DESC LIMIT 1""",
         (int(opened_at)-5, int(opened_at)+5)).fetchone()
-    if not previous:
-        log.info("Opening impulse waits for previous official BTC settlement: %s", ticker)
-        return
-    previous_ticker, previous_close = previous
-    previous_open = float(previous_close)-900
-    rows = db.execute("""SELECT observed_at,yes_mid FROM kalshi_only_samples
-        WHERE ticker=? AND observed_at>=? AND observed_at<=? ORDER BY observed_at""",
-        (previous_ticker, previous_open, float(previous_close))).fetchall()
-    path = [(float(t), dec(value)) for t, value in rows]
-    path = [(t, value) for t, value in path if value is not None]
-    if len(path) < 8 or path[0][0] > previous_open+20 or path[-1][0] < previous_close-30:
-        log.info("Opening impulse waits for the complete previous YES path: %s", previous_ticker)
-        return
-    opening_path = [(t, value) for t, value in path if t <= previous_open+90]
-    if len(opening_path) < 3:
-        return
-    initial_change = opening_path[-1][1]-opening_path[0][1]
-    previous_direction = "UP" if initial_change > 0 else "DOWN"
-    if abs(initial_change) < Decimal("0.010"):
-        return
-    if previous_direction == "UP":
-        extreme_index = max(range(len(opening_path)), key=lambda i: opening_path[i][1])
-        extreme_time, extreme = opening_path[extreme_index]
-        tail = [value for t, value in path if t >= extreme_time]
-        reversal_points = [(t, value) for t, value in path
-                           if t >= extreme_time and value <= extreme-Decimal("0.010")]
-        retrace = max(Decimal("0.25"), min(Decimal("1.0"),
-                        (extreme-min(tail))/abs(initial_change)))
-    else:
-        extreme_index = min(range(len(opening_path)), key=lambda i: opening_path[i][1])
-        extreme_time, extreme = opening_path[extreme_index]
-        tail = [value for t, value in path if t >= extreme_time]
-        reversal_points = [(t, value) for t, value in path
-                           if t >= extreme_time and value >= extreme+Decimal("0.010")]
-        retrace = max(Decimal("0.25"), min(Decimal("1.0"),
-                        (max(tail)-extreme)/abs(initial_change)))
+    if previous:
+        previous_ticker, previous_close = previous
+        previous_open = float(previous_close)-900
+        rows = db.execute("""SELECT observed_at,yes_mid FROM kalshi_only_samples
+            WHERE ticker=? AND observed_at>=? AND observed_at<=? ORDER BY observed_at""",
+            (previous_ticker, previous_open, float(previous_close))).fetchall()
+        path = [(float(t), dec(value)) for t, value in rows]
+        path = [(t, value) for t, value in path if value is not None]
+        path_complete = (
+            len(path) >= 8
+            and path[0][0] <= previous_open+20
+            and path[-1][0] >= previous_close-30
+        )
+        if path_complete:
+            opening_path = [(t, value) for t, value in path if t <= previous_open+90]
+            if len(opening_path) >= 3:
+                initial_change = opening_path[-1][1]-opening_path[0][1]
+                if abs(initial_change) >= Decimal("0.010"):
+                    previous_direction = "UP" if initial_change > 0 else "DOWN"
+                    if previous_direction == "UP":
+                        extreme_index = max(range(len(opening_path)), key=lambda i: opening_path[i][1])
+                        extreme_time, extreme = opening_path[extreme_index]
+                        tail = [value for t, value in path if t >= extreme_time]
+                        reversal_points = [(t, value) for t, value in path
+                                           if t >= extreme_time and value <= extreme-Decimal("0.010")]
+                        retrace = max(Decimal("0.25"), min(Decimal("1.0"),
+                                        (extreme-min(tail))/abs(initial_change)))
+                    else:
+                        extreme_index = min(range(len(opening_path)), key=lambda i: opening_path[i][1])
+                        extreme_time, extreme = opening_path[extreme_index]
+                        tail = [value for t, value in path if t >= extreme_time]
+                        reversal_points = [(t, value) for t, value in path
+                                           if t >= extreme_time and value >= extreme+Decimal("0.010")]
+                        retrace = max(Decimal("0.25"), min(Decimal("1.0"),
+                                        (max(tail)-extreme)/abs(initial_change)))
+                    elapsed = max(0, int(now-opened_at))
+                    eta_seconds = (max(20, min(300, int(reversal_points[0][0]-previous_open-elapsed)))
+                                   if reversal_points else 60)
+                    reference_available = True
+    if not reference_available:
+        log.info("Opening impulse uses conservative fallback; previous YES path is incomplete: %s", ticker)
     elapsed = max(0, int(now-opened_at))
-    eta_seconds = (max(20, min(300, int(reversal_points[0][0]-previous_open-elapsed)))
-                   if reversal_points else 60)
     target = (current_price-abs(btc_move)*retrace if reversal == "DOWN"
               else current_price+abs(btc_move)*retrace)
     if target <= 0:
@@ -1934,8 +1944,15 @@ def opening_impulse_signal(db, market, now):
     eta_label = f"{eta_seconds//60:02d}:{eta_seconds%60:02d}"
     impulse_label = direction_label(impulse)
     reversal_label = direction_label(reversal)
-    confidence_note = ("tiempo basado en el primer retroceso observado en el contrato anterior"
-                       if reversal_points else "tiempo orientativo; no hubo retroceso equivalente en el anterior")
+    if reference_available:
+        confidence_note = ("tiempo basado en el primer retroceso observado en el contrato anterior"
+                           if reversal_points else "tiempo orientativo; no hubo retroceso equivalente en el anterior")
+        reference_text = (f"recorrido completo de {previous_ticker}; impulso previo "
+                          f"{previous_direction}, retroceso estimado {retrace:.0%}")
+    else:
+        confidence_note = "tiempo orientativo; historial anterior incompleto"
+        reference_text = ("respaldo conservador: retroceso estimado del 25% del impulso actual; "
+                          "sin trayectoria completa anterior")
     message = (
         "🚨 BTC 15M · PRIMER IMPULSO DE APERTURA\n"
         f"🧾 Contrato: {ticker}\n"
@@ -1944,8 +1961,7 @@ def opening_impulse_signal(db, market, now):
         f"🎯 Posible entrada hacia: {reversal_label} cerca de USD {current_price:,.2f}\n"
         f"📍 Objetivo estimado: USD {target:,.2f}\n"
         f"⏱ Tiempo estimado: {eta_label} ({confidence_note})\n"
-        f"📚 Referencia: recorrido completo de {previous_ticker}; "
-        f"impulso previo {previous_direction}, retroceso estimado {retrace:.0%}.\n"
+        f"📚 Referencia: {reference_text}.\n"
         f"⏳ Minuto actual del contrato: {elapsed//60:02d}:{elapsed%60:02d}\n"
         "Proyección experimental; espera confirmación del precio antes de operar."
     )
