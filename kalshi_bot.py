@@ -21,7 +21,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_SECONDS = min(5, max(1, int(os.getenv("SCAN_SECONDS", "5"))))
 COMBO_WINDOW_SECONDS = 180
 OPENING_REVIEW_SECONDS = 20
-COMBO_RULE_VERSION = "combo-btc-eth-independent-market-v2"
+COMBO_RULE_VERSION = "combo-btc-eth-independent-kalshi-kraken-v3"
 COMBO_QUALITY_FILTERS_ENABLED = False
 COMBO_MIN_SETTLED = 30
 COMBO_MIN_JOINT_ACCURACY = 0.90
@@ -40,7 +40,7 @@ RULES_SNAPSHOT = json.dumps({
     "combo_rule_version": COMBO_RULE_VERSION,
     "combo_quality_filters_enabled": COMBO_QUALITY_FILTERS_ENABLED,
     "combo_kraken_reference_enabled": False,
-    "combo_rule": "In the final three minutes, analyze BTC and ETH independently from their own Kalshi YES quotes, 60/180/300-second movement, intracontract paths, reversals, official cycle outcomes, and this combo engine’s own settled forecasts; never use the individual BTC predictor or Kraken to choose either combo direction",
+    "combo_rule": "In the final three minutes, analyze BTC and ETH independently using each Kalshi YES quote path and Kraken BTC/USD or ETH/USD spot movement over 60/180/300 seconds, intracontract persistence and reversals, asset-specific official cycles, and this combo engine’s own settled forecasts; never use the individual BTC predictor",
     "combo_quality_gate": "Paused; preserve confidence and settlement data for evaluation without suppressing combo alerts",
     "learning": "Keep BTC individual forecasts and combo analysis separate; score BTC and ETH combo legs only against their own official Kalshi settlements",
     "automatic_orders": False,
@@ -2558,7 +2558,7 @@ def market_already_prices_direction_at_99(yes_mid, direction, remaining):
 
 
 def combo_leg(db, market, now, asset):
-    """Analyze one combo leg using only its Kalshi market path and combo-specific history."""
+    """Analyze one combo leg from its Kalshi path, Kraken spot path, and combo-only history."""
     q = quote(market)
     if q is None:
         return None
@@ -2568,7 +2568,6 @@ def combo_leg(db, market, now, asset):
         return None
 
     mid = q[2]
-    # Require a real price path, so a restart or a stale single quote cannot make a combo.
     points = db.execute("""SELECT observed_at,yes_mid FROM kalshi_only_samples
         WHERE ticker=? AND observed_at>=? AND observed_at<=?
         ORDER BY observed_at""",
@@ -2587,30 +2586,26 @@ def combo_leg(db, market, now, asset):
         observed, value = candidates[-1]
         return value if target_time-observed <= max_lag else None
 
-    # Each horizon is independent evidence from this contract's own YES price.
     changes = {}
     for age, max_lag in ((60, 35), (180, 45), (300, 60)):
         reference = prior_mid(age, max_lag)
         changes[age] = float(mid-reference) if reference is not None else None
-
     if changes[60] is None and changes[180] is None:
-        log.info("Combo %s leg waiting for a usable 60s or 180s quote comparison: %s",
+        log.info("Combo %s leg waiting for a usable 60s or 180s Kalshi comparison: %s",
                  asset, market["ticker"])
         return None
 
     def clamp(value):
         return max(-1.0, min(1.0, value))
 
-    # Scale each horizon against a meaningful YES-price move. Missing horizons
-    # are omitted and the remaining live evidence is reweighted.
-    live_parts = []
+    market_parts = []
     for age, scale, weight in ((60, 0.035, 0.35),
                                (180, 0.060, 0.40),
                                (300, 0.090, 0.25)):
         if changes[age] is not None:
-            live_parts.append((clamp(changes[age]/scale), weight))
-    live_score = (sum(value*weight for value, weight in live_parts)
-                  / sum(weight for _, weight in live_parts))
+            market_parts.append((clamp(changes[age]/scale), weight))
+    market_score = (sum(value*weight for value, weight in market_parts)
+                    / sum(weight for _, weight in market_parts))
 
     first_mid = points[0][1]
     above_share = sum(value >= Decimal("0.50") for _, value in points)/len(points)
@@ -2618,17 +2613,36 @@ def combo_leg(db, market, now, asset):
                     for left, right in zip(points, points[1:]))
     path_score = (0.70*clamp(float(mid-first_mid)/0.08)
                   + 0.30*(2.0*above_share-1.0))
-    # Frequent flips weaken the path's persistence without reversing its direction.
     path_score *= max(0.35, 1.0-min(0.65, crossings*0.08))
 
-    # Broader cycle history is read for this asset only; it never comes from
-    # individual forecast feedback or the BTC-only adaptive model.
+    # Kraken is an independent spot-market check for the same asset.
+    spot_samples = kraken_samples if asset == "BTC" else eth_kraken_samples
+    latest_spot = kraken_last_quote if asset == "BTC" else eth_kraken_last_quote
+    spot_score = None
+    if latest_spot is not None and now-latest_spot[0] <= 15:
+        spot_parts = []
+        for age, scale, weight in ((60, 0.0006, 0.35),
+                                   (180, 0.0010, 0.40),
+                                   (300, 0.0015, 0.25)):
+            target_time = now-age
+            prior = [(t, price) for t, price in spot_samples if t <= target_time]
+            if not prior:
+                continue
+            observed, price = prior[-1]
+            if target_time-observed > 25 or price <= 0:
+                continue
+            change_pct = float((latest_spot[1]-price)/price)
+            spot_parts.append((clamp(change_pct/scale), weight))
+        if spot_parts:
+            spot_score = (sum(value*weight for value, weight in spot_parts)
+                          / sum(weight for _, weight in spot_parts))
+
+    # Broader official outcomes are asset-specific; no individual BTC signal is read.
     cycle = cycle_pattern_summary(db, asset, now)
     cycle_score = ((cycle["up"]-cycle["down"])/cycle["completed"]
                    if cycle["completed"] else None)
 
-    # Learn whether this combo engine's own prior calls for this asset worked.
-    # Use only its versioned combo forecasts matched to official Kalshi settlement.
+    # Calibrate only from earlier forecasts made by this combo engine version.
     prefix = "btc" if asset == "BTC" else "eth"
     ticker_column = prefix + "_ticker"
     direction_column = prefix + "_direction"
@@ -2649,17 +2663,18 @@ def combo_leg(db, market, now, asset):
     calibration_score = (rates["UP"]-rates["DOWN"]
                          if "UP" in rates and "DOWN" in rates else None)
 
-    # Current contract momentum and path lead; official cycles and this engine's
-    # own settled forecasts act as small, separately tracked adjustments.
-    parts = [(live_score, 0.50), (path_score, 0.25),
-             (clamp((float(mid)-0.50)/0.25), 0.10)]
+    # Kalshi leads; Kraken corroborates. Disagreement can hold a weak combo leg.
+    parts = [(market_score, 0.44), (path_score, 0.20),
+             (clamp((float(mid)-0.50)/0.25), 0.08)]
+    if spot_score is not None:
+        parts.append((spot_score, 0.20))
     if cycle_score is not None:
-        parts.append((clamp(cycle_score), 0.10))
+        parts.append((clamp(cycle_score), 0.04))
     if calibration_score is not None:
-        parts.append((clamp(calibration_score), 0.15))
+        parts.append((clamp(calibration_score), 0.04))
     score = sum(value*weight for value, weight in parts)/sum(weight for _, weight in parts)
     if abs(score) < 0.08:
-        log.info("Combo %s leg held for mixed/flat evidence: %s score=%+.3f",
+        log.info("Combo %s leg held for mixed/flat Kalshi and Kraken evidence: %s score=%+.3f",
                  asset, market["ticker"], score)
         return None
     direction = "UP" if score > 0 else "DOWN"
@@ -2669,10 +2684,22 @@ def combo_leg(db, market, now, asset):
         return None
     volume = dec(market.get("volume_24h_fp")) or dec(market.get("volume_24h")) or Decimal(0)
     if asset == "BTC":
-        # Kraken never votes in a combo, and the combo keeps BTC numeric projection
-        # separate from BTC's individual forecast.
-        start = target = projected = move_amount = eta_seconds = None
-        symbol = "BTC/USD · referencia numérica pausada para combos"
+        projection = kraken_close_projection(now, horizon_seconds)
+        if projection is not None:
+            start, raw_projected = projection
+            move = abs(raw_projected-start)
+            raw_target = start+move if direction == "UP" else start-move
+            first = kraken_nearest_level_projection(now, direction, (start, raw_target))
+            if first is None or first[1] == start:
+                first = (start, raw_target)
+            target = first[1]
+            projected = raw_target
+            move_amount = abs(target-start)
+            eta_seconds = horizon_seconds
+            symbol = "BTC/USD · Kraken"
+        else:
+            start = target = projected = move_amount = eta_seconds = None
+            symbol = "BTC/USD · Kraken sin trayectoria suficiente"
         price_unit = "USD"
     else:
         move_reference = next((changes[age] for age in (300, 180, 60)
@@ -2697,6 +2724,7 @@ def combo_leg(db, market, now, asset):
     basis = (
         f"Combo-only {asset}: score={score:+.3f}; "
         f"YES Δ60/180/300s={changes[60]}/{changes[180]}/{changes[300]}; "
+        f"Kraken score={spot_score if spot_score is not None else 'n/d'}; "
         f"path={path_score:+.3f}, cruces50¢={crossings}, "
         f"ciclos={cycle['completed']}, calibración_combo_n={len(history)}"
     )
@@ -2708,6 +2736,8 @@ def combo_leg(db, market, now, asset):
         "volume": volume, "symbol": symbol, "price_unit": price_unit,
         "model_features": None, "learning_basis": basis,
         "cycle_summary": cycle["summary"], "combo_score": score,
+        "kraken_price": latest_spot[1] if latest_spot is not None else None,
+        "kraken_score": spot_score,
     }
 
 def record_combo_candidate(db, combo_key, btc_leg, eth_leg, now, close_at, alert_sent):
@@ -2772,17 +2802,20 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
     projection_horizon_label = f"{projection_horizon//60:02d}:{projection_horizon%60:02d}"
     eth_sign = "+" if eth_leg["direction"] == "UP" else "-"
     if btc_leg["start"] is None:
+        btc_price = (f"Precio actual Kraken BTC/USD: USD {btc_leg['kraken_price']:,.2f}."
+                     if btc_leg.get("kraken_price") is not None
+                     else "Precio BTC/USD de Kraken: reuniendo cotización.")
         btc_block = (
-            "₿ BTC — DIRECCIÓN KALSHI · KRAKEN PAUSADO PARA COMBOS\n"
+            "₿ BTC — KALSHI + CONFIRMACIÓN KRAKEN\n"
             f"Dirección prevista: {direction_label(btc_leg['direction'])}\n"
-            "Referencia numérica BTC/USD y proyección: pausadas en esta prueba.\n\n"
+            f"{btc_price} Proyección: reuniendo trayectoria.\n\n"
         )
     else:
         btc_sign = "+" if btc_leg["direction"] == "UP" else "-"
         btc_eta = max(0, int(btc_leg["eta_seconds"]))
         btc_eta_label = f"{btc_eta//60:02d}:{btc_eta%60:02d}"
         btc_block = (
-            "₿ BTC — PRECIO DE REFERENCIA KRAKEN\n"
+            "₿ BTC — PRECIO Y CONFIRMACIÓN KRAKEN\n"
             f"Dirección prevista: {direction_label(btc_leg['direction'])}\n"
             f"Precio BTC de referencia: USD {btc_leg['start']:,.2f}\n"
             f"Movimiento estimado hasta el primer objetivo: {btc_sign}USD {btc_leg['move_amount']:,.2f}\n"
@@ -2790,11 +2823,15 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
             f"Precio BTC proyectado al horizonte: USD {btc_leg['projected']:,.2f}\n"
             f"Tiempo estimado hasta el primer objetivo: {btc_eta_label}\n\n"
         )
+    eth_kraken_line = (
+        f"🌐 Kraken ETH/USD de confirmación: USD {eth_leg['kraken_price']:,.2f}\n"
+        if eth_leg.get("kraken_price") is not None else ""
+    )
     message = (
         "🧩 COMBO BTC + ETH · ÚLTIMOS 3 MIN\n"
         f"⏳ Horizonte común de proyección: {projection_horizon_label}\n\n"
         f"{btc_block}"
-        "◆ ETH — CONTRATO KALSHI YES\n"
+        "◆ ETH — CONTRATO KALSHI YES\n"\n        f"{eth_kraken_line}"
         f"Dirección prevista: {direction_label(eth_leg['direction'])}\n"
         f"Cotización YES actual: USD {eth_leg['start']:.3f} por contrato\n"
         f"Variación estimada: {eth_sign}USD {eth_leg['move_amount']:.3f} por contrato\n"
@@ -2843,7 +2880,8 @@ def scan(predictions_enabled=True):
             sync_dashboard(db, now)
         return
     # Keep spot histories fresh for learned feature vectors and combo price projections.
-    kraken_trend(now)  # BTC/USD reference only; it does not choose UP or DOWN.
+    kraken_trend(now)  # Spot prices confirm combo legs; they do not alter individual BTC signals.
+    eth_kraken_trend(now)
     with db_open() as db:
         record_kalshi_15m_chart(db, now)
         record_settled_eth_results(db, now)
