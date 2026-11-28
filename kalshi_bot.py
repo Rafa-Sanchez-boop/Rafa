@@ -22,6 +22,15 @@ SCAN_SECONDS = min(5, max(1, int(os.getenv("SCAN_SECONDS", "5"))))
 COMBO_WINDOW_SECONDS = 180
 OPENING_REVIEW_SECONDS = 20
 COMBO_RULE_VERSION = "combo-btc-eth-independent-kalshi-kraken-v3"
+COMBO_REVIEW_INTERVAL_SECONDS = 3 * 60 * 60
+COMBO_REVIEW_MIN_PAIRS = 8
+COMBO_POOR_PAIR_ACCURACY = 0.60
+COMBO_POOR_LEG_ACCURACY = 0.58
+COMBO_TRAIN_MIN_LEGS = 24
+COMBO_DEFAULT_WEIGHTS = {
+    "market": 0.44, "path": 0.20, "level": 0.08,
+    "spot": 0.20, "cycles": 0.04, "calibration": 0.04,
+}
 COMBO_QUALITY_FILTERS_ENABLED = False
 COMBO_MIN_SETTLED = 30
 COMBO_MIN_JOINT_ACCURACY = 0.90
@@ -42,7 +51,8 @@ RULES_SNAPSHOT = json.dumps({
     "combo_kraken_reference_enabled": False,
     "combo_rule": "In the final three minutes, analyze BTC and ETH independently using each Kalshi YES quote path and Kraken BTC/USD or ETH/USD spot movement over 60/180/300 seconds, intracontract persistence and reversals, asset-specific official cycles, and this combo engine’s own settled forecasts; never use the individual BTC predictor",
     "combo_quality_gate": "Paused; preserve confidence and settlement data for evaluation without suppressing combo alerts",
-    "learning": "Keep BTC individual forecasts and combo analysis separate; score BTC and ETH combo legs only against their own official Kalshi settlements",
+    "learning": "Every 3 hours, review combo-only accuracy from official BTC/ETH settlements; after enough examples, fit bounded per-asset weights and keep every accepted version in persistent history",
+    "combo_learning_minimums": {"recent_pairs": COMBO_REVIEW_MIN_PAIRS, "training_legs": COMBO_TRAIN_MIN_LEGS, "poor_pair_accuracy": COMBO_POOR_PAIR_ACCURACY},
     "automatic_orders": False,
 }, separators=(",", ":"), sort_keys=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -2205,6 +2215,227 @@ def evaluate_btc_forecasts(db, now):
             log.exception("Could not evaluate BTC forecast for %s", ticker)
 
 
+def ensure_combo_learning_tables(db):
+    """Keep combo-only feature snapshots and versioned per-asset weights on disk."""
+    db.execute("""CREATE TABLE IF NOT EXISTS kalshi_combo_learning_state
+        (asset TEXT PRIMARY KEY, weights_json TEXT NOT NULL,
+         weight_version INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL,
+         sample_count INTEGER NOT NULL DEFAULT 0)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS kalshi_combo_leg_features
+        (combo_key TEXT NOT NULL, asset TEXT NOT NULL, combo_version TEXT NOT NULL,
+         issued_at REAL NOT NULL, components_json TEXT NOT NULL,
+         weights_json TEXT NOT NULL, score REAL NOT NULL, direction TEXT NOT NULL,
+         PRIMARY KEY(combo_key,asset))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS kalshi_combo_weight_history
+        (id INTEGER PRIMARY KEY AUTOINCREMENT, asset TEXT NOT NULL,
+         trained_at REAL NOT NULL, weight_version INTEGER NOT NULL,
+         reason TEXT NOT NULL, sample_count INTEGER NOT NULL,
+         recent_pair_accuracy REAL NOT NULL, baseline_accuracy REAL NOT NULL,
+         candidate_accuracy REAL NOT NULL, baseline_logloss REAL NOT NULL,
+         candidate_logloss REAL NOT NULL, old_weights_json TEXT NOT NULL,
+         new_weights_json TEXT NOT NULL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS kalshi_combo_learning_clock
+        (name TEXT PRIMARY KEY, checked_at REAL NOT NULL)""")
+    defaults = json.dumps(COMBO_DEFAULT_WEIGHTS, separators=(",", ":"), sort_keys=True)
+    for asset in ("BTC", "ETH"):
+        db.execute("""INSERT OR IGNORE INTO kalshi_combo_learning_state
+            (asset,weights_json,weight_version,updated_at,sample_count)
+            VALUES (?,?,0,?,0)""", (asset, defaults, time.time()))
+
+
+def combo_weights_for_asset(db, asset):
+    ensure_combo_learning_tables(db)
+    row = db.execute("""SELECT weights_json FROM kalshi_combo_learning_state
+        WHERE asset=?""", (asset,)).fetchone()
+    try:
+        stored = json.loads(row[0]) if row else {}
+    except (TypeError, ValueError):
+        stored = {}
+    weights = {
+        name: max(0.0, min(0.70, float(stored.get(name, default))))
+        for name, default in COMBO_DEFAULT_WEIGHTS.items()
+    }
+    total = sum(weights.values())
+    return ({name: value/total for name, value in weights.items()}
+            if total else dict(COMBO_DEFAULT_WEIGHTS))
+
+
+def record_combo_leg_features(db, combo_key, leg, now):
+    components = leg.get("components")
+    weights = leg.get("weights_used")
+    if not components or not weights:
+        return
+    db.execute("""INSERT OR IGNORE INTO kalshi_combo_leg_features
+        (combo_key,asset,combo_version,issued_at,components_json,weights_json,score,direction)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        (combo_key, leg["asset"], COMBO_RULE_VERSION, now,
+         json.dumps(components, separators=(",", ":"), sort_keys=True),
+         json.dumps(weights, separators=(",", ":"), sort_keys=True),
+         float(leg["combo_score"]), leg["direction"]))
+
+
+def _combo_probability(components, weights):
+    score = sum(float(weights.get(name, 0.0))*float(components.get(name) or 0.0)
+                for name in COMBO_DEFAULT_WEIGHTS)
+    z = max(-8.0, min(8.0, 3.0*score))
+    return 1.0/(1.0+math.exp(-z))
+
+
+def _combo_validation_metrics(rows, weights):
+    if not rows:
+        return 0.0, float("inf")
+    hits = 0
+    loss = 0.0
+    for components, actual_up in rows:
+        probability = max(1e-6, min(1.0-1e-6, _combo_probability(components, weights)))
+        predicted_up = probability >= 0.5
+        hits += predicted_up == actual_up
+        loss += -(actual_up*math.log(probability)
+                  + (1-actual_up)*math.log(1.0-probability))
+    return hits/len(rows), loss/len(rows)
+
+
+def _fit_combo_weights(train_rows, initial_weights):
+    weights = dict(initial_weights)
+    keys = tuple(COMBO_DEFAULT_WEIGHTS)
+    for _ in range(180):
+        gradients = {key: 0.0 for key in keys}
+        for components, actual_up in train_rows:
+            score = sum(weights[key]*float(components.get(key) or 0.0) for key in keys)
+            z = max(-8.0, min(8.0, 3.0*score))
+            probability = 1.0/(1.0+math.exp(-z))
+            for key in keys:
+                gradients[key] += (probability-float(actual_up))*3.0*float(components.get(key) or 0.0)
+        for key in keys:
+            gradient = gradients[key]/len(train_rows) + 0.60*(weights[key]-COMBO_DEFAULT_WEIGHTS[key])
+            weights[key] = max(0.02, min(0.70, weights[key]-0.08*gradient))
+        total = sum(weights.values())
+        weights = {key:value/total for key,value in weights.items()}
+    bounded = {
+        key: max(initial_weights[key]*0.75,
+                 min(initial_weights[key]*1.25, weights[key]))
+        for key in keys
+    }
+    total = sum(bounded.values())
+    return {key:value/total for key,value in bounded.items()}
+
+
+def maybe_adapt_combo_weights(db, now):
+    """Review every three hours; update only with official outcomes and held-out gains."""
+    ensure_combo_forecast_table(db)
+    ensure_combo_learning_tables(db)
+    last = db.execute("""SELECT checked_at FROM kalshi_combo_learning_clock
+        WHERE name='three_hour_review'""").fetchone()
+    if last is None:
+        db.execute("""INSERT INTO kalshi_combo_learning_clock(name,checked_at)
+            VALUES ('three_hour_review',?)""", (now,))
+        log.info("Combo learning clock initialized; first review is due in three hours")
+        return
+    if now-float(last[0]) < COMBO_REVIEW_INTERVAL_SECONDS:
+        return
+    db.execute("""UPDATE kalshi_combo_learning_clock SET checked_at=?
+        WHERE name='three_hour_review'""", (now,))
+
+    recent = db.execute("""SELECT c.btc_direction,c.eth_direction,b.result,e.result
+        FROM kalshi_combo_forecasts c
+        JOIN kalshi_only_results b ON b.ticker=c.btc_ticker
+        JOIN kalshi_only_results e ON e.ticker=c.eth_ticker
+        WHERE c.alert_sent=1 AND c.combo_version=?
+          AND c.issued_at>=? AND c.issued_at<=?
+          AND b.result IN ('yes','no') AND e.result IN ('yes','no')
+        ORDER BY c.issued_at""",
+        (COMBO_RULE_VERSION, now-COMBO_REVIEW_INTERVAL_SECONDS, now)).fetchall()
+    if len(recent) < COMBO_REVIEW_MIN_PAIRS:
+        log.info("Combo review retained current weights: only %d/%d official pairs in the last three hours",
+                 len(recent), COMBO_REVIEW_MIN_PAIRS)
+        return
+    pair_hits = 0
+    leg_hits = {"BTC": 0, "ETH": 0}
+    for btc_pred, eth_pred, btc_result, eth_result in recent:
+        btc_ok = (btc_pred == "UP") == (btc_result == "yes")
+        eth_ok = (eth_pred == "UP") == (eth_result == "yes")
+        leg_hits["BTC"] += btc_ok
+        leg_hits["ETH"] += eth_ok
+        pair_hits += btc_ok and eth_ok
+    pair_accuracy = pair_hits/len(recent)
+    leg_accuracy = {asset: leg_hits[asset]/len(recent) for asset in leg_hits}
+    log.info("Three-hour combo review: both=%d/%d (%.1f%%), BTC=%.1f%%, ETH=%.1f%%",
+             pair_hits, len(recent), pair_accuracy*100,
+             leg_accuracy["BTC"]*100, leg_accuracy["ETH"]*100)
+    if pair_accuracy >= COMBO_POOR_PAIR_ACCURACY:
+        log.info("Combo memory kept its weights; recent joint accuracy is not below %.0f%%",
+                 COMBO_POOR_PAIR_ACCURACY*100)
+        return
+    assets_to_fit = [asset for asset, accuracy in leg_accuracy.items()
+                     if accuracy < COMBO_POOR_LEG_ACCURACY]
+    if not assets_to_fit:
+        log.info("Combo memory kept its weights; neither leg met the low-accuracy trigger")
+        return
+
+    for asset in assets_to_fit:
+        prefix = "btc" if asset == "BTC" else "eth"
+        ticker_column = prefix + "_ticker"
+        history = db.execute(f"""SELECT f.components_json,r.result
+            FROM kalshi_combo_leg_features f
+            JOIN kalshi_combo_forecasts c ON c.combo_key=f.combo_key
+            JOIN kalshi_only_results r ON r.ticker=c.{ticker_column}
+            WHERE f.asset=? AND f.combo_version=?
+              AND c.combo_version=? AND c.alert_sent=1
+              AND c.issued_at>=? AND c.issued_at<=?
+              AND r.result IN ('yes','no')
+            ORDER BY c.issued_at""",
+            (asset, COMBO_RULE_VERSION, COMBO_RULE_VERSION, now-7*86400, now)).fetchall()
+        examples = []
+        for raw_features, result in history:
+            try:
+                components = json.loads(raw_features)
+                actual_up = result == "yes"
+                examples.append((components, actual_up))
+            except (TypeError, ValueError):
+                continue
+        if len(examples) < COMBO_TRAIN_MIN_LEGS:
+            log.info("Combo %s weights unchanged: %d/%d settled feature records needed",
+                     asset, len(examples), COMBO_TRAIN_MIN_LEGS)
+            continue
+        split = max(1, int(len(examples)*0.70))
+        train_rows, validation_rows = examples[:split], examples[split:]
+        if len(validation_rows) < 6:
+            log.info("Combo %s weights unchanged: too few held-out examples", asset)
+            continue
+        old_weights = combo_weights_for_asset(db, asset)
+        candidate = _fit_combo_weights(train_rows, old_weights)
+        baseline_accuracy, baseline_loss = _combo_validation_metrics(validation_rows, old_weights)
+        candidate_accuracy, candidate_loss = _combo_validation_metrics(validation_rows, candidate)
+        improved = (candidate_loss <= baseline_loss-0.01
+                    and candidate_accuracy >= baseline_accuracy-0.05)
+        if not improved:
+            log.info("Combo %s retraining rejected by chronological holdout: "
+                     "accuracy %.1f%%→%.1f%%, logloss %.3f→%.3f",
+                     asset, baseline_accuracy*100, candidate_accuracy*100,
+                     baseline_loss, candidate_loss)
+            continue
+        row = db.execute("""SELECT weight_version FROM kalshi_combo_learning_state
+            WHERE asset=?""", (asset,)).fetchone()
+        new_version = (int(row[0]) if row else 0)+1
+        old_json = json.dumps(old_weights, separators=(",", ":"), sort_keys=True)
+        new_json = json.dumps(candidate, separators=(",", ":"), sort_keys=True)
+        db.execute("""UPDATE kalshi_combo_learning_state
+            SET weights_json=?,weight_version=?,updated_at=?,sample_count=?
+            WHERE asset=?""",
+            (new_json, new_version, now, len(examples), asset))
+        db.execute("""INSERT INTO kalshi_combo_weight_history
+            (asset,trained_at,weight_version,reason,sample_count,
+             recent_pair_accuracy,baseline_accuracy,candidate_accuracy,
+             baseline_logloss,candidate_logloss,old_weights_json,new_weights_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (asset, now, new_version,
+             "three-hour poor combo run; accepted on chronological holdout",
+             len(examples), pair_accuracy, baseline_accuracy, candidate_accuracy,
+             baseline_loss, candidate_loss, old_json, new_json))
+        log.info("Combo %s weights updated to version %d after holdout improvement",
+                 asset, new_version)
+
+
 def ensure_combo_forecast_table(db):
     db.execute("""CREATE TABLE IF NOT EXISTS kalshi_combo_forecasts
         (combo_key TEXT PRIMARY KEY, btc_ticker TEXT NOT NULL, eth_ticker TEXT NOT NULL,
@@ -2221,6 +2452,7 @@ def ensure_combo_forecast_table(db):
     if "combo_version" not in columns:
         db.execute("""ALTER TABLE kalshi_combo_forecasts
             ADD COLUMN combo_version TEXT NOT NULL DEFAULT 'legacy'""")
+    ensure_combo_learning_tables(db)
 
 def evaluate_combo_reviews(db, now):
     ensure_combo_forecast_table(db)
@@ -2330,6 +2562,7 @@ def check_results(db, now):
                    db=db, broadcast=True)
 
     evaluate_combo_reviews(db, now)
+    maybe_adapt_combo_weights(db, now)
 
     # Price-based BTC reviews are secondary and must not hold up official results.
     evaluate_btc_forecasts(db, now)
@@ -2663,16 +2896,15 @@ def combo_leg(db, market, now, asset):
     calibration_score = (rates["UP"]-rates["DOWN"]
                          if "UP" in rates and "DOWN" in rates else None)
 
-    # Kalshi leads; Kraken corroborates. Disagreement can hold a weak combo leg.
-    parts = [(market_score, 0.44), (path_score, 0.20),
-             (clamp((float(mid)-0.50)/0.25), 0.08)]
-    if spot_score is not None:
-        parts.append((spot_score, 0.20))
-    if cycle_score is not None:
-        parts.append((clamp(cycle_score), 0.04))
-    if calibration_score is not None:
-        parts.append((clamp(calibration_score), 0.04))
-    score = sum(value*weight for value, weight in parts)/sum(weight for _, weight in parts)
+    # Load persistent, bounded weights learned only from this asset's combo results.
+    weights = combo_weights_for_asset(db, asset)
+    level_score = clamp((float(mid)-0.50)/0.25)
+    components = {
+        "market": market_score, "path": path_score, "level": level_score,
+        "spot": spot_score or 0.0, "cycles": clamp(cycle_score) if cycle_score is not None else 0.0,
+        "calibration": clamp(calibration_score) if calibration_score is not None else 0.0,
+    }
+    score = sum(weights[name]*components[name] for name in COMBO_DEFAULT_WEIGHTS)
     if abs(score) < 0.08:
         log.info("Combo %s leg held for mixed/flat Kalshi and Kraken evidence: %s score=%+.3f",
                  asset, market["ticker"], score)
@@ -2736,6 +2968,7 @@ def combo_leg(db, market, now, asset):
         "volume": volume, "symbol": symbol, "price_unit": price_unit,
         "model_features": None, "learning_basis": basis,
         "cycle_summary": cycle["summary"], "combo_score": score,
+        "components": components, "weights_used": weights,
         "kraken_price": latest_spot[1] if latest_spot is not None else None,
         "kraken_score": spot_score,
     }
@@ -2757,6 +2990,7 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
     remaining = btc_close-now
     if not (0 < remaining <= COMBO_WINDOW_SECONDS):
         return
+    ensure_combo_forecast_table(db)
     btc_leg = combo_leg(db, btc_market, now, "BTC")
     eth_leg = combo_leg(db, eth_market, now, "ETH")
     if btc_leg is None or eth_leg is None:
@@ -2844,6 +3078,8 @@ def send_btc_eth_combo(db, btc_market, eth_market, now):
     if not notify(message, db=db, broadcast=True):
         return
     record_combo_candidate(db, combo_key, btc_leg, eth_leg, now, btc_close, True)
+    record_combo_leg_features(db, combo_key, btc_leg, now)
+    record_combo_leg_features(db, combo_key, eth_leg, now)
     for leg in (btc_leg, eth_leg):
         db.execute("""INSERT OR IGNORE INTO kalshi_only_alerts
             (ticker,phase,sent_at,direction,bot_version,rules_snapshot)
